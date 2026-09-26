@@ -1,0 +1,15 @@
+/target/
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+*.tsbuildinfo
+/apps/desktop/src-tauri/target/
+/apps/desktop/src-tauri/gen/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local database and asset snapshots
+/backups/
+
+# Packaged binaries belong in GitHub Releases, not the source tree
+/release/*.exe

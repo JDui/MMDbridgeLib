@@ -1,0 +1,7 @@
+.review-reason strong {
+  max-width: 68%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: right;
+  line-height: 1.5;
+}

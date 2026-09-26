@@ -1,0 +1,21 @@
+# Asset Package Operations
+
+## Plan, confirm, execute
+
+The desktop UI requests a Core operation plan before moving, renaming, or deleting an asset package. The confirmation dialog lists the source and destination paths, indexed assets affected, package dependencies, and any safety checks that block execution. Core rebuilds the plan immediately before executing it and rejects a plan whose paths, indexed assets, dependencies, or warnings changed after confirmation.
+
+Move and rename operate on the indexed asset directory as one package. The same asset IDs and metadata remain in SQLite; Core updates primary-source, package, dependency, card paths and the owning root. A moved package must land inside a registered root of the same asset type. Rename accepts one package at a time. Batch selection supports move and recycle.
+
+## Safety checks
+
+Core blocks operations when the package is the asset root itself, contains another registered root, includes a symlink/reparse point, has a tracked dependency outside the package, has a missing indexed dependency, has an active thumbnail job, or has an unresolved operation-journal entry. Move targets must be empty and inside a matching registered root. This first implementation also blocks loose assets directly in an asset-root folder; put those assets in their own package subfolder before using file operations.
+
+An operation is recorded as `Started` before the filesystem action. Move and rename use the Windows Shell `IFileOperation` API, preserving Unicode paths and supporting cross-volume moves. Delete uses the Shell recycle flag and never falls back to permanent deletion. Shell progress and error dialogs are suppressed because the desktop confirmation dialog already presents the operation plan. These behaviors follow Microsoft's [`IFileOperation::SetOperationFlags`](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperation-setoperationflags) documentation for `FOFX_RECYCLEONDELETE`.
+
+After a successful filesystem operation, Core updates the index in a SQLite transaction, marks moved cards stale, refreshes relation and duplicate indexes, and completes the journal entry. If a move's index update fails, Core attempts to move the package back. If rollback cannot be confirmed, or a recycle operation is interrupted, the journal records `RecoveryNeeded`. On the next desktop start, unfinished entries are marked for recovery and affected assets are blocked from further file operations. The user must inspect the recorded paths, restore or rescan as appropriate, then explicitly mark the entry resolved. The journal is a recovery aid; it does not automatically undo operations.
+
+The operation journal stores the operation, affected asset IDs, source and destination paths, timestamps, status and result. It is available from the desktop top bar. Permanent deletion and automatic restore are not implemented.
+
+## Windows runtime smoke
+
+On 2026-09-25, a disposable one-file PMX fixture in a temporary library completed plan-confirm-rename and cross-volume move through Windows Shell `IFileOperation`. Core updated the indexed source path and recorded both operations as `Completed`. An isolated smoke copied one real text-X scene into a unique `target` folder, then confirmed plan → silent Recycle Bin operation → index removal → `Completed` journal entry. A separate copy of the real 廃コンテナ置き場 scene package indexed 15 Scene assets and 25 dependencies; package Move updated all 15 indexed paths to the destination root and completed the journal entry. Temporary copies and roots were removed afterward. No smoke started the desktop app or changed the original scene folder. More complex packages with external or missing dependencies remain unverified.

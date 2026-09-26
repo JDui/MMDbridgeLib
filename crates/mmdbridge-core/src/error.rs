@@ -1,0 +1,49 @@
+use thiserror::Error;
+
+pub type CoreResult<T> = Result<T, CoreError>;
+
+#[derive(Debug, Error)]
+pub enum CoreError {
+    #[error("database error: {0}")]
+    Database(#[from] rusqlite::Error),
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid root path: {0}")]
+    InvalidRoot(String),
+    #[error("asset root was not found: {0}")]
+    RootNotFound(String),
+    #[error("asset root scanning is paused: {0}")]
+    RootDisabled(String),
+    #[error("asset root scan was cancelled")]
+    ScanCancelled,
+    #[error("asset root scan was paused")]
+    ScanPaused,
+    #[error("storage limit: {0}")]
+    StorageLimit(String),
+    #[error("model preview error: {0}")]
+    ModelPreview(String),
+    #[error("thumbnail render error: {0}")]
+    ThumbnailRender(String),
+    #[error("thumbnail queue error: {0}")]
+    ThumbnailQueue(String),
+    #[error("asset operation error: {0}")]
+    AssetOperation(String),
+    #[error("thumbnail job was cancelled")]
+    ThumbnailCancelled,
+    #[error("job was not found: {0}")]
+    JobNotFound(String),
+    #[error("asset was not found: {0}")]
+    AssetNotFound(String),
+    #[error("invalid asset type: {0}")]
+    InvalidAssetType(String),
+    #[error("resource card error: {0}")]
+    Card(String),
+    #[error("invalid tag: {0}")]
+    InvalidTag(String),
+    #[error("invalid filter: {0}")]
+    InvalidFilter(String),
+    #[error("metadata serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("library lock is poisoned")]
+    LockPoisoned,
+}

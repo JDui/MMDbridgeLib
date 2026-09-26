@@ -1,0 +1,16 @@
+[package]
+name = "mmdbridge-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mmdbridge-core = { path = "../../../crates/mmdbridge-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+notify = "=8.2.0"

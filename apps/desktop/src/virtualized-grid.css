@@ -1,0 +1,4 @@
+.asset-grid-item{min-width:0;align-self:start}
+.asset-grid-item>.asset-card{width:100%}
+.asset-grid-waiting{padding:28px;color:#82939b;font-size:11px}
+.asset-grid-footer{padding:22px 8px;color:#82939b;text-align:center;font-size:11px}

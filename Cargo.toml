@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/mmdbridge-core", "crates/mmdbridge-cli"]
+exclude = ["apps/desktop/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+blake3 = "1"
+bytemuck = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+encoding_rs = "0.8"
+glam = "0.32.1"
+image = { version = "0.25.10", default-features = false, features = ["bmp", "jpeg", "png", "tga"] }
+mmd-anim-format = "=0.5.2"
+mmd-anim-runtime = "=0.5.2"
+pollster = "0.4"
+rapier3d = { version = "=0.17.2", default-features = false, features = ["dim3", "f32"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+unicode-normalization = "=0.1.25"
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+webp = { version = "=0.3.1", default-features = false }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "gles", "vulkan", "wgsl"] }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1.1", features = ["rust_backend"] }
