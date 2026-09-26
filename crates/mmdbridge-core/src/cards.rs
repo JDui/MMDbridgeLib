@@ -427,6 +427,8 @@ fn thumbnail_version_current(
         library.motion_preview_model()?.and_then(|path| {
             crate::thumbnail::motion_preview_settings_version(Path::new(&path)).ok()
         })
+    } else if context.asset_type == AssetType::Scene {
+        Some(crate::thumbnail::SCENE_PREVIEW_SETTINGS_VERSION.to_owned())
     } else {
         Some(crate::thumbnail::PREVIEW_SETTINGS_VERSION.to_owned())
     };

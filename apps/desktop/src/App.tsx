@@ -7,6 +7,7 @@ import "./virtualized-grid.css";
 import "./review-status.css";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
+const MotionViewer = lazy(() => import("./MotionViewer"));
 
 function CardThumbnail({ assetId, alt }: { assetId: string; alt: string }) {
   const container = useRef<HTMLDivElement>(null);
@@ -58,6 +59,7 @@ function CardThumbnail({ assetId, alt }: { assetId: string; alt: string }) {
 }
 
 type AssetType = "model" | "motion" | "scene";
+type MotionFormat = "all" | "vmd" | "vpd";
 type Root = {
   id: string;
   assetType: AssetType;
@@ -83,6 +85,8 @@ type Asset = {
 };
 type AssetCursor = { name: string; id: string };
 type AssetPage = { items: Asset[]; nextCursor: AssetCursor | null };
+type AssetCounts = { all: number; model: number; motion: number; scene: number; byRoot: Record<string, number> };
+type AssetDirectory = { path: string; count: number };
 type AssetTag = { name: string; source: "user" | "agent" | "parser"; confidence: number | null };
 type Job = { id: string; status: string; kind: string; progress: number; asset_id?: string | null; error?: { message?: string } | null };
 type JobSummary = Record<string, number>;
@@ -233,8 +237,13 @@ export default function App() {
   const [loadingNextPage, setLoadingNextPage] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [savedFilters, setSavedFilters] = useState<SavedFilter[]>([]);
+  const [counts, setCounts] = useState<AssetCounts>({ all: 0, model: 0, motion: 0, scene: 0, byRoot: {} });
   const [activeType, setActiveType] = useState<AssetType | "all">("all");
+  const [activeMotionFormat, setActiveMotionFormat] = useState<MotionFormat>("all");
   const [activeRoot, setActiveRoot] = useState<string | null>(null);
+  const [activeDirectory, setActiveDirectory] = useState<string | null>(null);
+  const [assetDirectories, setAssetDirectories] = useState<AssetDirectory[]>([]);
+  useEffect(() => { setActiveDirectory(null); }, [activeRoot]);
   const [activeSavedFilterId, setActiveSavedFilterId] = useState<string | null>(null);
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [duplicatesOnly, setDuplicatesOnly] = useState(false);
@@ -248,7 +257,8 @@ export default function App() {
   const assetMenuRef = useRef<HTMLDivElement>(null);
   const [bulkSelectMode, setBulkSelectMode] = useState(false);
   const [bulkSelectedIds, setBulkSelectedIds] = useState<Set<string>>(() => new Set());
-  const [viewerAsset, setViewerAsset] = useState<{ id?: string; name: string; primarySource: string } | null>(null);
+  const [viewerAsset, setViewerAsset] = useState<{ id?: string; name: string; primarySource: string; assetType?: "model" | "scene" } | null>(null);
+  const [motionViewerAsset, setMotionViewerAsset] = useState<Asset | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [motionPreviewModel, setMotionPreviewModel] = useState<string | null>(null);
   const [thumbnailConcurrencyDraft, setThumbnailConcurrencyDraft] = useState<ThumbnailConcurrencySettings>({ parse: null, render: null, encode: null });
@@ -301,7 +311,7 @@ export default function App() {
 
   useEffect(() => {
     setBulkSelectedIds(new Set());
-  }, [activeRoot, activeSavedFilterId, activeType, duplicatesOnly, favoritesOnly, searchText]);
+  }, [activeRoot, activeDirectory, activeSavedFilterId, activeType, activeMotionFormat, duplicatesOnly, favoritesOnly, searchText]);
 
   const refresh = useCallback(async () => {
     const revision = ++assetQueryRevision.current;
@@ -321,8 +331,10 @@ export default function App() {
         ? invoke<AssetPage>("duplicate_assets_page", assetPageArgs)
         : invoke<AssetPage>("assets_page", {
           assetType: activeType === "all" ? null : activeType,
+          motionFormat: activeType === "motion" && activeMotionFormat !== "all" ? activeMotionFormat : null,
           query: searchText || null,
           rootId: activeRoot,
+          directoryPath: activeDirectory,
           favoritesOnly,
           filterId: activeSavedFilterId,
           cursor: null,
@@ -332,6 +344,8 @@ export default function App() {
       const reportError = (reason: unknown) => { if (current()) setError(String(reason)); };
       await Promise.allSettled([
         invoke<Root[]>("roots_list").then((value) => { if (current()) setRoots(value); }).catch(reportError),
+        invoke<AssetCounts>("asset_counts").then((value) => { if (current()) setCounts(value); }).catch(reportError),
+        activeRoot ? invoke<AssetDirectory[]>("asset_directories", { rootId: activeRoot }).then((value) => { if (current()) setAssetDirectories(value); }).catch(reportError) : Promise.resolve().then(() => { if (current()) setAssetDirectories([]); }),
         assetRequest.then((page) => {
           if (!current()) return;
           const visible = page.items.filter((asset) => !activeRoot || asset.rootId === activeRoot);
@@ -355,7 +369,7 @@ export default function App() {
     } finally {
       if (revision === assetQueryRevision.current) setIsRefreshing(false);
     }
-  }, [activeRoot, activeSavedFilterId, activeType, duplicatesOnly, favoritesOnly, searchText]);
+  }, [activeRoot, activeDirectory, activeSavedFilterId, activeType, activeMotionFormat, duplicatesOnly, favoritesOnly, searchText]);
 
   const loadNextAssetPage = useCallback(async () => {
     const cursor = nextAssetCursor;
@@ -374,8 +388,10 @@ export default function App() {
         })
         : await invoke<AssetPage>("assets_page", {
           assetType: activeType === "all" ? null : activeType,
+          motionFormat: activeType === "motion" && activeMotionFormat !== "all" ? activeMotionFormat : null,
           query: searchText || null,
           rootId: activeRoot,
+          directoryPath: activeDirectory,
           favoritesOnly,
           filterId: activeSavedFilterId,
           cursor,
@@ -393,7 +409,7 @@ export default function App() {
       if (assetPageLoading.current === revision) assetPageLoading.current = null;
       if (revision === assetQueryRevision.current) setLoadingNextPage(false);
     }
-  }, [activeRoot, activeSavedFilterId, activeType, duplicatesOnly, favoritesOnly, nextAssetCursor, searchText]);
+  }, [activeRoot, activeDirectory, activeSavedFilterId, activeType, activeMotionFormat, duplicatesOnly, favoritesOnly, nextAssetCursor, searchText]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -444,6 +460,9 @@ export default function App() {
         const previous = scanStatesRef.current;
         scanStatesRef.current = nextScans;
         setScanStates(nextScans);
+        if (nextScans.some((scan) => activeScanStatuses.has(scan.status))) {
+          void invoke<AssetCounts>("asset_counts").then((nextCounts) => { if (!disposed) setCounts(nextCounts); }).catch(() => {});
+        }
         if (previous.some((scan) => activeScanStatuses.has(scan.status)
           && ["Completed", "Paused", "Cancelled", "Failed"].includes(nextScans.find((next) => next.rootId === scan.rootId)?.status ?? ""))) {
           void refresh();
@@ -477,12 +496,6 @@ export default function App() {
     return () => { active = false; };
   }, [selected?.id]);
 
-  const counts = useMemo(() => ({
-    all: assets.length,
-    model: assets.filter((asset) => asset.assetType === "model").length,
-    motion: assets.filter((asset) => asset.assetType === "motion").length,
-    scene: assets.filter((asset) => asset.assetType === "scene").length,
-  }), [assets]);
   const activeJobs = useMemo(
     () => jobs.filter((job) => ["Pending", "Parsing", "Rendering", "Encoding"].includes(job.status)),
     [jobs],
@@ -498,7 +511,15 @@ export default function App() {
     setActiveSavedFilterId(null);
     setActiveType(type);
     setActiveRoot(null);
+    setActiveDirectory(null);
     setSelected(null);
+  }
+
+  function selectMotionFormat(format: MotionFormat) {
+    setActiveMotionFormat(format);
+    setAssets([]);
+    setSelected(null);
+    setNextAssetCursor(null);
   }
 
   async function addRoot(type: AssetType) {
@@ -1057,6 +1078,24 @@ export default function App() {
 
   const visibleAssets = assets.filter((asset) => (activeType === "all" || asset.assetType === activeType)
     && (!activeRoot || asset.rootId === activeRoot));
+  const folderRoot = roots.find((root) => root.id === activeRoot);
+  const folderBase = activeDirectory ?? folderRoot?.path ?? null;
+  const folderPrefix = folderBase ? `${folderBase.replace(/[\\/]+$/, "")}\\` : "";
+  const childFolders = new Map<string, { path: string; count: number }>();
+  if (folderRoot && folderBase) for (const directory of assetDirectories) {
+    if (!directory.path.toLowerCase().startsWith(folderPrefix.toLowerCase())) continue;
+    const segment = directory.path.slice(folderPrefix.length).split(/[\\/]/)[0];
+    if (!segment) continue;
+    const path = `${folderPrefix}${segment}`;
+    const previous = childFolders.get(path) ?? { path, count: 0 };
+    previous.count += directory.count;
+    childFolders.set(path, previous);
+  }
+  const indexedTotal = activeDirectory
+    ? assetDirectories.filter((directory) => directory.path.toLowerCase() === activeDirectory.toLowerCase()
+      || directory.path.toLowerCase().startsWith(`${activeDirectory.toLowerCase()}\\`)).reduce((total, directory) => total + directory.count, 0)
+    : activeRoot ? counts.byRoot[activeRoot] ?? 0 : activeType === "all" ? counts.all : counts[activeType];
+  const showIndexedTotal = !searchText && !favoritesOnly && !duplicatesOnly && !activeSavedFilterId && (activeType !== "motion" || activeMotionFormat === "all");
   const activeTitle = duplicatesOnly ? "重复项" : favoritesOnly ? "收藏" : savedFilters.find((filter) => filter.id === activeSavedFilterId)?.name ?? (activeRoot ? roots.find((root) => root.id === activeRoot)?.displayName ?? "Library" : activeType === "all" ? "全部资产" : categoryLabels[activeType]);
 
   return (
@@ -1080,11 +1119,10 @@ export default function App() {
               {roots.filter((root) => root.assetType === type).map((root) => (
                 <div className={`root-row ${activeRoot === root.id ? "selected" : ""}`} key={root.id}>
                   <button className="root-name" title={root.path} onClick={() => { setActiveType(type); setActiveRoot(root.id); setActiveSavedFilterId(null); setFavoritesOnly(false); setDuplicatesOnly(false); setSelected(null); }}>
-                    <span className={`root-dot ${root.enabled ? "" : "paused"}`} />{root.displayName}
+                    <span className={`root-dot ${root.enabled ? "" : "paused"}`} /><span className="root-label">{root.displayName}</span><span className="count">{counts.byRoot[root.id] ?? 0}</span>
                   </button>
                   {scanStates.find((scan) => scan.rootId === root.id && activeScanStatuses.has(scan.status)) &&
                     <span className="root-scan-percent" title="扫描进度">{Math.round((scanStates.find((scan) => scan.rootId === root.id)?.progress ?? 0) * 100)}%</span>}
-                  <button className={`root-action ${root.scanRecursive ? "recursive-on" : ""}`} title={root.scanRecursive ? "关闭递归扫描" : "开启递归扫描"} disabled={!!activeScans.length} onClick={() => void updateRoot(root, { scanRecursive: !root.scanRecursive })}>↳</button>
                   <button className="root-action" title="修改显示名称" disabled={!!activeScans.length} onClick={() => renameRoot(root)}>✎</button>
                   <button className="root-action" title="扫描目录" disabled={busy || !root.enabled} onClick={() => void scanRoot(root)}>↻</button>
                   <button className="root-action" title="完整检查源文件内容及资源卡版本" disabled={busy || !root.enabled || scanStates.some((scan) => scan.rootId === root.id && (activeScanStatuses.has(scan.status) || scan.status === "Paused"))} onClick={() => void scanRoot(root, true)}>✓</button>
@@ -1127,7 +1165,7 @@ export default function App() {
         <div className="library-content" ref={setLibraryScrollParent}>
           <div className="page-heading">
             <div><div className="eyebrow">YOUR COLLECTION</div><h1>{activeTitle}</h1><p>浏览、搜索并整理你的 MMD 资产</p></div>
-            <div className="view-controls"><button className="open-model-button" onClick={() => void openModelPreview()}>＋ 打开 PMX</button><span className="asset-total"><b>{visibleAssets.length.toLocaleString()}{nextAssetCursor ? "+" : ""}</b> 项资产</span><label className="card-size-control">卡片大小 <input type="range" min="130" max="300" step="10" value={cardSize} aria-label="资产卡片大小" onChange={(event) => setCardSize(Number(event.target.value))} /></label></div>
+            <div className="view-controls"><button className="open-model-button" onClick={() => void openModelPreview()}>＋ 打开 PMX</button><span className="asset-total"><b>{(showIndexedTotal ? indexedTotal : visibleAssets.length).toLocaleString()}{!showIndexedTotal && nextAssetCursor ? "+" : ""}</b> {showIndexedTotal ? "在库资产" : "已加载资产"}</span><label className="card-size-control">卡片大小 <input type="range" min="130" max="300" step="10" value={cardSize} aria-label="资产卡片大小" onChange={(event) => setCardSize(Number(event.target.value))} /></label></div>
           </div>
 
           <div className="type-tabs" role="tablist" aria-label="资产类型过滤">
@@ -1137,6 +1175,14 @@ export default function App() {
             <button className="quick-add" disabled={busy} onClick={() => { setBulkSelectMode((mode) => !mode); setBulkSelectedIds(new Set()); }}>{bulkSelectMode ? "退出批量选择" : "批量选择"}</button>
             {activeType !== "all" && <button className="quick-add" onClick={() => void addRoot(activeType)}><span>＋</span> 添加目录</button>}
           </div>
+          {activeType === "motion" && !activeSavedFilterId && !duplicatesOnly && <div className="motion-format-tabs" role="tablist" aria-label="动作文件格式">
+            {([ ["all", "全部动作"], ["vmd", "VMD 动作"], ["vpd", "VPD 姿势"] ] as Array<[MotionFormat, string]>).map(([format, label]) =>
+              <button key={format} role="tab" aria-selected={activeMotionFormat === format} className={activeMotionFormat === format ? "selected" : ""} onClick={() => selectMotionFormat(format)}>{label}</button>)}
+          </div>}
+          {folderRoot && !favoritesOnly && !duplicatesOnly && !activeSavedFilterId && <section className="folder-browser" aria-label="按文件夹浏览资产">
+            <div className="folder-breadcrumbs"><button onClick={() => setActiveDirectory(null)}>{folderRoot.displayName}</button>{activeDirectory?.slice(folderRoot.path.length).split(/[\\/]/).filter(Boolean).map((part, index, all) => <button key={`${part}-${index}`} onClick={() => setActiveDirectory(`${folderRoot.path.replace(/[\\/]+$/, "")}\\${all.slice(0, index + 1).join("\\")}`)}>› {part}</button>)}</div>
+            {childFolders.size > 0 && <div className="folder-children">{Array.from(childFolders.values()).sort((left, right) => left.path.localeCompare(right.path, "zh-CN")).map((folder) => <button key={folder.path} onClick={() => { setActiveDirectory(folder.path); setSelected(null); }} title={folder.path}><span>▤</span><strong>{folder.path.split(/[\\/]/).pop()}</strong><small>{folder.count.toLocaleString()}</small></button>)}</div>}
+          </section>}
 
           {bulkSelectMode && <div className="bulk-actions" aria-label="批量操作">
             <span>已选择 {bulkSelectedIds.size} 项</span>
@@ -1182,7 +1228,7 @@ export default function App() {
             itemContent={(index, asset) => <button className={`asset-card ${selected?.id === asset.id ? "selected" : ""} ${bulkSelectedIds.has(asset.id) ? "bulk-selected" : ""}`} aria-pressed={bulkSelectMode ? bulkSelectedIds.has(asset.id) : selected?.id === asset.id} onClick={() => toggleBulkSelection(asset)} onDoubleClick={() => { if (!bulkSelectMode) setPreviewAsset(asset); }} onContextMenu={(event) => openAssetMenu(event, asset)} style={{ animationDelay: `${Math.min(index, 18) * 18}ms` }}>
               <div className={`asset-art ${asset.assetType} ${asset.hasThumbnail ? "has-thumbnail" : ""}`}>
                 {asset.hasThumbnail && <CardThumbnail assetId={asset.id} alt={`${asset.name} 缩略图`} />}
-                <div className="art-orbit orbit-one" /><div className="art-orbit orbit-two" /><div className="art-glow" /><span className="art-glyph">{categoryGlyphs[asset.assetType]}</span><span className="art-format">{String(asset.metadata.file_type ?? asset.assetType).toUpperCase()}</span>{asset.isFavorite && <span className="favorite-marker">★</span>}{asset.cardStatus !== "CardValid" || !asset.hasThumbnail ? <span className="missing-preview">预览待生成</span> : null}
+                <div className="art-orbit orbit-one" /><div className="art-orbit orbit-two" /><div className="art-glow" /><span className="art-glyph">{categoryGlyphs[asset.assetType]}</span><span className="art-format">{String(asset.metadata.file_type ?? asset.assetType).toUpperCase()}</span>{typeof asset.metadata.paired_camera_path === "string" && <span className="paired-camera-marker" title={`同目录配套镜头：${asset.metadata.paired_camera_path}`}>◉ 镜头</span>}{asset.isFavorite && <span className="favorite-marker">★</span>}{asset.cardStatus !== "CardValid" || !asset.hasThumbnail ? <span className="missing-preview">预览待生成</span> : null}
               </div>
               <div className="asset-card-body"><div className="asset-card-title" title={asset.name}>{asset.name}</div><div className="asset-card-subline"><span className={`badge ${asset.assetType}`}>{String(asset.metadata.is_camera_only ? "CAMERA" : asset.metadata.is_pose ? "POSE" : asset.assetType).toUpperCase()}</span><span className="asset-source-name" title={asset.primarySource}>{asset.primarySource.split(/[\\/]/).pop()}</span></div></div>
               {bulkSelectMode && <span className={`asset-bulk-checkbox ${bulkSelectedIds.has(asset.id) ? "checked" : ""}`} aria-hidden="true">{bulkSelectedIds.has(asset.id) ? "✓" : ""}</span>}
@@ -1245,12 +1291,13 @@ export default function App() {
             return <div className="relation-card" key={duplicate.id} title={otherPath}><div className="relation-card-main"><strong>{exact ? "内容完全相同" : "可能重复"}</strong><span>{otherName}</span></div><div className="relation-card-meta"><span>{exact ? "BLAKE3 内容相同" : "名称、文件与结构相似"}</span><span>{Math.round(duplicate.similarity * 100)}%</span></div></div>;
           })}</div></div>}
           <div className="inspector-spacer" />
-          <div className="inspector-actions"><button onClick={() => void revealAsset(selected)} title="在资源管理器中定位源文件"><span>↗</span> 在文件夹中显示</button><button onClick={() => void openAssetDirectory(selected)} title="打开资产源目录">打开目录</button>{selected.assetType === "model" && <button className="preview-3d-button" onClick={() => setViewerAsset(selected)}><span>◇</span> 3D 预览</button>}</div>
+          <div className="inspector-actions"><button onClick={() => void revealAsset(selected)} title="在资源管理器中定位源文件"><span>↗</span> 在文件夹中显示</button><button onClick={() => void openAssetDirectory(selected)} title="打开资产源目录">打开目录</button>{selected.assetType !== "motion" && <button className="preview-3d-button" onClick={() => setViewerAsset({ id: selected.id, name: selected.name, primarySource: selected.primarySource, assetType: selected.assetType as "model" | "scene" })}><span>◇</span> 3D 预览</button>}{selected.assetType === "motion" && selected.primarySource.toLowerCase().endsWith(".vmd") && <button className="preview-3d-button" onClick={() => setMotionViewerAsset(selected)}><span>▶</span> 3D 动作</button>}</div>
         </> : <div className="inspector-empty"><div className="inspector-empty-icon">◇</div><strong>选择一个资产</strong><span>详细信息将在此处显示</span></div>}
       </aside>
       {assetMenu && <div className="asset-context-menu" ref={assetMenuRef} role="menu" aria-label={`${assetMenu.asset.name} 操作`} style={{ left: assetMenu.x, top: assetMenu.y }}>
         <button role="menuitem" onClick={() => { setPreviewAsset(assetMenu.asset); setAssetMenu(null); }}>查看缩略图</button>
-        {assetMenu.asset.assetType === "model" && <button role="menuitem" onClick={() => { setViewerAsset(assetMenu.asset); setAssetMenu(null); }}>查看 3D 模型</button>}
+        {assetMenu.asset.assetType !== "motion" && <button role="menuitem" onClick={() => { setViewerAsset({ id: assetMenu.asset.id, name: assetMenu.asset.name, primarySource: assetMenu.asset.primarySource, assetType: assetMenu.asset.assetType as "model" | "scene" }); setAssetMenu(null); }}>查看 3D {assetMenu.asset.assetType === "scene" ? "场景" : "模型"}</button>}
+        {assetMenu.asset.assetType === "motion" && assetMenu.asset.primarySource.toLowerCase().endsWith(".vmd") && <button role="menuitem" onClick={() => { setMotionViewerAsset(assetMenu.asset); setAssetMenu(null); }}>播放 3D 动作{typeof assetMenu.asset.metadata.paired_camera_path === "string" ? " / 配套镜头" : ""}</button>}
         <div className="asset-context-separator" role="separator" />
         <button role="menuitem" onClick={() => { void revealAsset(assetMenu.asset); setAssetMenu(null); }}>在文件夹中显示</button>
         <button role="menuitem" onClick={() => { void openAssetDirectory(assetMenu.asset); setAssetMenu(null); }}>打开所在目录</button>
@@ -1284,6 +1331,7 @@ export default function App() {
         {!previewAsset.hasThumbnail && <div className="settings-modal-actions"><button onClick={() => { void createCard(previewAsset.id); setPreviewAsset(null); }}>生成资源卡和缩略图</button></div>}
       </section></div>}
       {viewerAsset && <Suspense fallback={<div role="status" style={{ position: "fixed", inset: 0, zIndex: 50, display: "grid", placeItems: "center", background: "#050a0de8", color: "#bbcbc9", fontSize: 12 }}>正在载入 3D Viewer…</div>}><ModelViewer asset={viewerAsset} onClose={() => setViewerAsset(null)} /></Suspense>}
+      {motionViewerAsset && <Suspense fallback={<div role="status" style={{ position: "fixed", inset: 0, zIndex: 50, display: "grid", placeItems: "center", background: "#050a0de8", color: "#bbcbc9", fontSize: 12 }}>正在载入 VMD 3D Viewer…</div>}><MotionViewer asset={motionViewerAsset} onClose={() => setMotionViewerAsset(null)} /></Suspense>}
       {assetOperationPlan && <div className="operation-modal-backdrop" role="presentation"><section className="operation-modal" role="dialog" aria-modal="true" aria-labelledby="operation-plan-title">
         <div className="settings-modal-heading"><div><span>PACKAGE OPERATION</span><h2 id="operation-plan-title">确认资产操作</h2></div><button className="icon-button" aria-label="关闭操作计划" onClick={() => setAssetOperationPlan(null)}>×</button></div>
         <p className="operation-summary">{assetOperationPlan.operation === "move" ? "移动" : assetOperationPlan.operation === "rename" ? "重命名" : "发送到 Windows 回收站"}将影响 {assetOperationPlan.sourcePaths.length} 个资产包、{assetOperationPlan.affectedAssets.length} 项索引资产。</p>

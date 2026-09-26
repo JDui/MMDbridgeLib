@@ -427,6 +427,8 @@ pub(crate) fn list_asset_page(
     favorite_only: bool,
     cursor: Option<&AssetCursor>,
     limit: usize,
+    motion_format: Option<&str>,
+    directory_path: Option<&str>,
 ) -> CoreResult<AssetPage> {
     let type_text = asset_type.map(|asset_type| asset_type.as_str().to_owned());
     list_asset_page_with_predicate(
@@ -434,10 +436,14 @@ pub(crate) fn list_asset_page(
         query,
         root_id,
         limit,
-        "(?2 IS NULL OR a.asset_type=?2) AND (?3=0 OR EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id))",
+        "(?2 IS NULL OR a.asset_type=?2) AND (?3=0 OR EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id))
+         AND (?4 IS NULL OR (a.asset_type='motion' AND lower(a.primary_source) LIKE ('%.' || ?4)))
+         AND (?5 IS NULL OR a.asset_directory=?5 OR substr(a.asset_directory,1,length(?5)+1)=?5 || char(92))",
         vec![
             type_text.map(SqlValue::Text).unwrap_or(SqlValue::Null),
             SqlValue::Integer(if favorite_only { 1 } else { 0 }),
+            motion_format.map(|value| SqlValue::Text(value.to_owned())).unwrap_or(SqlValue::Null),
+            directory_path.map(|value| SqlValue::Text(value.to_owned())).unwrap_or(SqlValue::Null),
         ],
         cursor,
     )
@@ -474,7 +480,10 @@ pub(crate) fn list_assets_with_predicate(
     let limit_parameter = filter_values.len() + 2;
     let sql = format!(
         "SELECT a.id,a.asset_type,a.root_id,a.name,a.primary_source,a.asset_directory,a.fingerprint,a.statuses_json,a.updated_at,m.value_json,COALESCE(c.status,'CardMissing'),c.manifest_json,
-                EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id)
+                EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id),
+                (SELECT camera.primary_source FROM relations r JOIN assets camera ON camera.id=r.target_asset
+                 WHERE r.relation_type='MotionCameraPair' AND r.source_asset=a.id
+                   AND camera.asset_directory=a.asset_directory ORDER BY r.confidence DESC LIMIT 1)
          FROM assets a LEFT JOIN metadata m ON m.asset_id=a.id AND m.key='parsed' LEFT JOIN cards c ON c.asset_id=a.id
          WHERE {ASSET_SEARCH_PREDICATE}
            AND ({predicate})
@@ -513,7 +522,10 @@ pub(crate) fn list_asset_page_with_predicate(
     let limit_parameter = root_parameter + 3;
     let sql = format!(
         "SELECT a.id,a.asset_type,a.root_id,a.name,a.primary_source,a.asset_directory,a.fingerprint,a.statuses_json,a.updated_at,m.value_json,COALESCE(c.status,'CardMissing'),c.manifest_json,
-                EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id)
+                EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id),
+                (SELECT camera.primary_source FROM relations r JOIN assets camera ON camera.id=r.target_asset
+                 WHERE r.relation_type='MotionCameraPair' AND r.source_asset=a.id
+                   AND camera.asset_directory=a.asset_directory ORDER BY r.confidence DESC LIMIT 1)
          FROM assets a LEFT JOIN metadata m ON m.asset_id=a.id AND m.key='parsed' LEFT JOIN cards c ON c.asset_id=a.id
          WHERE {ASSET_SEARCH_PREDICATE}
            AND ({predicate})
@@ -615,6 +627,11 @@ fn search_query_parameter(query: &str) -> Option<String> {
 
 fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
     let raw_type: String = row.get(1)?;
+    let preview_settings_version = if raw_type == "scene" {
+        crate::thumbnail::SCENE_PREVIEW_SETTINGS_VERSION
+    } else {
+        crate::thumbnail::PREVIEW_SETTINGS_VERSION
+    };
     let statuses_json: String = row.get(7)?;
     let metadata_json: Option<String> = row.get(9)?;
     let manifest_json: Option<String> = row.get(11)?;
@@ -627,13 +644,21 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
             && thumbnail.pointer("/render_report/rendererVersion").and_then(Value::as_str)
                 == Some(crate::thumbnail::RENDERER_VERSION)
             && thumbnail.pointer("/render_report/previewSettingsVersion").and_then(Value::as_str)
-                .is_some_and(|version| version.starts_with(crate::thumbnail::PREVIEW_SETTINGS_VERSION))
+                .is_some_and(|version| version.starts_with(preview_settings_version))
     });
     let card_status: String = row.get(10)?;
     let card_status = if thumbnail.is_some_and(|thumbnail| !thumbnail.is_null())
         && !has_thumbnail && card_status == "CardValid" {
         "CardStale".to_owned()
     } else { card_status };
+    let mut metadata = metadata_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Value>(json).ok())
+        .unwrap_or(Value::Null);
+    let paired_camera: Option<String> = row.get(13)?;
+    if let (Some(path), Some(object)) = (paired_camera, metadata.as_object_mut()) {
+        object.insert("paired_camera_path".to_owned(), Value::String(path));
+    }
     Ok(Asset {
         id: row.get(0)?,
         asset_type: AssetType::parse(&raw_type).unwrap_or(AssetType::Model),
@@ -642,10 +667,7 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         primary_source: row.get(4)?,
         asset_directory: row.get(5)?,
         fingerprint: row.get(6)?,
-        metadata: metadata_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok())
-            .unwrap_or(Value::Null),
+        metadata,
         statuses: parse_statuses(&statuses_json),
         updated_at: row.get(8)?,
         card_status,

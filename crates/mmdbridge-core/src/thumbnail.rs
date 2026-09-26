@@ -23,7 +23,8 @@ const WIDTH: u32 = 1024;
 const HEIGHT: u32 = 1024;
 const QUALITY: f32 = 50.0;
 pub(crate) const RENDERER_VERSION: &str = "0.5.0";
-pub(crate) const PREVIEW_SETTINGS_VERSION: &str = "front-minus-z-conservative-frame-alpha-v5";
+pub(crate) const PREVIEW_SETTINGS_VERSION: &str = "front-minus-z-posed-frame-soft-matcap-v6";
+pub(crate) const SCENE_PREVIEW_SETTINGS_VERSION: &str = "scene-center-165cm-wide-camera-soft-matcap-v2";
 const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TEXTURE_DIMENSION: u32 = 4096;
 const MAX_TEXTURE_DECODE_DIMENSION: u32 = 8192;
@@ -142,6 +143,7 @@ struct RenderInput {
     material_ranges: Vec<MaterialRange>,
     materials: Vec<RenderMaterial>,
     camera: Option<mmd_anim_format::vmd::VmdCameraState>,
+    scene_view: bool,
     framing_bounds: Option<(Vec3, Vec3)>,
     diagnostics: Vec<String>,
 }
@@ -183,15 +185,13 @@ pub(crate) fn render_file_with_progress(
         ));
     }
     let bytes = std::fs::read(path)?;
-    let input = if extension.eq_ignore_ascii_case("pmx") {
+    let mut input = if extension.eq_ignore_ascii_case("pmx") {
         let model = parse_pmx_model(&bytes)
             .map_err(|error| CoreError::ThumbnailRender(format!("PMX 解析失败：{error}")))?;
         if !progress("Parsing", 0.20) {
             return Err(CoreError::ThumbnailCancelled);
         }
-        let mut input = render_input_from_pmx(&bytes, &model)?;
-        if scene_asset { input.framing_bounds = None; }
-        input
+        render_input_from_pmx(&bytes, &model)?
     } else if extension.eq_ignore_ascii_case("pmd") {
         let model = parse_pmd_model(&bytes)
             .map_err(|error| CoreError::ThumbnailRender(format!("PMD 解析失败：{error}")))?;
@@ -218,6 +218,10 @@ pub(crate) fn render_file_with_progress(
             extension.to_ascii_lowercase()
         )));
     };
+    if scene_asset {
+        input.scene_view = true;
+        input.framing_bounds = None;
+    }
     drop(parse_permit);
     if !progress("Rendering", 0.40) {
         return Err(CoreError::ThumbnailCancelled);
@@ -241,6 +245,83 @@ pub(crate) fn motion_preview_settings_version(model_path: &Path) -> CoreResult<S
         model_path.to_string_lossy(),
         metadata.len()
     ))
+}
+
+fn scene_view_input(path: &Path) -> CoreResult<RenderInput> {
+    if std::fs::metadata(path)?.len() > MAX_SOURCE_BYTES {
+        return Err(CoreError::ModelPreview("场景超过 512 MiB 预览上限".to_owned()));
+    }
+    let bytes = std::fs::read(path)?;
+    match path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase().as_str() {
+        "pmx" => {
+            let model = parse_pmx_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?;
+            render_input_from_pmx(&bytes, &model)
+        }
+        "pmd" => {
+            let model = parse_pmd_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?;
+            render_input_from_pmd(&model)
+        }
+        "x" => {
+            let manifest = if crate::x_binary::is_binary_x(&bytes) {
+                crate::x_binary::parse_binary_x(&bytes)
+                    .map_err(|error| CoreError::ModelPreview(error.to_string()))?
+            } else {
+                parse_accessory_manifest(&bytes, path.file_name().and_then(|name| name.to_str()))
+                    .map_err(|error| CoreError::ModelPreview(error.to_string()))?
+            };
+            render_input_from_x(&manifest)
+        }
+        _ => Err(CoreError::ModelPreview("3D 场景预览只支持 PMX、PMD 和 X".to_owned())),
+    }
+}
+
+pub(crate) fn scene_preview_file(path: &Path) -> CoreResult<Vec<u8>> {
+    let input = scene_view_input(path)?;
+    let vertex_count = input.vertices.len();
+    let group_count = input.material_ranges.len();
+    let texture_paths = input.material_ranges.iter().map(|group| {
+        input.materials.get(group.material_index).map(|material| material.texture_path.as_str()).unwrap_or("")
+    }).collect::<Vec<_>>();
+    let texture_bytes = texture_paths.iter().map(|path| 4usize.saturating_add(path.len())).sum::<usize>();
+    let capacity = 24usize.checked_add(vertex_count.checked_mul(104).ok_or_else(|| CoreError::ModelPreview("场景网格过大".to_owned()))?)
+        .and_then(|size| size.checked_add(input.indices.len().checked_mul(4)?))
+        .and_then(|size| size.checked_add(group_count.checked_mul(24)?))
+        .and_then(|size| size.checked_add(texture_bytes))
+        .ok_or_else(|| CoreError::ModelPreview("场景预览大小溢出".to_owned()))?;
+    if capacity > 256 * 1024 * 1024 { return Err(CoreError::ModelPreview("场景网格超过 256 MiB 预览上限".to_owned())); }
+    let mut output = Vec::with_capacity(capacity);
+    output.extend_from_slice(b"MMDV");
+    for count in [3u32, vertex_count as u32, input.indices.len() as u32, group_count as u32, 0u32] {
+        output.extend_from_slice(&count.to_le_bytes());
+    }
+    for (index, vertex) in input.vertices.iter().enumerate() {
+        let uv = input.uvs.get(index).copied().unwrap_or([0.0; 2]);
+        let payload = [vertex.position.x,vertex.position.y,vertex.position.z,
+            vertex.normal.x,vertex.normal.y,vertex.normal.z,uv[0],uv[1],
+            0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,
+            0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0];
+        for value in payload { output.extend_from_slice(&finite_or_zero(value).to_le_bytes()); }
+    }
+    for index in input.indices { output.extend_from_slice(&index.to_le_bytes()); }
+    for group in input.material_ranges {
+        output.extend_from_slice(&(group.start as u32).to_le_bytes());
+        output.extend_from_slice(&(group.count as u32).to_le_bytes());
+        let color = input.materials.get(group.material_index).map(|material| material.diffuse).unwrap_or([0.72,0.76,0.79,1.0]);
+        for value in color { output.extend_from_slice(&finite_or_zero(value).to_le_bytes()); }
+    }
+    for path in texture_paths {
+        output.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        output.extend_from_slice(path.as_bytes());
+    }
+    Ok(output)
+}
+
+pub(crate) fn scene_preview_texture_file(path: &Path, texture_path: &str) -> CoreResult<Option<(Vec<u8>, u8)>> {
+    let input = scene_view_input(path)?;
+    if !input.materials.iter().any(|material| material.texture_path == texture_path) {
+        return Err(CoreError::ModelPreview("贴图未被该场景引用".to_owned()));
+    }
+    preview_texture_png(path, texture_path)
 }
 
 pub(crate) fn render_vpd_motion_file_with_progress(
@@ -289,6 +370,7 @@ pub(crate) fn render_vpd_motion_file_with_progress(
         return Err(CoreError::ThumbnailCancelled);
     }
     let mut input = render_input_from_pmx_with_pose(&model_bytes, &model, Some(&pose), None, None)?;
+    input.framing_bounds = None;
     input.diagnostics.push("MotionPreview:VPD".to_owned());
     drop(parse_permit);
     render_motion_input_with_progress(preview_model_path, input, None, progress)
@@ -408,6 +490,7 @@ pub(crate) fn render_vmd_motion_file_with_progress(
     }
     let mut input =
         render_input_from_pmx_with_pose(&model_bytes, &model, None, Some(&sample), camera)?;
+    input.framing_bounds = None;
     input
         .diagnostics
         .push(format!("MotionPreview:VMD:{preview_frame}"));
@@ -577,6 +660,7 @@ fn render_input_from_pmx_with_pose(
         material_ranges,
         materials,
         camera,
+        scene_view: false,
         framing_bounds: character_skeleton_bounds(model),
         diagnostics,
     })
@@ -774,6 +858,7 @@ fn render_input_from_pmd(model: &PmdParsedModel) -> CoreResult<RenderInput> {
         material_ranges,
         materials,
         camera: None,
+        scene_view: false,
         framing_bounds: None,
         diagnostics,
     })
@@ -964,6 +1049,7 @@ fn render_input_from_x(manifest: &AccessoryParsedManifest) -> CoreResult<RenderI
         material_ranges,
         materials,
         camera: None,
+        scene_view: false,
         framing_bounds: None,
         diagnostics,
     })
@@ -1860,6 +1946,7 @@ impl GpuRenderer {
             material_ranges,
             materials,
             camera,
+            scene_view,
             framing_bounds,
             mut diagnostics,
         } = input;
@@ -1883,9 +1970,14 @@ impl GpuRenderer {
             ((minimum + maximum) * 0.5, mesh_half_extent)
         };
         let depth_range = (maximum.z - minimum.z).max(0.001);
-        let camera_view_projection = camera.and_then(|camera| {
-            vmd_camera_view_projection(camera, &source_vertices, &mut diagnostics)
-        });
+        let camera_view_projection = if scene_view {
+            diagnostics.push("SceneWideCamera:165cm:90deg".to_owned());
+            Some(scene_camera_view_projection(&source_vertices))
+        } else {
+            camera.and_then(|camera| {
+                vmd_camera_view_projection(camera, &source_vertices, &mut diagnostics)
+            })
+        };
         if camera.is_some() && camera_view_projection.is_none() {
             diagnostics.push("InvalidVmdCamera:usingAutoFraming".to_owned());
         }
@@ -2118,9 +2210,15 @@ impl GpuRenderer {
             preview_webp,
             report: ThumbnailRenderReport {
                 renderer_version: RENDERER_VERSION.to_owned(),
-                preview_settings_version: PREVIEW_SETTINGS_VERSION.to_owned(),
+                preview_settings_version: if scene_view {
+                    SCENE_PREVIEW_SETTINGS_VERSION.to_owned()
+                } else {
+                    PREVIEW_SETTINGS_VERSION.to_owned()
+                },
                 adapter: self.adapter_name.clone(),
-                front_axis: if camera_view_projection.is_some() {
+                front_axis: if scene_view {
+                    "scene center -Z, eye 165cm (+Y up)".to_owned()
+                } else if camera_view_projection.is_some() {
                     "VMD camera track (+Y up)".to_owned()
                 } else {
                     "-Z (+Y up)".to_owned()
@@ -2591,6 +2689,19 @@ fn character_skeleton_bounds(model: &PmxParsedModel) -> Option<(Vec3, Vec3)> {
         .then_some((minimum, maximum))
 }
 
+fn scene_camera_view_projection(vertices: &[SkinnedVertex]) -> Mat4 {
+    // MMD's commonly used scale is approximately 8 cm per world unit.
+    let eye = Vec3::new(0.0, 165.0 / 8.0, 0.0);
+    let far = vertices.iter()
+        .map(|vertex| vertex.position.distance(eye))
+        .filter(|distance| distance.is_finite())
+        .fold(250.0f32, f32::max)
+        .mul_add(1.25, 0.0)
+        .min(100_000.0);
+    Mat4::perspective_rh(90.0f32.to_radians(), WIDTH as f32 / HEIGHT as f32, 0.1, far)
+        * Mat4::look_at_rh(eye, eye - Vec3::Z, Vec3::Y)
+}
+
 fn vmd_camera_view_projection(
     camera: mmd_anim_format::vmd::VmdCameraState,
     vertices: &[SkinnedVertex],
@@ -2895,6 +3006,10 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @l
     let half_vector = normalize(light_direction + vec3<f32>(0.0, 0.0, 1.0));
     let specular_strength = pow(max(dot(normal, half_vector), 0.0), max(material.specular.a, 1.0));
     color += material.specular.rgb * specular_strength * diffuse_light;
+    // A restrained view-facing matcap fill keeps dark diffuse materials legible in small cards.
+    let matcap_normal = normalize(normal + vec3<f32>(0.0, 0.0, 0.35));
+    let matcap_light = pow(max(dot(matcap_normal, normalize(vec3<f32>(-0.32, 0.55, 0.78))), 0.0), 3.0);
+    color += vec3<f32>(0.075, 0.09, 0.105) * matcap_light;
     return vec4<f32>(color, texel.a * material.texture_factor.a * material.diffuse.a * vertex_alpha);
 }
 "#;

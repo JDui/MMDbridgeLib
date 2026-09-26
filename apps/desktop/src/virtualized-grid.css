@@ -1,4 +1,23 @@
-.asset-grid-item{min-width:0;align-self:start}
-.asset-grid-item>.asset-card{width:100%}
-.asset-grid-waiting{padding:28px;color:#82939b;font-size:11px}
-.asset-grid-footer{padding:22px 8px;color:#82939b;text-align:center;font-size:11px}
+.asset-grid-item {
+  min-width: 0;
+  align-self: start;
+}
+
+.asset-grid-item > .asset-card {
+  width: 100%;
+}
+
+.asset-grid-waiting {
+  padding: 28px;
+  color: var(--text-3, #8b99a7);
+  font-size: 11.5px;
+  animation: fade-up .4s var(--e-expo, cubic-bezier(.16, 1, .3, 1)) both;
+}
+
+.asset-grid-footer {
+  padding: 22px 8px;
+  color: var(--text-3, #8b99a7);
+  text-align: center;
+  font-size: 11.5px;
+  animation: fade-up .45s var(--e-expo, cubic-bezier(.16, 1, .3, 1)) both;
+}

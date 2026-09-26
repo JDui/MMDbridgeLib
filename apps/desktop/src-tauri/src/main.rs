@@ -74,6 +74,16 @@ async fn roots_list(state: State<'_, CoreState>) -> Result<Vec<Root>, ApiError> 
 }
 
 #[tauri::command]
+async fn asset_counts(state: State<'_, CoreState>) -> Result<serde_json::Value, ApiError> {
+    read_core(state.0.clone(), |library| library.asset_counts()).await
+}
+
+#[tauri::command]
+async fn asset_directories(state: State<'_, CoreState>, root_id: String) -> Result<Vec<serde_json::Value>, ApiError> {
+    read_core(state.0.clone(), move |library| library.asset_directories(&root_id)).await
+}
+
+#[tauri::command]
 fn root_add(
     state: State<'_, CoreState>,
     asset_type: String,
@@ -150,10 +160,32 @@ async fn model_preview(state: State<'_, CoreState>, asset_id: String) -> Result<
 }
 
 #[tauri::command]
+async fn motion_preview_frame(state: State<'_, CoreState>, asset_id: String, frame: u32) -> Result<serde_json::Value, ApiError> {
+    read_core(state.0.clone(), move |library| library.motion_preview_frame(&asset_id, frame)).await
+}
+
+#[tauri::command]
 async fn model_preview_file(state: State<'_, CoreState>, path: String) -> Result<Response, ApiError> {
     read_core(state.0.clone(), move |library| library.model_preview_file(std::path::Path::new(&path)))
         .await
         .map(Response::new)
+}
+
+#[tauri::command]
+async fn scene_preview(state: State<'_, CoreState>, asset_id: String) -> Result<Response, ApiError> {
+    read_core(state.0.clone(), move |library| library.scene_preview(&asset_id)).await.map(Response::new)
+}
+
+#[tauri::command]
+async fn scene_preview_texture(state: State<'_, CoreState>, asset_id: String, texture_path: String) -> Result<Response, ApiError> {
+    read_core(state.0.clone(), move |library| library.scene_preview_texture(&asset_id, &texture_path))
+        .await.map(|texture| {
+            let Some((png, alpha_mode)) = texture else { return Response::new(Vec::new()); };
+            let mut payload = Vec::with_capacity(png.len() + 1);
+            payload.push(alpha_mode);
+            payload.extend_from_slice(&png);
+            Response::new(payload)
+        })
 }
 
 #[tauri::command]
@@ -275,6 +307,8 @@ fn assets_list(
 async fn assets_page(
     state: State<'_, CoreState>,
     asset_type: Option<String>,
+    motion_format: Option<String>,
+    directory_path: Option<String>,
     query: Option<String>,
     root_id: Option<String>,
     favorites_only: Option<bool>,
@@ -289,11 +323,16 @@ async fn assets_page(
         }
         None => None,
     };
+    let motion_format = match motion_format.as_deref() {
+        None => None,
+        Some("vmd" | "vpd") if kind == Some(AssetType::Motion) => motion_format,
+        Some(value) => return Err(ApiError::from(CoreError::InvalidAssetType(value.to_owned()))),
+    };
     read_core(state.0.clone(), move |library| {
         if let Some(filter_id) = filter_id {
             library.apply_saved_filter_page(&filter_id, query.as_deref(), root_id.as_deref(), cursor.as_ref(), page_size)
         } else {
-            library.list_asset_page(kind, query.as_deref(), root_id.as_deref(), favorites_only.unwrap_or(false), cursor.as_ref(), page_size)
+            library.list_asset_page(kind, query.as_deref(), root_id.as_deref(), favorites_only.unwrap_or(false), cursor.as_ref(), page_size, motion_format.as_deref(), directory_path.as_deref())
         }
     }).await
 }
@@ -689,7 +728,10 @@ fn main() {
             scan_continue,
             scan_move,
             model_preview,
+            motion_preview_frame,
             model_preview_file,
+            scene_preview,
+            scene_preview_texture,
             model_preview_texture_file,
             motion_preview_model_get,
             motion_preview_model_set,
@@ -700,6 +742,8 @@ fn main() {
             operation_journal_list,
             operation_journal_resolve,
             assets_list,
+            asset_counts,
+            asset_directories,
             assets_page,
             duplicate_assets_page,
             asset_reveal,

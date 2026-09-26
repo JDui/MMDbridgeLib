@@ -4,4 +4,7 @@
   overflow-wrap: anywhere;
   text-align: right;
   line-height: 1.5;
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+  color: var(--amber);
 }

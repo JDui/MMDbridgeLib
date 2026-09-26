@@ -383,9 +383,21 @@ fn asset_id_for_job(library: &Library, job_id: &str) -> CoreResult<String> {
 }
 
 fn get_job(library: &Library, job_id: &str) -> CoreResult<Value> {
-    library
-        .list_jobs()?
-        .into_iter()
-        .find(|job| job.get("id").and_then(Value::as_str) == Some(job_id))
+    let connection = library.connection()?;
+    connection.query_row(
+        "SELECT id,asset_id,kind,priority,status,progress,error_json,created_at,updated_at
+         FROM jobs WHERE id=?1",
+        [job_id],
+        |row| {
+            let error_json: Option<String> = row.get(6)?;
+            Ok(serde_json::json!({
+                "id":row.get::<_,String>(0)?, "asset_id":row.get::<_,Option<String>>(1)?,
+                "kind":row.get::<_,String>(2)?, "priority":row.get::<_,i64>(3)?,
+                "status":row.get::<_,String>(4)?, "progress":row.get::<_,f64>(5)?,
+                "error":error_json.and_then(|value| serde_json::from_str::<Value>(&value).ok()),
+                "created_at":row.get::<_,String>(7)?, "updated_at":row.get::<_,String>(8)?
+            }))
+        },
+    ).optional()?
         .ok_or_else(|| CoreError::JobNotFound(job_id.to_owned()))
 }

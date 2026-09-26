@@ -128,6 +128,7 @@ impl Library {
                  created_at TEXT NOT NULL, last_scan_at TEXT, scan_status TEXT NOT NULL DEFAULT 'NeverScanned',
                  UNIQUE(asset_type, path_key)
              );
+             UPDATE roots SET scan_recursive=1 WHERE scan_recursive=0;
              CREATE TABLE IF NOT EXISTS assets (
                  id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
                  asset_type TEXT NOT NULL, name TEXT NOT NULL, primary_source TEXT NOT NULL,
@@ -139,6 +140,54 @@ impl Library {
              CREATE INDEX IF NOT EXISTS idx_assets_fingerprint ON assets(asset_type, fingerprint);
              CREATE INDEX IF NOT EXISTS idx_assets_root ON assets(root_id);
              CREATE INDEX IF NOT EXISTS idx_assets_directory ON assets(asset_directory COLLATE NOCASE);
+             CREATE TABLE IF NOT EXISTS asset_counts (
+                 root_id TEXT NOT NULL, asset_type TEXT NOT NULL, asset_count INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(root_id, asset_type)
+             );
+             CREATE TABLE IF NOT EXISTS asset_directory_counts (
+                 root_id TEXT NOT NULL, directory TEXT NOT NULL, asset_count INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(root_id, directory)
+             );
+             INSERT OR IGNORE INTO asset_counts(root_id,asset_type,asset_count)
+                 SELECT root_id,asset_type,COUNT(*) FROM assets
+                 WHERE NOT EXISTS(SELECT 1 FROM asset_counts) GROUP BY root_id,asset_type;
+             INSERT OR IGNORE INTO asset_directory_counts(root_id,directory,asset_count)
+                 SELECT root_id,asset_directory,COUNT(*) FROM assets
+                 WHERE NOT EXISTS(SELECT 1 FROM asset_directory_counts) GROUP BY root_id,asset_directory;
+             CREATE TRIGGER IF NOT EXISTS assets_count_insert AFTER INSERT ON assets BEGIN
+                 INSERT INTO asset_counts(root_id,asset_type,asset_count) VALUES (NEW.root_id,NEW.asset_type,1)
+                 ON CONFLICT(root_id,asset_type) DO UPDATE SET asset_count=asset_count+1;
+                 INSERT INTO asset_directory_counts(root_id,directory,asset_count) VALUES (NEW.root_id,NEW.asset_directory,1)
+                 ON CONFLICT(root_id,directory) DO UPDATE SET asset_count=asset_count+1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS assets_count_delete AFTER DELETE ON assets BEGIN
+                 UPDATE asset_counts SET asset_count=asset_count-1
+                 WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type;
+                 UPDATE asset_directory_counts SET asset_count=asset_count-1
+                 WHERE root_id=OLD.root_id AND directory=OLD.asset_directory;
+                 DELETE FROM asset_counts WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type AND asset_count<=0;
+                 DELETE FROM asset_directory_counts WHERE root_id=OLD.root_id AND directory=OLD.asset_directory AND asset_count<=0;
+             END;
+             CREATE TRIGGER IF NOT EXISTS assets_count_move AFTER UPDATE OF root_id,asset_type ON assets
+             WHEN OLD.root_id!=NEW.root_id OR OLD.asset_type!=NEW.asset_type BEGIN
+                 UPDATE asset_counts SET asset_count=asset_count-1
+                 WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type;
+                 INSERT INTO asset_counts(root_id,asset_type,asset_count) VALUES (NEW.root_id,NEW.asset_type,1)
+                 ON CONFLICT(root_id,asset_type) DO UPDATE SET asset_count=asset_count+1;
+                 DELETE FROM asset_counts WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type AND asset_count<=0;
+             END;
+             CREATE TRIGGER IF NOT EXISTS assets_directory_count_move AFTER UPDATE OF root_id,asset_directory ON assets
+             WHEN OLD.root_id!=NEW.root_id OR OLD.asset_directory!=NEW.asset_directory BEGIN
+                 UPDATE asset_directory_counts SET asset_count=asset_count-1
+                 WHERE root_id=OLD.root_id AND directory=OLD.asset_directory;
+                 INSERT INTO asset_directory_counts(root_id,directory,asset_count) VALUES (NEW.root_id,NEW.asset_directory,1)
+                 ON CONFLICT(root_id,directory) DO UPDATE SET asset_count=asset_count+1;
+                 DELETE FROM asset_directory_counts WHERE root_id=OLD.root_id AND directory=OLD.asset_directory AND asset_count<=0;
+             END;
+             CREATE TRIGGER IF NOT EXISTS roots_count_delete AFTER DELETE ON roots BEGIN
+                 DELETE FROM asset_counts WHERE root_id=OLD.id;
+                 DELETE FROM asset_directory_counts WHERE root_id=OLD.id;
+             END;
              CREATE TABLE IF NOT EXISTS asset_files (
                  id INTEGER PRIMARY KEY AUTOINCREMENT, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
                  path TEXT NOT NULL, role TEXT NOT NULL, file_size INTEGER NOT NULL, modified_ns INTEGER NOT NULL,
@@ -214,7 +263,7 @@ impl Library {
                  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                  expression_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
              );
-             PRAGMA user_version = 7;
+             PRAGMA user_version = 9;
              COMMIT;",
         )?;
         let columns = connection
@@ -234,6 +283,42 @@ impl Library {
             connection.execute("ALTER TABLE scan_state ADD COLUMN full_check INTEGER NOT NULL DEFAULT 0", [])?;
         }
         Ok(())
+    }
+
+    pub fn asset_counts(&self) -> CoreResult<serde_json::Value> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT root_id,asset_type,asset_count FROM asset_counts WHERE asset_count>0"
+        )?;
+        let mut model = 0_i64;
+        let mut motion = 0_i64;
+        let mut scene = 0_i64;
+        let mut by_root = serde_json::Map::new();
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })? {
+            let (root_id, asset_type, count) = row?;
+            by_root.insert(root_id, serde_json::json!(count));
+            match asset_type.as_str() {
+                "model" => model += count,
+                "motion" => motion += count,
+                "scene" => scene += count,
+                _ => {},
+            }
+        }
+        Ok(serde_json::json!({"all":model+motion+scene,"model":model,"motion":motion,"scene":scene,"byRoot":by_root}))
+    }
+
+    pub fn asset_directories(&self, root_id: &str) -> CoreResult<Vec<serde_json::Value>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT directory,asset_count FROM asset_directory_counts
+             WHERE root_id=?1 AND asset_count>0 ORDER BY directory COLLATE NOCASE"
+        )?;
+        let rows = statement.query_map([root_id], |row| {
+            Ok(serde_json::json!({"path":row.get::<_,String>(0)?, "count":row.get::<_,i64>(1)?}))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn add_root(
@@ -625,6 +710,26 @@ impl Library {
         self.model_preview_file(Path::new(&asset.primary_source))
     }
 
+    pub fn motion_preview_frame(&self, asset_id: &str, frame: u32) -> CoreResult<serde_json::Value> {
+        crate::motion_view::frame(self, asset_id, frame)
+    }
+
+    pub fn scene_preview(&self, asset_id: &str) -> CoreResult<Vec<u8>> {
+        let asset = self.inspect_asset(asset_id)?;
+        if asset.asset_type != AssetType::Scene {
+            return Err(CoreError::ModelPreview("3D 场景预览需要场景资产".to_owned()));
+        }
+        crate::thumbnail::scene_preview_file(Path::new(&asset.primary_source))
+    }
+
+    pub fn scene_preview_texture(&self, asset_id: &str, texture_path: &str) -> CoreResult<Option<(Vec<u8>, u8)>> {
+        let asset = self.inspect_asset(asset_id)?;
+        if asset.asset_type != AssetType::Scene || texture_path.len() > 4096 {
+            return Err(CoreError::ModelPreview("无效的场景或贴图路径".to_owned()));
+        }
+        crate::thumbnail::scene_preview_texture_file(Path::new(&asset.primary_source), texture_path)
+    }
+
     pub fn model_preview_file(&self, path: &Path) -> CoreResult<Vec<u8>> {
         if !path
             .extension()
@@ -939,6 +1044,8 @@ impl Library {
         favorite_only: bool,
         cursor: Option<&AssetCursor>,
         limit: usize,
+        motion_format: Option<&str>,
+        directory_path: Option<&str>,
     ) -> CoreResult<AssetPage> {
         scanner::list_asset_page(
             self,
@@ -948,6 +1055,8 @@ impl Library {
             favorite_only,
             cursor,
             limit,
+            motion_format,
+            directory_path,
         )
     }
 
@@ -1021,6 +1130,8 @@ impl Library {
             let preview_settings_version = if let Some(model_path) = motion_preview_model.as_deref()
             {
                 crate::thumbnail::motion_preview_settings_version(Path::new(model_path))?
+            } else if asset.asset_type == AssetType::Scene {
+                crate::thumbnail::SCENE_PREVIEW_SETTINGS_VERSION.to_owned()
             } else {
                 crate::thumbnail::PREVIEW_SETTINGS_VERSION.to_owned()
             };
@@ -1105,7 +1216,7 @@ impl Library {
         let mut cursor = None;
         let mut job_ids = Vec::new();
         loop {
-            let page = self.list_asset_page(Some(root.asset_type), None, Some(root_id), false, cursor.as_ref(), 500)?;
+            let page = self.list_asset_page(Some(root.asset_type), None, Some(root_id), false, cursor.as_ref(), 500, None, None)?;
             for asset in page.items {
                 if asset.card_status == "CardValid" && asset.has_thumbnail { continue; }
                 if asset.statuses.iter().any(|status| matches!(status.as_str(),

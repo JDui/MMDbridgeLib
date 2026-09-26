@@ -4,7 +4,7 @@ import * as THREE from "./vendor/three.module.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
 import "./model-viewer.css";
 
-type ViewerAsset = { id?: string; name: string; primarySource: string };
+type ViewerAsset = { id?: string; name: string; primarySource: string; assetType?: "model" | "scene" };
 type ViewerMode = "texture" | "materials" | "types" | "bone" | "anomaly";
 type WeightType = { code: number; key: string; label: string; color: number; description: string };
 type MaterialGroup = { start: number; count: number; color: [number, number, number, number]; texturePath: string };
@@ -20,7 +20,7 @@ type ViewerStats = {
   sdefByBone: Array<{ index: number; name: string; count: number }>;
   qdefByBone: Array<{ index: number; name: string; count: number }>;
 };
-type ParsedModel = {
+export type ParsedModel = {
   vertexCount: number;
   indices: Uint32Array;
   vertices: Float32Array;
@@ -65,7 +65,7 @@ const WEIGHT_TYPES: WeightType[] = [
 const WARNING_COLOR = 0xf5a524;
 const NEUTRAL_COLOR = 0xc9ced6;
 
-function parsePreview(buffer: ArrayBuffer): ParsedModel {
+export function parsePreview(buffer: ArrayBuffer): ParsedModel {
   if (buffer.byteLength < 24) throw new Error("模型预览数据不完整。");
   const view = new DataView(buffer);
   if (view.getUint8(0) !== 77 || view.getUint8(1) !== 77 || view.getUint8(2) !== 68 || view.getUint8(3) !== 86) {
@@ -326,7 +326,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
     setModel(null);
     setSelectedVertex(null);
     setTexturesLoaded(0);
-    const command = asset.id ? "model_preview" : "model_preview_file";
+    const command = asset.assetType === "scene" ? "scene_preview" : asset.id ? "model_preview" : "model_preview_file";
     const args = asset.id ? { assetId: asset.id } : { path: asset.primarySource };
     invoke<ArrayBuffer>(command, args)
       .then((buffer) => {
@@ -485,7 +485,8 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
           for (const texturePath of texturePaths) {
             if (!active) break;
             try {
-              const bytes = await invoke<ArrayBuffer>("model_preview_texture_file", { modelPath: asset.primarySource, texturePath });
+              const bytes = await invoke<ArrayBuffer>(asset.assetType === "scene" ? "scene_preview_texture" : "model_preview_texture_file",
+                asset.assetType === "scene" ? { assetId: asset.id, texturePath } : { modelPath: asset.primarySource, texturePath });
               if (!active || bytes.byteLength <= 1) continue;
               const alphaMode = new Uint8Array(bytes)[0];
               const url = URL.createObjectURL(new Blob([bytes.slice(1)], { type: "image/png" }));
@@ -516,7 +517,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       if (objects.current) disposeModelObjects(objects.current, handles.current);
       objects.current = null;
     };
-  }, [asset.id, asset.primarySource]);
+  }, [asset.id, asset.primarySource, asset.assetType]);
 
   useEffect(() => {
     const current = objects.current;
@@ -675,9 +676,9 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
   };
 
   return <div className="model-viewer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className="model-viewer-window" role="dialog" aria-modal="true" aria-label={`${asset.name} 3D 权重查看器`}>
+    <section className={`model-viewer-window ${asset.assetType === "scene" ? "scene-viewer" : ""}`} role="dialog" aria-modal="true" aria-label={`${asset.name} 3D 查看器`}>
       <header className="model-viewer-header">
-        <div><span className="model-viewer-eyebrow">PMX MODEL &amp; WEIGHT INSPECTOR</span><h2 title={asset.name}>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div>
+        <div><span className="model-viewer-eyebrow">{asset.assetType === "scene" ? "SCENE 3D VIEWER" : "PMX MODEL & WEIGHT INSPECTOR"}</span><h2 title={asset.name}>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div>
         <div className="model-viewer-header-actions"><button disabled={!model} title="导出当前视角 PNG" onClick={exportPng}>导出截图</button><button className="model-viewer-close" aria-label="关闭 3D 预览" onClick={onClose}>×</button></div>
       </header>
       <div className="model-viewer-content">
@@ -743,12 +744,12 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
         </aside>
         <main className="model-viewer-stage">
           <div className="model-viewer-canvas" ref={host} />
-          {loading && <div className="model-viewer-message">正在由 Rust Core 解析 PMX 权重与网格…</div>}
+          {loading && <div className="model-viewer-message">正在由 Rust Core 解析 3D 网格…</div>}
           {error && <div className="model-viewer-message model-viewer-error">模型无法预览：{error}</div>}
-          {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点 · 双击顶点查看权重数据</div><div className="model-viewer-controls"><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span><button onClick={resetCamera}>重置视角</button></div></>}
+          {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls"><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span><button onClick={resetCamera}>重置视角</button></div></>}
         </main>
       </div>
-      <footer className="model-viewer-footer">已解析 PMX 权重与材质贴图；当前不执行骨骼姿势或物理模拟。</footer>
+      <footer className="model-viewer-footer">{asset.assetType === "scene" ? "场景以源文件的世界坐标和材质显示。" : "已解析 PMX 权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer>
     </section>
   </div>;
 }

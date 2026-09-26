@@ -1,0 +1,34 @@
+.motion-viewer-window {
+  width: min(1100px, calc(100vw - 48px));
+  height: min(760px, calc(100vh - 48px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #3d5962;
+  border-radius: 9px;
+  background: #14212a;
+  box-shadow: 0 28px 90px #000a;
+}
+
+.motion-viewer-stage { position: relative; flex: 1; min-height: 0; background: #10191f; }
+.motion-viewer-stage canvas { display: block; width: 100%; height: 100%; }
+.motion-viewer-timeline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-top: 1px solid #314852;
+  color: #bfd0d1;
+  font-size: 12px;
+}
+.motion-viewer-timeline input[type="range"] { flex: 1; min-width: 80px; accent-color: #65cbae; }
+.motion-viewer-timeline button, .motion-viewer-timeline select {
+  min-height: 30px;
+  padding: 4px 9px;
+  border: 1px solid #405c62;
+  border-radius: 5px;
+  background: #1b3036;
+  color: #d4e5e3;
+}
+.motion-viewer-timeline span { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.motion-viewer-note { padding: 0 16px 11px; color: #8ba6a8; font-size: 10px; }

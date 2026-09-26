@@ -4,6 +4,7 @@ mod duplicates;
 mod error;
 mod filters;
 mod jobs;
+mod motion_view;
 mod operations;
 mod parser;
 mod relations;
