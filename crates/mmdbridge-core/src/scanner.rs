@@ -39,6 +39,7 @@ const ASSET_SEARCH_PREDICATE: &str =
 
 pub(crate) fn scan(library: &Library, root: &Root, full_check: bool) -> CoreResult<ScanReport> {
     let root_path = Path::new(&root.path);
+    let root_path_key = scan_path_key(root_path);
     let walker = if root.scan_recursive {
         WalkDir::new(root_path)
     } else {
@@ -174,12 +175,17 @@ pub(crate) fn scan(library: &Library, root: &Root, full_check: bool) -> CoreResu
             Ok(bytes) => bytes,
             Err(message) => {
                 report.parse_failures += 1;
-                let parsed = ParsedCandidate {
+                let mut parsed = ParsedCandidate {
                     name: display_name(&path),
                     metadata: serde_json::json!({"error":{"error_code":"ReadFailed","message":message,"source":path_text,"recoverable":true}}),
                     status: "ParseFailed".to_owned(),
                     dependencies: Vec::new(),
                 };
+                if multiple_pmx_dirs.contains(path.parent().unwrap_or(root_path))
+                    && root.asset_type != AssetType::Motion
+                {
+                    mark_multiple_pmx_issue(&mut parsed);
+                }
                 store_candidate(
                     library,
                     root,
@@ -220,13 +226,7 @@ pub(crate) fn scan(library: &Library, root: &Root, full_check: bool) -> CoreResu
         if multiple_pmx_dirs.contains(path.parent().unwrap_or(root_path))
             && root.asset_type != AssetType::Motion
         {
-            parsed.status = "NeedsReview".to_owned();
-            if let Value::Object(metadata) = &mut parsed.metadata {
-                metadata.insert(
-                    "candidate_reason".to_owned(),
-                    Value::String("multiple_primary_models_in_directory".to_owned()),
-                );
-            }
+            mark_multiple_pmx_issue(&mut parsed);
         }
         let relative_path = path
             .strip_prefix(root_path)
@@ -290,7 +290,7 @@ pub(crate) fn scan(library: &Library, root: &Root, full_check: bool) -> CoreResu
             }
         }
         if ambiguous_identity {
-            parsed.status = "NeedsReview".to_owned();
+            mark_candidate_needs_review(&mut parsed);
             if let Value::Object(metadata) = &mut parsed.metadata {
                 metadata.insert("card_identity_ambiguous".to_owned(), Value::Bool(true));
             }
@@ -303,7 +303,7 @@ pub(crate) fn scan(library: &Library, root: &Root, full_check: bool) -> CoreResu
         let restore_card_path = card_path_hint
             .as_deref()
             .filter(|_| recovered_id.as_deref() == selected_id);
-        store_candidate(
+        if !store_candidate(
             library,
             root,
             &path,
@@ -314,7 +314,10 @@ pub(crate) fn scan(library: &Library, root: &Root, full_check: bool) -> CoreResu
             selected_id,
             restore_card_path,
             &now,
-        )?;
+        )? {
+            report.parse_failures += 1;
+            continue;
+        }
         if let Some(restored_asset_id) = recovered_id.as_deref() {
             for tag in recovered_tags {
                 library.add_asset_tag(restored_asset_id, &tag, "user", None)?;
@@ -347,6 +350,13 @@ pub(crate) fn scan(library: &Library, root: &Root, full_check: bool) -> CoreResu
         let records = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         for (asset_id, source, statuses_json) in records {
+            let in_scan_scope = root.scan_recursive
+                || Path::new(&source)
+                    .parent()
+                    .is_some_and(|parent| scan_path_key(parent) == root_path_key);
+            if !in_scan_scope {
+                continue;
+            }
             let mut statuses = parse_statuses(&statuses_json);
             if seen_paths.contains(&source) {
                 statuses.retain(|status| status != "MissingSource");
@@ -687,20 +697,41 @@ fn store_candidate(
     existing_id: Option<&str>,
     card_path_hint: Option<&Path>,
     now: &str,
-) -> CoreResult<()> {
+) -> CoreResult<bool> {
     let path_text = path.to_string_lossy().into_owned();
     let id = existing_id
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let statuses = serde_json::to_string(&[parsed.status])?;
+    let statuses = serde_json::to_string(&candidate_statuses(&parsed))?;
     let asset_directory = path
         .parent()
         .unwrap_or(Path::new(&root.path))
         .to_string_lossy()
         .into_owned();
-    let connection = library.connection()?;
+    let parsed_metadata = serde_json::to_string(&parsed.metadata)?;
+    let mut dependency_files = Vec::new();
+    for dependency in parsed.dependencies.iter().filter(|dependency| {
+        dependency.status == "resolved" && dependency.path.as_deref() != Some(path_text.as_str())
+    }) {
+        let Some(dependency_path) = dependency.path.as_deref() else {
+            return Ok(false);
+        };
+        let metadata = match std::fs::metadata(dependency_path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return Ok(false),
+            Err(_) => return Ok(false),
+        };
+        dependency_files.push((
+            dependency_path.to_owned(),
+            dependency.role.as_str(),
+            i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            metadata_modified_ns(&metadata),
+        ));
+    }
+    let mut connection = library.connection()?;
+    let transaction = connection.transaction()?;
     let existing_row = if existing_id.is_some() {
-        connection.query_row(
+        transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1)",
             [id.as_str()],
             |row| row.get::<_, bool>(0),
@@ -709,7 +740,7 @@ fn store_candidate(
         false
     };
     let old_source = if existing_row {
-        connection
+        transaction
             .query_row(
                 "SELECT primary_source FROM assets WHERE id=?1",
                 [&id],
@@ -722,7 +753,7 @@ fn store_candidate(
     let card_path = if let Some(card_path_hint) = card_path_hint {
         card_path_hint.to_string_lossy().into_owned()
     } else if old_source.as_deref() == Some(path_text.as_str()) {
-        connection
+        transaction
             .query_row(
                 "SELECT card_path FROM cards WHERE asset_id=?1",
                 [&id],
@@ -740,53 +771,45 @@ fn store_candidate(
             .into_owned()
     };
     if existing_row {
-        connection.execute(
+        transaction.execute(
             "UPDATE assets SET root_id=?2,asset_type=?3,name=?4,primary_source=?5,asset_directory=?6,fingerprint=?7,statuses_json=?8,updated_at=?9,last_seen_at=?9 WHERE id=?1",
             params![id, root.id, root.asset_type.as_str(), parsed.name, path_text, asset_directory, fingerprint, statuses, now],
         )?;
-        connection.execute("DELETE FROM asset_files WHERE asset_id=?1", [&id])?;
+        transaction.execute("DELETE FROM asset_files WHERE asset_id=?1", [&id])?;
     } else {
-        connection.execute(
+        transaction.execute(
             "INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,fingerprint,statuses_json,created_at,updated_at,last_seen_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9)
              ON CONFLICT(root_id,primary_source) DO UPDATE SET name=excluded.name,asset_directory=excluded.asset_directory,fingerprint=excluded.fingerprint,statuses_json=excluded.statuses_json,updated_at=excluded.updated_at,last_seen_at=excluded.last_seen_at",
             params![id, root.id, root.asset_type.as_str(), parsed.name, path_text, asset_directory, fingerprint, statuses, now],
         )?;
     }
-    let stored_id: String = connection.query_row(
+    let stored_id: String = transaction.query_row(
         "SELECT id FROM assets WHERE root_id=?1 AND primary_source=?2",
         params![root.id, path_text],
         |row| row.get(0),
     )?;
-    connection.execute(
+    transaction.execute(
         "INSERT INTO asset_files(asset_id,path,role,file_size,modified_ns) VALUES (?1,?2,'primary',?3,?4)
          ON CONFLICT(asset_id,path) DO UPDATE SET file_size=excluded.file_size,modified_ns=excluded.modified_ns",
         params![stored_id, path_text, file_size, modified_ns],
     )?;
-    for dependency in parsed.dependencies.iter().filter(|dependency| {
-        dependency.status == "resolved" && dependency.path.as_deref() != Some(path_text.as_str())
-    }) {
-        let Some(dependency_path) = dependency.path.as_deref() else {
-            continue;
-        };
-        let Ok(metadata) = std::fs::metadata(dependency_path) else {
-            continue;
-        };
-        let dependency_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
-        let dependency_modified = metadata_modified_ns(&metadata);
-        connection.execute(
+    for (dependency_path, role, dependency_size, dependency_modified) in dependency_files {
+        transaction.execute(
             "INSERT INTO asset_files(asset_id,path,role,file_size,modified_ns) VALUES (?1,?2,?3,?4,?5)
              ON CONFLICT(asset_id,path) DO UPDATE SET role=excluded.role,file_size=excluded.file_size,modified_ns=excluded.modified_ns",
-            params![stored_id, dependency_path, dependency.role, dependency_size, dependency_modified],
+            params![stored_id, dependency_path, role, dependency_size, dependency_modified],
         )?;
     }
-    connection.execute("INSERT INTO metadata(asset_id,key,value_json) VALUES (?1,'parsed',?2) ON CONFLICT(asset_id,key) DO UPDATE SET value_json=excluded.value_json", params![stored_id, serde_json::to_string(&parsed.metadata)?])?;
-    connection.execute("INSERT INTO cards(asset_id,card_path,status,last_checked_at) VALUES (?1,?2,'CardMissing',?3) ON CONFLICT(asset_id) DO UPDATE SET card_path=excluded.card_path,status=CASE WHEN cards.status='CardValid' THEN 'CardStale' ELSE cards.status END,last_checked_at=excluded.last_checked_at", params![stored_id, card_path, now])?;
-    Ok(())
+    transaction.execute("INSERT INTO metadata(asset_id,key,value_json) VALUES (?1,'parsed',?2) ON CONFLICT(asset_id,key) DO UPDATE SET value_json=excluded.value_json", params![stored_id, parsed_metadata])?;
+    transaction.execute("INSERT INTO cards(asset_id,card_path,status,last_checked_at) VALUES (?1,?2,'CardMissing',?3) ON CONFLICT(asset_id) DO UPDATE SET card_path=excluded.card_path,status=CASE WHEN cards.status='CardValid' THEN 'CardStale' ELSE cards.status END,last_checked_at=excluded.last_checked_at", params![stored_id, card_path, now])?;
+    transaction.commit()?;
+    Ok(true)
 }
 
 fn dependencies_unchanged(library: &Library, asset_id: &str) -> CoreResult<bool> {
     let connection = library.connection()?;
+    let mut indexed_paths = HashSet::new();
     let mut statement = connection.prepare(
         "SELECT path,file_size,modified_ns FROM asset_files WHERE asset_id=?1 AND role<>'primary'",
     )?;
@@ -799,16 +822,24 @@ fn dependencies_unchanged(library: &Library, asset_id: &str) -> CoreResult<bool>
     })?;
     for row in rows {
         let (path, old_size, old_modified) = row?;
+        indexed_paths.insert(path.clone());
         let Ok(metadata) = std::fs::metadata(&path) else {
             return Ok(false);
         };
-        if i64::try_from(metadata.len()).unwrap_or(i64::MAX) != old_size
+        if !metadata.is_file()
+            || i64::try_from(metadata.len()).unwrap_or(i64::MAX) != old_size
             || metadata_modified_ns(&metadata) != old_modified
         {
             return Ok(false);
         }
     }
     drop(statement);
+    let primary_source: String = connection.query_row(
+        "SELECT primary_source FROM assets WHERE id=?1",
+        [asset_id],
+        |row| row.get(0),
+    )?;
+    indexed_paths.insert(primary_source);
 
     let parsed_json: Option<String> = connection
         .query_row(
@@ -818,25 +849,59 @@ fn dependencies_unchanged(library: &Library, asset_id: &str) -> CoreResult<bool>
         )
         .optional()?;
     let Some(parsed_json) = parsed_json else {
-        return Ok(true);
+        return Ok(false);
     };
-    let parsed: Value = serde_json::from_str(&parsed_json).unwrap_or(Value::Null);
-    if let Some(dependencies) = parsed.get("file_dependencies").and_then(Value::as_array) {
-        for dependency in dependencies.iter().filter(|dependency| {
-            dependency.get("status").and_then(Value::as_str) == Some("missing")
-        }) {
-            if dependency
-                .get("path")
-                .and_then(Value::as_str)
-                .is_some_and(|path| {
-                    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
-                })
-            {
-                return Ok(false);
-            }
+    let Ok(parsed) = serde_json::from_str::<Value>(&parsed_json) else {
+        return Ok(false);
+    };
+    let Some(dependencies) = parsed.get("file_dependencies").and_then(Value::as_array) else {
+        return Ok(false);
+    };
+    for dependency in dependencies {
+        let status = dependency.get("status").and_then(Value::as_str);
+        let path = dependency.get("path").and_then(Value::as_str);
+        if status == Some("resolved") && path.is_none_or(|path| !indexed_paths.contains(path)) {
+            return Ok(false);
+        }
+        if status == Some("missing")
+            && path.is_some_and(|path| {
+                std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+            })
+        {
+            return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn mark_candidate_needs_review(parsed: &mut ParsedCandidate) {
+    if parsed.status != "ParseFailed" && parsed.status != "Unsupported" {
+        parsed.status = "NeedsReview".to_owned();
+    }
+}
+
+fn mark_multiple_pmx_issue(parsed: &mut ParsedCandidate) {
+    mark_candidate_needs_review(parsed);
+    if let Value::Object(metadata) = &mut parsed.metadata {
+        metadata.insert(
+            "candidate_reason".to_owned(),
+            Value::String("multiple_primary_models_in_directory".to_owned()),
+        );
+    }
+}
+
+fn candidate_statuses(parsed: &ParsedCandidate) -> Vec<String> {
+    let mut statuses = vec![parsed.status.clone()];
+    let has_review_issue = parsed.metadata.get("candidate_reason").is_some()
+        || parsed
+            .metadata
+            .get("card_identity_ambiguous")
+            .and_then(Value::as_bool)
+            == Some(true);
+    if has_review_issue && !statuses.iter().any(|status| status == "NeedsReview") {
+        statuses.push("NeedsReview".to_owned());
+    }
+    statuses
 }
 
 fn resolve_dependencies(path: &Path, parsed: &mut ParsedCandidate) {
@@ -887,6 +952,14 @@ fn normalized_absolute(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| path.to_path_buf())
     };
     normalize_path(&absolute)
+}
+
+fn scan_path_key(path: &Path) -> String {
+    normalized_absolute(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase()
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -973,4 +1046,322 @@ fn multiple_pmx_directories(files: &[PathBuf], asset_type: AssetType) -> HashSet
         .into_iter()
         .filter_map(|(path, count)| (count > 1).then_some(path))
         .collect()
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn candidate_with_texture(name: &str, texture: &Path) -> ParsedCandidate {
+        let dependency = crate::types::ParsedDependency {
+            reference: texture
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            role: "texture".to_owned(),
+            path: Some(texture.to_string_lossy().into_owned()),
+            status: "resolved".to_owned(),
+        };
+        ParsedCandidate {
+            name: name.to_owned(),
+            metadata: serde_json::json!({
+                "file_dependencies": [dependency.clone()]
+            }),
+            status: "Ready".to_owned(),
+            dependencies: vec![dependency],
+        }
+    }
+
+    #[test]
+    fn candidate_review_issue_is_persisted_without_overwriting_status() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-candidate-status-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let primary = directory.join("broken.pmx");
+        std::fs::write(&primary, b"fixture-pmx").unwrap();
+        let library = Library::open(directory.join("library.sqlite3")).unwrap();
+        let root = library
+            .add_root(
+                AssetType::Model,
+                directory.to_str().unwrap(),
+                Some("Candidate Status Fixture"),
+            )
+            .unwrap();
+        let primary_metadata = std::fs::metadata(&primary).unwrap();
+        let mut asset_id: Option<String> = None;
+
+        for status in ["ParseFailed", "Unsupported"] {
+            let mut parsed = ParsedCandidate {
+                name: "Broken model".to_owned(),
+                metadata: serde_json::json!({"error":{"error_code":status}}),
+                status: status.to_owned(),
+                dependencies: Vec::new(),
+            };
+            mark_multiple_pmx_issue(&mut parsed);
+
+            assert_eq!(parsed.status, status);
+            assert_eq!(
+                candidate_statuses(&parsed),
+                vec![status.to_owned(), "NeedsReview".to_owned()]
+            );
+            assert!(store_candidate(
+                &library,
+                &root,
+                &primary,
+                i64::try_from(primary_metadata.len()).unwrap_or(i64::MAX),
+                metadata_modified_ns(&primary_metadata),
+                format!("{status}-fingerprint"),
+                parsed,
+                asset_id.as_deref(),
+                None,
+                "2026-09-27T00:00:00Z",
+            )
+            .unwrap());
+
+            let connection = library.connection().unwrap();
+            let (stored_id, statuses_json): (String, String) = connection
+                .query_row(
+                    "SELECT id,statuses_json FROM assets WHERE primary_source=?1",
+                    [primary.to_string_lossy().as_ref()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            asset_id = Some(stored_id);
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&statuses_json).unwrap(),
+                vec![status.to_owned(), "NeedsReview".to_owned()]
+            );
+            let metadata_json: String = connection
+                .query_row(
+                    "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='parsed'",
+                    [asset_id.as_deref().unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let metadata: Value = serde_json::from_str(&metadata_json).unwrap();
+            assert_eq!(
+                metadata.get("candidate_reason").and_then(Value::as_str),
+                Some("multiple_primary_models_in_directory")
+            );
+        }
+
+        drop(library);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn store_candidate_rolls_back_all_asset_rows_when_card_write_fails() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-scan-transaction-{}", Uuid::new_v4()));
+        let package = directory.join("model-package");
+        let library_path = directory.join("library.sqlite3");
+        std::fs::create_dir_all(&package).unwrap();
+        let primary = package.join("model.pmx");
+        let old_texture = package.join("old.png");
+        let new_texture = package.join("new.png");
+        std::fs::write(&primary, b"pmx").unwrap();
+        std::fs::write(&old_texture, b"old").unwrap();
+        std::fs::write(&new_texture, b"new").unwrap();
+
+        let library = Library::open(&library_path).unwrap();
+        let root = library
+            .add_root(
+                AssetType::Model,
+                directory.to_str().unwrap(),
+                Some("Transaction Fixture"),
+            )
+            .unwrap();
+        let primary_metadata = std::fs::metadata(&primary).unwrap();
+        store_candidate(
+            &library,
+            &root,
+            &primary,
+            i64::try_from(primary_metadata.len()).unwrap_or(i64::MAX),
+            metadata_modified_ns(&primary_metadata),
+            "old-fingerprint".to_owned(),
+            candidate_with_texture("Before", &old_texture),
+            None,
+            None,
+            "2026-09-27T00:00:00Z",
+        )
+        .unwrap();
+        let primary_text = primary.to_string_lossy().into_owned();
+        let asset_id: String = library
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM assets WHERE primary_source=?1",
+                [&primary_text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let initial_card: (String, String, String) = library
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT card_path,status,last_checked_at FROM cards WHERE asset_id=?1",
+                [&asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        let connection = library.connection().unwrap();
+        connection
+            .execute(
+                "DELETE FROM asset_files WHERE asset_id=?1 AND role<>'primary'",
+                [&asset_id],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(!dependencies_unchanged(&library, &asset_id).unwrap());
+        std::fs::remove_file(&old_texture).unwrap();
+        std::fs::create_dir(&old_texture).unwrap();
+        assert!(
+            !store_candidate(
+                &library,
+                &root,
+                &primary,
+                i64::try_from(primary_metadata.len()).unwrap_or(i64::MAX),
+                metadata_modified_ns(&primary_metadata),
+                "directory-dependency".to_owned(),
+                candidate_with_texture("Directory", &old_texture),
+                Some(&asset_id),
+                None,
+                "2026-09-27T00:00:01Z",
+            )
+            .unwrap()
+        );
+        let directory_metadata = std::fs::metadata(&old_texture).unwrap();
+        library
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO asset_files(asset_id,path,role,file_size,modified_ns) VALUES (?1,?2,'texture',?3,?4)",
+                params![
+                    asset_id,
+                    old_texture.to_string_lossy(),
+                    i64::try_from(directory_metadata.len()).unwrap_or(i64::MAX),
+                    metadata_modified_ns(&directory_metadata),
+                ],
+            )
+            .unwrap();
+        assert!(!dependencies_unchanged(&library, &asset_id).unwrap());
+        std::fs::remove_dir(&old_texture).unwrap();
+        std::fs::write(&old_texture, b"old").unwrap();
+        let old_texture_metadata = std::fs::metadata(&old_texture).unwrap();
+        library
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE asset_files SET file_size=?2,modified_ns=?3 WHERE asset_id=?1 AND path=?4",
+                params![
+                    asset_id,
+                    i64::try_from(old_texture_metadata.len()).unwrap_or(i64::MAX),
+                    metadata_modified_ns(&old_texture_metadata),
+                    old_texture.to_string_lossy(),
+                ],
+            )
+            .unwrap();
+
+        std::fs::remove_file(&new_texture).unwrap();
+        assert!(
+            !store_candidate(
+                &library,
+                &root,
+                &primary,
+                i64::try_from(primary_metadata.len()).unwrap_or(i64::MAX),
+                metadata_modified_ns(&primary_metadata),
+                "new-fingerprint".to_owned(),
+                candidate_with_texture("After", &new_texture),
+                Some(&asset_id),
+                None,
+                "2026-09-27T00:00:01Z",
+            )
+            .unwrap()
+        );
+        std::fs::write(&new_texture, b"new").unwrap();
+        library
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_card_update BEFORE UPDATE ON cards
+                 BEGIN SELECT RAISE(ABORT,'fixture write failure'); END;",
+            )
+            .unwrap();
+
+        let result = store_candidate(
+            &library,
+            &root,
+            &primary,
+            i64::try_from(primary_metadata.len()).unwrap_or(i64::MAX),
+            metadata_modified_ns(&primary_metadata),
+            "new-fingerprint".to_owned(),
+            candidate_with_texture("After", &new_texture),
+            Some(&asset_id),
+            None,
+            "2026-09-27T00:00:01Z",
+        );
+        assert!(result.is_err());
+
+        let connection = library.connection().unwrap();
+        let (name, fingerprint, statuses): (String, String, String) = connection
+            .query_row(
+                "SELECT name,fingerprint,statuses_json FROM assets WHERE id=?1",
+                [&asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let dependencies: Vec<String> = {
+            let mut statement = connection
+                .prepare("SELECT path FROM asset_files WHERE asset_id=?1 AND role<>'primary' ORDER BY path")
+                .unwrap();
+            statement
+                .query_map([&asset_id], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let stored_metadata: String = connection
+            .query_row(
+                "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='parsed'",
+                [&asset_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let primary_file: (String, i64, i64) = connection
+            .query_row(
+                "SELECT path,file_size,modified_ns FROM asset_files WHERE asset_id=?1 AND role='primary'",
+                [&asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let stored_card: (String, String, String) = connection
+            .query_row(
+                "SELECT card_path,status,last_checked_at FROM cards WHERE asset_id=?1",
+                [&asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(name, "Before");
+        assert_eq!(fingerprint, "old-fingerprint");
+        assert_eq!(statuses, r#"["Ready"]"#);
+        assert_eq!(dependencies, vec![old_texture.to_string_lossy().into_owned()]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored_metadata).unwrap(),
+            candidate_with_texture("Before", &old_texture).metadata
+        );
+        assert_eq!(
+            primary_file,
+            (
+                primary_text,
+                i64::try_from(primary_metadata.len()).unwrap_or(i64::MAX),
+                metadata_modified_ns(&primary_metadata)
+            )
+        );
+        assert_eq!(stored_card, initial_card);
+
+        drop(connection);
+        drop(library);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

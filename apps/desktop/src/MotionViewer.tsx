@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "./vendor/three.module.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
 import { parsePreview } from "./ModelViewer";
+import { toUiError } from "./uiError";
 import "./motion-viewer.css";
 
 type MotionAsset = { id: string; name: string; primarySource: string; metadata: Record<string, unknown> };
@@ -91,7 +92,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
     } catch (reason) {
       playingRef.current = false;
       setPlaying(false);
-      setError(String(reason));
+      setError(toUiError(reason));
     } finally { requestPending.current = false; }
   }
 
@@ -222,7 +223,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
             } finally { URL.revokeObjectURL(url); }
           } catch (reason) { console.warn("动作预览贴图加载失败", texturePath, reason); }
         }
-      } catch (reason) { if (!disposed) { setError(String(reason)); setLoading(false); } }
+      } catch (reason) { if (!disposed) { setError(toUiError(reason)); setLoading(false); } }
     })();
     const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onCloseRef.current(); };
     window.addEventListener("keydown", onKey);

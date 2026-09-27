@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     thread,
+    time::UNIX_EPOCH,
 };
 
 use chrono::Utc;
@@ -34,8 +35,34 @@ pub struct AssetOperationPlan {
     pub new_name: Option<String>,
     pub affected_assets: Vec<AssetOperationAsset>,
     pub dependency_paths: Vec<String>,
+    #[serde(default)]
+    pub source_snapshots: Vec<AssetOperationSourceSnapshot>,
+    #[serde(default)]
+    pub package_snapshots: Vec<AssetOperationSourceSnapshot>,
+    #[serde(default)]
+    pub dependency_snapshots: Vec<AssetOperationDependencySnapshot>,
     pub warnings: Vec<String>,
     pub can_execute: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetOperationSourceSnapshot {
+    pub path: String,
+    pub file_size: String,
+    pub modified_ns: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetOperationDependencySnapshot {
+    pub asset_id: String,
+    pub reference: Option<String>,
+    pub role: String,
+    pub path: Option<String>,
+    pub status: String,
+    pub file_size: Option<String>,
+    pub modified_ns: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +130,14 @@ struct PreparedPlan {
     kind: OperationKind,
     packages: Vec<Package>,
     affected_assets: Vec<StoredAsset>,
+}
+
+#[derive(Debug)]
+struct IndexedDependency {
+    reference: Option<String>,
+    role: Option<String>,
+    path: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +236,9 @@ fn prepare(
     let mut packages = Vec::new();
     let mut affected_assets = Vec::<StoredAsset>::new();
     let mut dependency_paths = HashSet::<String>::new();
+    let mut source_snapshots = Vec::<AssetOperationSourceSnapshot>::new();
+    let mut package_snapshots = Vec::<AssetOperationSourceSnapshot>::new();
+    let mut dependency_snapshots = Vec::<AssetOperationDependencySnapshot>::new();
     for source in collapsed_sources {
         for (root_id, root_path) in &all_roots {
             if selected_assets
@@ -224,6 +262,13 @@ fn prepare(
                 symlink.display()
             ));
         }
+        match package_entry_snapshots(&source) {
+            Ok(snapshots) => package_snapshots.extend(snapshots),
+            Err(error) => warnings.push(format!(
+                "无法完整记录资产包内容，请重新扫描后再操作：{}（{error}）",
+                source.display()
+            )),
+        }
         let package_assets = load_assets_under_package(library, &source)?;
         if package_assets.is_empty() {
             warnings.push(format!("找不到资产包中的索引记录：{}", source.display()));
@@ -243,11 +288,132 @@ fn prepare(
         }
         for asset in &package_assets {
             affected_assets.push(asset.clone());
+            match source_file_snapshot(&asset.primary_source) {
+                Ok(snapshot) if path_is_within(&source, Path::new(&snapshot.path)) => {
+                    match load_indexed_primary_version(library, &asset.id)? {
+                        Some((path, file_size, modified_ns))
+                            if same_path(Path::new(&path), Path::new(&snapshot.path))
+                                && snapshot.file_size.parse::<i64>().ok() == Some(file_size)
+                                && snapshot.modified_ns.parse::<i64>().ok()
+                                    == Some(modified_ns) =>
+                        {
+                            source_snapshots.push(snapshot);
+                        }
+                        Some(_) => warnings.push(format!(
+                            "主文件自上次扫描后已变化，请重新扫描后再操作：{}",
+                            asset.primary_source
+                        )),
+                        None => warnings.push(format!(
+                            "索引中缺少主文件版本记录，请重新扫描后再操作：{}",
+                            asset.primary_source
+                        )),
+                    }
+                }
+                Ok(_) => warnings.push(format!(
+                    "索引中的主文件不在待操作资产包内：{}",
+                    asset.primary_source
+                )),
+                Err(_) => warnings.push(format!(
+                    "资产包中的主文件不存在或不可读取，请重新扫描：{}",
+                    asset.primary_source
+                )),
+            }
+
+            let parsed_dependencies = load_parsed_dependencies(library, &asset.id)?;
+            if let Some(parsed_dependencies) = parsed_dependencies {
+                for dependency in parsed_dependencies {
+                    let role = dependency.role.as_deref().unwrap_or("unknown");
+                    let status = dependency.status.as_deref().unwrap_or("unknown");
+                    let dependency_path = dependency.path.as_deref();
+                    let snapshot = dependency_file_snapshot(
+                        &asset.id,
+                        dependency.reference.as_deref(),
+                        role,
+                        dependency_path,
+                        status,
+                    );
+                    dependency_snapshots.push(snapshot);
+
+                    if dependency.reference.is_none() || role == "unknown" {
+                        warnings.push(format!(
+                            "无法确认资产依赖记录内容，请重新扫描后再操作：{}",
+                            asset.primary_source
+                        ));
+                        continue;
+                    }
+
+                    if status == "missing"
+                        && role == "shared_toon_texture"
+                        && is_builtin_shared_toon(dependency.reference.as_deref())
+                        && dependency_path.is_some_and(|path| {
+                            !Path::new(path).exists() && path_is_within(&source, Path::new(path))
+                        })
+                    {
+                        continue;
+                    }
+
+                    match (status, dependency_path) {
+                        ("resolved", Some(path)) => match fs::canonicalize(path) {
+                            Ok(canonical)
+                                if canonical.is_file() && path_is_within(&source, &canonical) =>
+                            {
+                                dependency_paths
+                                    .insert(canonical.to_string_lossy().into_owned());
+                            }
+                            Ok(canonical) if canonical.is_file() => warnings.push(format!(
+                                "检测到解析记录中的资产包外依赖，请先收拢到包内再操作：{}（资产：{}）",
+                                canonical.display(),
+                                asset.name
+                            )),
+                            _ => warnings.push(format!(
+                                "解析记录中的依赖文件已不存在，请重新扫描后再操作：{}（资产：{}）",
+                                path,
+                                asset.name
+                            )),
+                        },
+                        ("missing", _) => warnings.push(format!(
+                            "检测到缺失依赖，请修复引用或重新扫描：{}（资产：{}）",
+                            dependency_path
+                                .or(dependency.reference.as_deref())
+                                .unwrap_or("未知路径"),
+                            asset.name
+                        )),
+                        ("external", _) => warnings.push(format!(
+                            "检测到资产包外依赖，请先收拢到包内再操作：{}（资产：{}）",
+                            dependency_path
+                                .or(dependency.reference.as_deref())
+                                .unwrap_or("未知路径"),
+                            asset.name
+                        )),
+                        (_, _) => warnings.push(format!(
+                            "无法确认资产依赖状态，请重新扫描后再操作：{}（资产：{}）",
+                            dependency_path
+                                .or(dependency.reference.as_deref())
+                                .unwrap_or("未知路径"),
+                            asset.name
+                        )),
+                    }
+                }
+            } else if may_have_file_dependencies(&asset.primary_source, &asset.asset_type) {
+                warnings.push(format!(
+                    "无法确认资产文件依赖（缺少解析记录），请重新扫描后再操作：{}",
+                    asset.primary_source
+                ));
+            }
+
             let dependency_rows = load_asset_dependencies(library, &asset.id)?;
             for dependency in dependency_rows {
                 match fs::canonicalize(&dependency) {
                     Ok(canonical) if path_is_within(&source, &canonical) => {
                         dependency_paths.insert(canonical.to_string_lossy().into_owned());
+                        let canonical_text = canonical.to_string_lossy().into_owned();
+                        dependency_snapshots.push(dependency_file_snapshot(
+                            &asset.id,
+                            None,
+                            "indexed",
+                            Some(&canonical_text),
+                            "resolved",
+                        ));
                     }
                     Ok(canonical) => warnings.push(format!(
                         "检测到资产包外依赖，需先收拢到包内再操作：{}",
@@ -284,8 +450,20 @@ fn prepare(
             assets: package_assets,
         });
     }
+    let affected_ids = affected_assets
+        .iter()
+        .map(|asset| asset.id.clone())
+        .collect::<HashSet<_>>();
+    append_reverse_dependency_warnings(library, &packages, &affected_ids, &mut warnings)?;
     affected_assets.sort_by(|left, right| left.id.cmp(&right.id));
     affected_assets.dedup_by(|left, right| left.id == right.id);
+
+    source_snapshots.sort();
+    source_snapshots.dedup();
+    package_snapshots.sort();
+    package_snapshots.dedup();
+    dependency_snapshots.sort();
+    dependency_snapshots.dedup();
 
     if kind == OperationKind::Recycle && !cfg!(windows) {
         warnings.push("此平台没有启用回收站接口；为避免永久删除，不能执行删除".to_owned());
@@ -394,6 +572,9 @@ fn prepare(
             })
             .collect(),
         dependency_paths,
+        source_snapshots,
+        package_snapshots,
+        dependency_snapshots,
         warnings: warnings.clone(),
         can_execute: warnings.is_empty(),
     };
@@ -427,6 +608,9 @@ pub(crate) fn execute(
         || prepared.view.destination_paths != confirmed_plan.destination_paths
         || prepared.view.affected_assets != confirmed_plan.affected_assets
         || prepared.view.dependency_paths != confirmed_plan.dependency_paths
+        || prepared.view.source_snapshots != confirmed_plan.source_snapshots
+        || prepared.view.package_snapshots != confirmed_plan.package_snapshots
+        || prepared.view.dependency_snapshots != confirmed_plan.dependency_snapshots
         || prepared.view.warnings != confirmed_plan.warnings
     {
         return Err(CoreError::AssetOperation(
@@ -685,6 +869,23 @@ fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<
             }
         }
     }
+    for snapshot in &prepared.view.dependency_snapshots {
+        let Some(path) = snapshot.path.as_deref() else {
+            continue;
+        };
+        let Some(package) = prepared
+            .packages
+            .iter()
+            .find(|package| path_is_within(&package.source, Path::new(path)))
+        else {
+            continue;
+        };
+        let Some(target) = package.target.as_ref() else {
+            continue;
+        };
+        moved_path_map.insert(path.to_owned(), remap_path(path, &package.source, target)?);
+    }
+    rewrite_asset_dependency_paths(&transaction, &prepared.affected_assets, &moved_path_map)?;
     rewrite_relation_paths(&transaction, &moved_path_map)?;
     transaction.commit()?;
     drop(connection);
@@ -724,6 +925,59 @@ fn rewrite_relation_paths(
             transaction.execute(
                 "UPDATE relations SET reason_json=?2 WHERE id=?1",
                 params![id, serde_json::to_string(&reason)?],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_asset_dependency_paths(
+    transaction: &rusqlite::Transaction<'_>,
+    assets: &[StoredAsset],
+    moved_paths: &HashMap<String, String>,
+) -> CoreResult<()> {
+    for asset in assets {
+        let parsed_json = transaction
+            .query_row(
+                "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='parsed'",
+                [&asset.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(parsed_json) = parsed_json else {
+            continue;
+        };
+        let Ok(mut parsed) = serde_json::from_str::<Value>(&parsed_json) else {
+            continue;
+        };
+        let Some(dependencies) = parsed
+            .get_mut("file_dependencies")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        let mut changed = false;
+        for dependency in dependencies {
+            let Some(path) = dependency
+                .get_mut("path")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if let Some((_, new_path)) = moved_paths
+                .iter()
+                .find(|(old_path, _)| path_key(Path::new(old_path)) == path_key(Path::new(&path)))
+                && let Some(path_value) = dependency.get_mut("path")
+            {
+                *path_value = Value::String(new_path.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            transaction.execute(
+                "UPDATE metadata SET value_json=?2 WHERE asset_id=?1 AND key='parsed'",
+                params![asset.id, serde_json::to_string(&parsed)?],
             )?;
         }
     }
@@ -906,6 +1160,287 @@ fn load_asset_dependencies(library: &Library, asset_id: &str) -> CoreResult<Vec<
     rows.map(|row| row.map(PathBuf::from))
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+fn load_parsed_dependencies(
+    library: &Library,
+    asset_id: &str,
+) -> CoreResult<Option<Vec<IndexedDependency>>> {
+    let connection = library.connection()?;
+    let parsed_json = connection
+        .query_row(
+            "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='parsed'",
+            [asset_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(parsed_json) = parsed_json else {
+        return Ok(None);
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&parsed_json) else {
+        return Ok(None);
+    };
+    let Some(dependencies) = parsed.get("file_dependencies") else {
+        return Ok(None);
+    };
+    let Some(dependencies) = dependencies.as_array() else {
+        return Ok(Some(vec![IndexedDependency {
+            reference: None,
+            role: None,
+            path: None,
+            status: None,
+        }]));
+    };
+    Ok(Some(
+        dependencies
+            .iter()
+            .map(|dependency| IndexedDependency {
+                reference: dependency
+                    .get("reference")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                role: dependency
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                path: dependency
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                status: dependency
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+            .collect(),
+    ))
+}
+
+fn may_have_file_dependencies(primary_source: &str, asset_type: &str) -> bool {
+    if asset_type != "model" && asset_type != "scene" {
+        return false;
+    }
+    Path::new(primary_source)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["pmx", "pmd", "x"]
+                .iter()
+                .any(|supported| extension.eq_ignore_ascii_case(supported))
+        })
+}
+
+fn load_indexed_primary_version(
+    library: &Library,
+    asset_id: &str,
+) -> CoreResult<Option<(String, i64, i64)>> {
+    let connection = library.connection()?;
+    connection
+        .query_row(
+            "SELECT path,file_size,modified_ns FROM asset_files
+             WHERE asset_id=?1 AND role='primary' LIMIT 1",
+            [asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn is_builtin_shared_toon(reference: Option<&str>) -> bool {
+    let Some(reference) = reference else {
+        return false;
+    };
+    let name = reference.rsplit(['\\', '/']).next().unwrap_or(reference);
+    if name != reference {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    (1..=10).any(|index| name == format!("toon{index:02}.bmp"))
+}
+
+fn source_file_snapshot(path: &str) -> std::io::Result<AssetOperationSourceSnapshot> {
+    let canonical = fs::canonicalize(path)?;
+    let metadata = fs::metadata(&canonical)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source is not a file",
+        ));
+    }
+    Ok(AssetOperationSourceSnapshot {
+        path: canonical.to_string_lossy().into_owned(),
+        file_size: metadata.len().to_string(),
+        modified_ns: file_modified_ns(&metadata).to_string(),
+    })
+}
+
+fn package_entry_snapshots(package: &Path) -> CoreResult<Vec<AssetOperationSourceSnapshot>> {
+    let mut snapshots = Vec::new();
+    for entry in walkdir::WalkDir::new(package).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            CoreError::AssetOperation(format!("无法完整记录资产包内容：{error}"))
+        })?;
+        if entry.file_type().is_symlink()
+            || (!entry.file_type().is_file() && !entry.file_type().is_dir())
+        {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|error| {
+            CoreError::AssetOperation(format!("无法读取资产包条目属性：{error}"))
+        })?;
+        let path = fs::canonicalize(entry.path()).map_err(|error| {
+            CoreError::AssetOperation(format!("无法规范化资产包条目路径：{error}"))
+        })?;
+        snapshots.push(AssetOperationSourceSnapshot {
+            path: path.to_string_lossy().into_owned(),
+            file_size: metadata.len().to_string(),
+            modified_ns: file_modified_ns(&metadata).to_string(),
+        });
+    }
+    Ok(snapshots)
+}
+
+fn dependency_file_snapshot(
+    asset_id: &str,
+    reference: Option<&str>,
+    role: &str,
+    path: Option<&str>,
+    status: &str,
+) -> AssetOperationDependencySnapshot {
+    let (path, file_size, modified_ns) = path.map_or((None, None, None), |path| {
+        let canonical = fs::canonicalize(path).ok();
+        let snapshot_path = canonical.as_deref().unwrap_or_else(|| Path::new(path));
+        let metadata = fs::metadata(snapshot_path)
+            .ok()
+            .filter(|metadata| metadata.is_file());
+        (
+            Some(snapshot_path.to_string_lossy().into_owned()),
+            metadata.as_ref().map(|metadata| metadata.len().to_string()),
+            metadata
+                .as_ref()
+                .map(|metadata| file_modified_ns(metadata).to_string()),
+        )
+    });
+    AssetOperationDependencySnapshot {
+        asset_id: asset_id.to_owned(),
+        reference: reference.map(str::to_owned),
+        role: role.to_owned(),
+        path,
+        status: status.to_owned(),
+        file_size,
+        modified_ns,
+    }
+}
+
+fn file_modified_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+        })
+}
+
+fn append_reverse_dependency_warnings(
+    library: &Library,
+    packages: &[Package],
+    affected_asset_ids: &HashSet<String>,
+    warnings: &mut Vec<String>,
+) -> CoreResult<()> {
+    let connection = library.connection()?;
+    let mut statement = connection.prepare(
+        "SELECT a.id,a.name,a.primary_source,m.value_json
+         FROM assets a JOIN metadata m ON m.asset_id=a.id AND m.key='parsed'",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (asset_id, asset_name, primary_source, parsed_json) = row?;
+        if affected_asset_ids.contains(&asset_id) {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(&parsed_json) else {
+            continue;
+        };
+        let Some(dependencies) = parsed.get("file_dependencies").and_then(Value::as_array) else {
+            continue;
+        };
+        for dependency in dependencies {
+            let Some(path) = dependency.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let dependency_path = Path::new(path);
+            let resolved_path = fs::canonicalize(dependency_path).unwrap_or_else(|_| {
+                if dependency_path.is_absolute() {
+                    dependency_path.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .map(|current| current.join(dependency_path))
+                        .unwrap_or_else(|_| dependency_path.to_path_buf())
+                }
+            });
+            if packages
+                .iter()
+                .any(|package| path_is_within(&package.source, &resolved_path))
+            {
+                warnings.push(format!(
+                    "其他资产引用待操作资产包中的文件，移动或删除会使其失效：{}（{}）→ {}",
+                    asset_name,
+                    primary_source,
+                    resolved_path.display()
+                ));
+            }
+        }
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT a.id,a.name,a.primary_source,f.path
+         FROM assets a JOIN asset_files f ON f.asset_id=a.id
+         WHERE f.role<>'primary'",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (asset_id, asset_name, primary_source, path) = row?;
+        if affected_asset_ids.contains(&asset_id) {
+            continue;
+        }
+        let dependency_path = Path::new(&path);
+        let resolved_path = fs::canonicalize(dependency_path).unwrap_or_else(|_| {
+            if dependency_path.is_absolute() {
+                dependency_path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|current| current.join(dependency_path))
+                    .unwrap_or_else(|_| dependency_path.to_path_buf())
+            }
+        });
+        if packages
+            .iter()
+            .any(|package| path_is_within(&package.source, &resolved_path))
+        {
+            warnings.push(format!(
+                "其他资产引用待操作资产包中的文件，移动或删除会使其失效：{}（{}）→ {}",
+                asset_name,
+                primary_source,
+                resolved_path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn load_card_path(library: &Library, asset_id: &str) -> CoreResult<Option<String>> {
@@ -1224,4 +1759,364 @@ unsafe fn shell_item(path: &Path) -> Result<windows::Win32::UI::Shell::IShellIte
             native_path, shell_path
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture {
+        path: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mmdbridge-operation-plan-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn child(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn add_root(library: &Library, id: &str, path: &Path) {
+        let path = fs::canonicalize(path).unwrap();
+        let connection = library.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO roots(id,asset_type,path,path_key,display_name,created_at)
+                 VALUES (?1,'model',?2,?3,?1,'2026-09-27T00:00:00Z')",
+                params![id, path.to_string_lossy(), path_key(&path)],
+            )
+            .unwrap();
+    }
+
+    fn add_asset(
+        library: &Library,
+        id: &str,
+        root_id: &str,
+        name: &str,
+        primary: &Path,
+        package: &Path,
+        parsed: &Value,
+        indexed_dependencies: &[(&str, &str)],
+    ) {
+        let now = "2026-09-27T00:00:00Z";
+        let metadata = fs::metadata(primary).unwrap();
+        let primary = fs::canonicalize(primary).unwrap();
+        let package = fs::canonicalize(package).unwrap();
+        let connection = library.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,fingerprint,statuses_json,created_at,updated_at,last_seen_at)
+                 VALUES (?1,?2,'model',?3,?4,?5,'fixture','[]',?6,?6,?6)",
+                params![
+                    id,
+                    root_id,
+                    name,
+                    primary.to_string_lossy(),
+                    package.to_string_lossy(),
+                    now
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO asset_files(asset_id,path,role,file_size,modified_ns) VALUES (?1,?2,'primary',?3,?4)",
+                params![
+                    id,
+                    primary.to_string_lossy(),
+                    i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+                    file_modified_ns(&metadata)
+                ],
+            )
+            .unwrap();
+        for (path, role) in indexed_dependencies {
+            let metadata = fs::metadata(path).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO asset_files(asset_id,path,role,file_size,modified_ns) VALUES (?1,?2,?3,?4,?5)",
+                    params![
+                        id,
+                        path,
+                        role,
+                        i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+                        file_modified_ns(&metadata)
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO metadata(asset_id,key,value_json) VALUES (?1,'parsed',?2)",
+                params![id, parsed.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn setup_roots(fixture: &Fixture, library: &Library) -> (PathBuf, PathBuf) {
+        let source_root = fixture.child("source-root");
+        let destination_root = fixture.child("destination-root");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        add_root(library, "source-root", &source_root);
+        add_root(library, "destination-root", &destination_root);
+        (source_root, destination_root)
+    }
+
+    fn dependency(reference: &str, role: &str, path: &Path, status: &str) -> Value {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| {
+            match (
+                path.parent()
+                    .and_then(|parent| fs::canonicalize(parent).ok()),
+                path.file_name(),
+            ) {
+                (Some(parent), Some(file_name)) => parent.join(file_name),
+                _ => path.to_path_buf(),
+            }
+        });
+        serde_json::json!({
+            "reference": reference,
+            "role": role,
+            "path": path.to_string_lossy(),
+            "status": status,
+        })
+    }
+
+    fn move_plan(library: &Library, destination_root: &Path) -> AssetOperationPlan {
+        library
+            .plan_asset_operation(
+                "move",
+                &["asset-1".to_owned()],
+                destination_root.to_str(),
+                None,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn plan_blocks_external_and_missing_dependencies_without_executing() {
+        let fixture = Fixture::new();
+        let library = Library::in_memory().unwrap();
+        let (source_root, destination_root) = setup_roots(&fixture, &library);
+        let package = source_root.join("model-package");
+        let external_dir = fixture.child("external");
+        fs::create_dir_all(&package).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+        let primary = package.join("model.pmx");
+        let external = external_dir.join("shared.png");
+        let missing = package.join("missing.png");
+        fs::write(&primary, b"fixture-pmx").unwrap();
+        fs::write(&external, b"texture").unwrap();
+        let parsed = serde_json::json!({
+            "file_type": "pmx",
+            "file_dependencies": [
+                dependency("../external/shared.png", "texture", &external, "external"),
+                dependency("missing.png", "texture", &missing, "missing"),
+                { "reference": "opaque.bin", "role": "texture", "status": "unresolved" }
+            ]
+        });
+        add_asset(
+            &library,
+            "asset-1",
+            "source-root",
+            "Fixture Model",
+            &primary,
+            &package,
+            &parsed,
+            &[],
+        );
+
+        let plan = move_plan(&library, &destination_root);
+
+        assert!(!plan.can_execute);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("资产包外依赖")),
+            "warnings: {:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("缺失依赖")),
+            "warnings: {:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("无法确认资产依赖状态"))
+        );
+        assert_eq!(plan.source_snapshots.len(), 1);
+        assert!(!plan.package_snapshots.is_empty());
+        assert_eq!(plan.dependency_snapshots.len(), 3);
+    }
+
+    #[test]
+    fn plan_blocks_reverse_references_from_other_assets() {
+        let fixture = Fixture::new();
+        let library = Library::in_memory().unwrap();
+        let (source_root, destination_root) = setup_roots(&fixture, &library);
+        let package = source_root.join("model-package");
+        let consumer_root = fixture.child("consumer-root");
+        let consumer_package = consumer_root.join("consumer-package");
+        fs::create_dir_all(&package).unwrap();
+        fs::create_dir_all(&consumer_package).unwrap();
+        fs::create_dir_all(&consumer_root).unwrap();
+        add_root(&library, "consumer-root", &consumer_root);
+
+        let primary = package.join("model.pmx");
+        let texture = package.join("shared.png");
+        fs::write(&primary, b"fixture-pmx").unwrap();
+        fs::write(&texture, b"texture").unwrap();
+        let selected_parsed = serde_json::json!({
+            "file_type": "pmx",
+            "file_dependencies": [dependency("shared.png", "texture", &texture, "resolved")]
+        });
+        add_asset(
+            &library,
+            "asset-1",
+            "source-root",
+            "Fixture Model",
+            &primary,
+            &package,
+            &selected_parsed,
+            &[(texture.to_str().unwrap(), "texture")],
+        );
+
+        let consumer_primary = consumer_package.join("consumer.pmx");
+        fs::write(&consumer_primary, b"consumer-pmx").unwrap();
+        let consumer_parsed = serde_json::json!({ "file_type": "pmx" });
+        add_asset(
+            &library,
+            "consumer-asset",
+            "consumer-root",
+            "External Consumer",
+            &consumer_primary,
+            &consumer_package,
+            &consumer_parsed,
+            &[(texture.to_str().unwrap(), "texture")],
+        );
+        library
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE metadata SET value_json='{invalid' WHERE asset_id='consumer-asset' AND key='parsed'",
+                [],
+            )
+            .unwrap();
+
+        let plan = move_plan(&library, &destination_root);
+
+        assert!(!plan.can_execute);
+        assert!(
+            plan.warnings.iter().any(|warning| {
+                warning.contains("其他资产引用")
+                    && warning.contains("External Consumer")
+                    && warning.contains(
+                        &fs::canonicalize(&texture)
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+            }),
+            "warnings: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn plan_allows_missing_standard_shared_toon_supplied_by_renderer() {
+        let fixture = Fixture::new();
+        let library = Library::in_memory().unwrap();
+        let (source_root, destination_root) = setup_roots(&fixture, &library);
+        let package = source_root.join("model-package");
+        fs::create_dir_all(&package).unwrap();
+        let primary = package.join("model.pmd");
+        let builtin_toon = package.join("toon01.bmp");
+        fs::write(&primary, b"fixture-pmd").unwrap();
+        let parsed = serde_json::json!({
+            "file_type": "pmd",
+            "file_dependencies": [dependency(
+                "toon01.bmp",
+                "shared_toon_texture",
+                &builtin_toon,
+                "missing"
+            )]
+        });
+        add_asset(
+            &library,
+            "asset-1",
+            "source-root",
+            "Fixture PMD",
+            &primary,
+            &package,
+            &parsed,
+            &[],
+        );
+
+        let plan = move_plan(&library, &destination_root);
+
+        assert!(plan.can_execute, "warnings: {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn plan_rejects_stale_primary_and_snapshots_package_entries() {
+        let fixture = Fixture::new();
+        let library = Library::in_memory().unwrap();
+        let (source_root, destination_root) = setup_roots(&fixture, &library);
+        let package = source_root.join("model-package");
+        fs::create_dir_all(&package).unwrap();
+        let primary = package.join("model.pmx");
+        let texture = package.join("texture.png");
+        fs::write(&primary, b"fixture-pmx").unwrap();
+        fs::write(&texture, b"texture").unwrap();
+        let parsed = serde_json::json!({
+            "file_type": "pmx",
+            "file_dependencies": [dependency("texture.png", "texture", &texture, "resolved")]
+        });
+        add_asset(
+            &library,
+            "asset-1",
+            "source-root",
+            "Fixture Model",
+            &primary,
+            &package,
+            &parsed,
+            &[(texture.to_str().unwrap(), "texture")],
+        );
+
+        let initial = move_plan(&library, &destination_root);
+        assert!(initial.can_execute, "warnings: {:?}", initial.warnings);
+        fs::write(&texture, b"texture-updated").unwrap();
+        let changed_dependency = move_plan(&library, &destination_root);
+
+        assert!(changed_dependency.can_execute);
+        assert_ne!(initial.dependency_snapshots, changed_dependency.dependency_snapshots);
+        assert_ne!(initial.package_snapshots, changed_dependency.package_snapshots);
+
+        fs::write(package.join("unindexed-note.txt"), b"new package file").unwrap();
+        let changed_package = move_plan(&library, &destination_root);
+        assert!(changed_package.can_execute);
+        assert_ne!(changed_dependency.package_snapshots, changed_package.package_snapshots);
+
+        fs::write(&primary, b"fixture-pmx-updated").unwrap();
+        let changed_primary = move_plan(&library, &destination_root);
+
+        assert!(!changed_primary.can_execute);
+        assert!(changed_primary.warnings.iter().any(|warning| {
+            warning.contains("主文件自上次扫描后已变化")
+        }));
+    }
 }

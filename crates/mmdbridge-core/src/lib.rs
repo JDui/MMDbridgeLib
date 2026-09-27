@@ -18,7 +18,10 @@ mod x_binary;
 
 pub use database::Library;
 pub use error::{CoreError, CoreResult};
-pub use operations::{AssetOperationAsset, AssetOperationJournalEntry, AssetOperationPlan};
+pub use operations::{
+    AssetOperationAsset, AssetOperationDependencySnapshot, AssetOperationJournalEntry,
+    AssetOperationPlan, AssetOperationSourceSnapshot,
+};
 pub use thumbnail::{GeneratedThumbnail, ThumbnailRenderReport};
 pub use thumbnail_concurrency::ThumbnailConcurrencySettings;
 pub use types::{

@@ -29,12 +29,23 @@ struct ApiError {
     error_code: &'static str,
     message: String,
     asset_id: Option<String>,
+    root_id: Option<String>,
+    job_id: Option<String>,
     source: Option<String>,
     recoverable: bool,
 }
 
 impl From<CoreError> for ApiError {
     fn from(error: CoreError) -> Self {
+        let recoverable = error.is_recoverable();
+        let (asset_id, root_id, job_id) = match &error {
+            CoreError::AssetNotFound(asset_id) => (Some(asset_id.clone()), None, None),
+            CoreError::RootNotFound(root_id) | CoreError::RootDisabled(root_id) => {
+                (None, Some(root_id.clone()), None)
+            }
+            CoreError::JobNotFound(job_id) => (None, None, Some(job_id.clone())),
+            _ => (None, None, None),
+        };
         let error_code = match &error {
             CoreError::Database(_) => "DatabaseError",
             CoreError::Io(_) => "FilesystemError",
@@ -61,9 +72,11 @@ impl From<CoreError> for ApiError {
         Self {
             error_code,
             message: error.to_string(),
-            asset_id: None,
+            asset_id,
+            root_id,
+            job_id,
             source: None,
-            recoverable: true,
+            recoverable,
         }
     }
 }
@@ -89,12 +102,13 @@ fn root_add(
     asset_type: String,
     path: String,
     name: Option<String>,
+    scan_recursive: Option<bool>,
 ) -> Result<Root, ApiError> {
     let kind =
         AssetType::parse(&asset_type).ok_or_else(|| CoreError::InvalidAssetType(asset_type))?;
     state
         .0
-        .add_root(kind, &path, name.as_deref())
+        .add_root_with_recursive(kind, &path, name.as_deref(), scan_recursive.unwrap_or(true))
         .map_err(Into::into)
 }
 

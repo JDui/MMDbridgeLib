@@ -622,6 +622,25 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   cursor: not-allowed;
 }
 
+.root-action.root-primary-action, .root-action.root-more-action {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+}
+
+.root-action.root-primary-action:not(:disabled) {
+  color: #9bd9c4;
+}
+
+.root-action.root-primary-action:disabled {
+  opacity: .35;
+}
+
+.root-action:focus-visible {
+  outline: 1px solid var(--mint-2);
+  outline-offset: 1px;
+}
+
 .add-root {
   height: 28px;
   display: flex;
@@ -2925,6 +2944,16 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   animation: menu-in .28s var(--e-spring) both;
 }
 
+.asset-context-menu.root-context-menu {
+  width: 264px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+}
+
+.asset-context-menu .root-menu-remove {
+  color: #e7aaa0;
+}
+
 .asset-context-menu button {
   display: block;
   width: 100%;
@@ -2999,6 +3028,74 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   width: min(720px, 100%);
   max-height: calc(100vh - 48px);
   overflow: auto;
+}
+
+.add-root-modal { width: min(540px, 100%); }
+
+.add-root-form {
+  display: grid;
+  gap: 14px;
+  padding-top: 16px;
+}
+
+.add-root-field {
+  display: grid;
+  gap: 7px;
+  color: #ccded6;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.add-root-field input, .add-root-field select {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  height: 35px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: #101a20;
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.add-root-path-row {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.add-root-path-row input { flex: 1; }
+
+.add-root-path-row button {
+  flex: 0 0 auto;
+  padding: 0 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: var(--panel-3);
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.add-root-recursive {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.add-root-recursive input { accent-color: #5ed6b2; }
+
+.add-root-error {
+  padding: 9px 10px;
+  border: 1px solid rgba(180, 110, 90, .45);
+  border-radius: 7px;
+  background: rgba(52, 34, 30, .7);
+  color: #eab8ab;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .settings-modal-heading {
@@ -3206,7 +3303,8 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   color: #bfd4ce;
 }
 
-.operation-assets > div {
+.operation-assets > div,
+.operation-assets details > div {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -3214,7 +3312,17 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   overflow: auto;
 }
 
-.operation-assets > div span {
+.operation-assets details {
+  margin-top: 4px;
+}
+
+.operation-assets summary {
+  cursor: pointer;
+  color: #9ec6b5;
+}
+
+.operation-assets > div span,
+.operation-assets details > div span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

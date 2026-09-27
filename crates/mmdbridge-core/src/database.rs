@@ -128,7 +128,6 @@ impl Library {
                  created_at TEXT NOT NULL, last_scan_at TEXT, scan_status TEXT NOT NULL DEFAULT 'NeverScanned',
                  UNIQUE(asset_type, path_key)
              );
-             UPDATE roots SET scan_recursive=1 WHERE scan_recursive=0;
              CREATE TABLE IF NOT EXISTS assets (
                  id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
                  asset_type TEXT NOT NULL, name TEXT NOT NULL, primary_source TEXT NOT NULL,
@@ -327,6 +326,16 @@ impl Library {
         path: &str,
         display_name: Option<&str>,
     ) -> CoreResult<Root> {
+        self.add_root_with_recursive(asset_type, path, display_name, true)
+    }
+
+    pub fn add_root_with_recursive(
+        &self,
+        asset_type: AssetType,
+        path: &str,
+        display_name: Option<&str>,
+        scan_recursive: bool,
+    ) -> CoreResult<Root> {
         let canonical = std::fs::canonicalize(path)
             .map_err(|error| CoreError::InvalidRoot(format!("{path}: {error}")))?;
         if !canonical.is_dir() {
@@ -348,8 +357,8 @@ impl Library {
             .lock()
             .map_err(|_| CoreError::LockPoisoned)?;
         connection.execute(
-            "INSERT INTO roots (id, asset_type, path, path_key, display_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, asset_type.as_str(), path_text, path_text.to_lowercase(), name, now],
+            "INSERT INTO roots (id, asset_type, path, path_key, display_name, scan_recursive, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, asset_type.as_str(), path_text, path_text.to_lowercase(), name, scan_recursive, now],
         )?;
         Ok(Root {
             id,
@@ -357,7 +366,7 @@ impl Library {
             path: path_text,
             display_name: name,
             enabled: true,
-            scan_recursive: true,
+            scan_recursive,
             created_at: now,
             last_scan_at: None,
             scan_status: "NeverScanned".to_owned(),
@@ -1785,6 +1794,37 @@ mod storage_tests {
             if file.exists() { std::fs::remove_file(file).unwrap(); }
         }
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn non_recursive_root_setting_survives_database_reopen() {
+        let directory = std::env::temp_dir().join(format!(
+            "mmdbridge-root-setting-{}",
+            Uuid::new_v4()
+        ));
+        let root_path = directory.join("assets");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let database_path = directory.join("library.sqlite3");
+        let library = Library::open(&database_path).unwrap();
+        let root = library
+            .add_root(AssetType::Model, root_path.to_str().unwrap(), None)
+            .unwrap();
+        library
+            .update_root(&root.id, None, Some(false), None)
+            .unwrap();
+        drop(library);
+
+        let reopened = Library::open(&database_path).unwrap();
+        let stored_root = reopened
+            .list_roots()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == root.id)
+            .unwrap();
+
+        assert!(!stored_root.scan_recursive);
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 

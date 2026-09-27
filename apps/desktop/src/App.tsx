@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { VirtuosoGrid } from "react-virtuoso";
+import { toUiError } from "./uiError";
 import "./virtualized-grid.css";
 import "./review-status.css";
 
@@ -94,6 +95,16 @@ type ScanState = { rootId: string; status: string; queueOrder: number; fullCheck
 type StorageInfo = { path: string; databaseBytes: number; walBytes: number; databaseLimitBytes: number; walTargetBytes: number };
 type ThumbnailConcurrencySettings = { parse: number | null; render: number | null; encode: number | null };
 type AssetOperationAsset = { id: string; name: string; primarySource: string };
+type AssetOperationSourceSnapshot = { path: string; fileSize: string; modifiedNs: string };
+type AssetOperationDependencySnapshot = {
+  assetId: string;
+  reference: string | null;
+  role: string;
+  path: string | null;
+  status: string;
+  fileSize: string | null;
+  modifiedNs: string | null;
+};
 type AssetOperationPlan = {
   operation: "move" | "rename" | "recycle";
   assetIds: string[];
@@ -103,6 +114,9 @@ type AssetOperationPlan = {
   newName: string | null;
   affectedAssets: AssetOperationAsset[];
   dependencyPaths: string[];
+  sourceSnapshots: AssetOperationSourceSnapshot[];
+  packageSnapshots: AssetOperationSourceSnapshot[];
+  dependencySnapshots: AssetOperationDependencySnapshot[];
   warnings: string[];
   canExecute: boolean;
 };
@@ -180,7 +194,9 @@ function formatMiB(bytes: number): string {
 
 function reviewReason(asset: Asset): string {
   const reasons: string[] = [];
-  if (asset.metadata.candidate_reason === "multiple_primary_models_in_directory") reasons.push("同一目录中有多个主模型，需确认应使用哪一个");
+  const candidateReason = typeof asset.metadata.candidate_reason === "string" ? asset.metadata.candidate_reason : "";
+  if (candidateReason === "multiple_primary_models_in_directory") reasons.push("同一目录中有多个主模型，需确认应使用哪一个");
+  else if (candidateReason) reasons.push(`待复核原因：${candidateReason}`);
   if (asset.metadata.card_identity_ambiguous === true) reasons.push("附近有无法明确归属的资源卡");
   const dependencies = Array.isArray(asset.metadata.file_dependencies) ? asset.metadata.file_dependencies : [];
   const missing = dependencies.filter((item) => item && typeof item === "object" && "status" in item && item.status === "missing").length;
@@ -193,11 +209,7 @@ function reviewReason(asset: Asset): string {
 }
 
 function assetStatusText(statuses: string[]): string {
-  return statuses.filter((status) => status !== "NeedsReview").map((status) => ({ Ready: "就绪", ParseFailed: "解析失败", MissingSource: "源文件缺失", Unsupported: "暂不支持" } as Record<string, string>)[status] ?? status).join(" · ") || "已索引";
-}
-
-function isAssetType(value: string): value is AssetType {
-  return value === "model" || value === "motion" || value === "scene";
+  return statuses.map((status) => ({ Ready: "就绪", NeedsReview: "需要复核", ParseFailed: "解析失败", MissingSource: "源文件缺失", Unsupported: "暂不支持" } as Record<string, string>)[status] ?? status).join(" · ") || "已索引";
 }
 
 function operatorsFor(field: FilterField): FilterOperator[] {
@@ -255,6 +267,14 @@ export default function App() {
   const [selected, setSelected] = useState<Asset | null>(null);
   const [assetMenu, setAssetMenu] = useState<{ asset: Asset; x: number; y: number } | null>(null);
   const assetMenuRef = useRef<HTMLDivElement>(null);
+  const [rootMenu, setRootMenu] = useState<{ root: Root; x: number; y: number } | null>(null);
+  const rootMenuRef = useRef<HTMLDivElement>(null);
+  const [addRootOpen, setAddRootOpen] = useState(false);
+  const [addRootType, setAddRootType] = useState<AssetType>("model");
+  const [addRootPath, setAddRootPath] = useState("");
+  const [addRootName, setAddRootName] = useState("");
+  const [addRootRecursive, setAddRootRecursive] = useState(true);
+  const [addRootBusy, setAddRootBusy] = useState(false);
   const [bulkSelectMode, setBulkSelectMode] = useState(false);
   const [bulkSelectedIds, setBulkSelectedIds] = useState<Set<string>>(() => new Set());
   const [viewerAsset, setViewerAsset] = useState<{ id?: string; name: string; primarySource: string; assetType?: "model" | "scene" } | null>(null);
@@ -298,6 +318,25 @@ export default function App() {
     };
   }, [assetMenu]);
 
+  useEffect(() => {
+    if (!rootMenu) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!rootMenuRef.current?.contains(event.target as Node)) setRootMenu(null);
+    };
+    const close = () => setRootMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [rootMenu]);
+
   function openAssetMenu(event: React.MouseEvent<HTMLElement>, asset: Asset) {
     event.preventDefault();
     event.stopPropagation();
@@ -306,6 +345,17 @@ export default function App() {
       asset,
       x: Math.max(8, Math.min(event.clientX, window.innerWidth - 232)),
       y: Math.max(8, Math.min(event.clientY, window.innerHeight - 238)),
+    });
+  }
+
+  function openRootMenu(event: React.MouseEvent<HTMLButtonElement>, root: Root) {
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    setRootMenu({
+      root,
+      x: Math.max(8, Math.min(bounds.right, window.innerWidth - 268)),
+      y: Math.max(8, Math.min(bounds.top, window.innerHeight - 340)),
     });
   }
 
@@ -341,7 +391,7 @@ export default function App() {
           limit: LIBRARY_PAGE_SIZE,
         });
       const current = () => revision === assetQueryRevision.current;
-      const reportError = (reason: unknown) => { if (current()) setError(String(reason)); };
+      const reportError = (reason: unknown) => { if (current()) setError(toUiError(reason)); };
       await Promise.allSettled([
         invoke<Root[]>("roots_list").then((value) => { if (current()) setRoots(value); }).catch(reportError),
         invoke<AssetCounts>("asset_counts").then((value) => { if (current()) setCounts(value); }).catch(reportError),
@@ -365,7 +415,7 @@ export default function App() {
         invoke<SavedFilter[]>("filters_list").then((value) => { if (current()) setSavedFilters(value); }).catch(reportError),
       ]);
     } catch (reason) {
-      if (revision === assetQueryRevision.current) setError(String(reason));
+      if (revision === assetQueryRevision.current) setError(toUiError(reason));
     } finally {
       if (revision === assetQueryRevision.current) setIsRefreshing(false);
     }
@@ -404,7 +454,7 @@ export default function App() {
       });
       setNextAssetCursor(page.nextCursor);
     } catch (reason) {
-      if (revision === assetQueryRevision.current) setError(String(reason));
+      if (revision === assetQueryRevision.current) setError(toUiError(reason));
     } finally {
       if (assetPageLoading.current === revision) assetPageLoading.current = null;
       if (revision === assetQueryRevision.current) setLoadingNextPage(false);
@@ -426,7 +476,7 @@ export default function App() {
         if (disposed) listeners.forEach((stop) => stop());
         else unlisten = listeners;
       })
-      .catch((reason) => { if (!disposed) setError(String(reason)); });
+      .catch((reason) => { if (!disposed) setError(toUiError(reason)); });
     return () => {
       disposed = true;
       unlisten.forEach((stop) => stop());
@@ -447,7 +497,7 @@ export default function App() {
             void refresh();
           }
         })
-        .catch((reason) => { if (!disposed) setError(String(reason)); });
+        .catch((reason) => { if (!disposed) setError(toUiError(reason)); });
     }, 700);
     return () => { disposed = true; window.clearInterval(timer); };
   }, [jobs, refresh]);
@@ -467,7 +517,7 @@ export default function App() {
           && ["Completed", "Paused", "Cancelled", "Failed"].includes(nextScans.find((next) => next.rootId === scan.rootId)?.status ?? ""))) {
           void refresh();
         }
-      }).catch((reason) => { if (!disposed) setError(String(reason)); });
+      }).catch((reason) => { if (!disposed) setError(toUiError(reason)); });
     }, 1200);
     return () => { disposed = true; window.clearInterval(timer); };
   }, [refresh]);
@@ -492,7 +542,7 @@ export default function App() {
           setAssetDuplicates(duplicates);
         }
       })
-      .catch((reason) => { if (active) setError(String(reason)); });
+      .catch((reason) => { if (active) setError(toUiError(reason)); });
     return () => { active = false; };
   }, [selected?.id]);
 
@@ -522,25 +572,68 @@ export default function App() {
     setNextAssetCursor(null);
   }
 
-  async function addRoot(type: AssetType) {
-    const path = await open({ directory: true, multiple: false, title: `添加${categoryLabels[type]}目录` });
-    if (typeof path !== "string" || !path.trim()) return;
-    setBusy(true);
-    setNotice("正在添加资产库…");
+  function addRoot(type?: AssetType) {
+    setAddRootType(type ?? (activeType === "all" ? "model" : activeType));
+    setAddRootPath("");
+    setAddRootName("");
+    setAddRootRecursive(true);
+    setError("");
+    setNotice("");
+    setAddRootOpen(true);
+  }
+
+  async function chooseAddRootDirectory() {
     try {
-      const root = await invoke<Root>("root_add", { assetType: type, path: path.trim(), name: null });
-      setActiveType(type);
+      const path = await open({ directory: true, multiple: false, title: `选择${categoryLabels[addRootType]}目录` });
+      if (typeof path === "string" && path.trim()) setAddRootPath(path.trim());
+    } catch (reason) {
+      setError(toUiError(reason));
+    }
+  }
+
+  async function submitAddRoot() {
+    const path = addRootPath.trim();
+    const name = addRootName.trim();
+    if (!path) {
+      setError("请选择或输入目录路径。");
+      return;
+    }
+    if (Array.from(name).length > 128) {
+      setError("显示名称不能超过 128 个字符。");
+      return;
+    }
+    setAddRootBusy(true);
+    setNotice("正在添加目录并加入扫描队列…");
+    try {
+      const root = await invoke<Root>("root_add", {
+        assetType: addRootType,
+        path,
+        name: name || null,
+        scanRecursive: addRootRecursive,
+      });
+      setRoots((current) => [...current.filter((item) => item.id !== root.id), root]);
+      setActiveType(addRootType);
       setActiveRoot(root.id);
       setActiveSavedFilterId(null);
       setFavoritesOnly(false);
       setDuplicatesOnly(false);
-      await refresh();
-      setNotice("已添加。可点击目录旁的扫描按钮建立索引。");
+      try {
+        const scan = await invoke<ScanState>("scan_enqueue", { rootId: root.id });
+        setScanStates((current) => [...current.filter((item) => item.rootId !== root.id), scan]);
+        scanStatesRef.current = [...scanStatesRef.current.filter((item) => item.rootId !== root.id), scan];
+        setError("");
+        setNotice(`${root.displayName} 已添加并加入扫描队列。`);
+      } catch (reason) {
+        setError(`目录已添加，但扫描未能启动：${toUiError(reason)}`);
+        setNotice("目录仍保留在列表中；请点击目录旁的扫描按钮重试。");
+      }
+      setAddRootOpen(false);
+      void refresh();
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
       setNotice("");
     } finally {
-      setBusy(false);
+      setAddRootBusy(false);
     }
   }
 
@@ -567,7 +660,7 @@ export default function App() {
       setStorageInfo(storage);
       setSettingsOpen(true);
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
     }
   }
 
@@ -585,7 +678,7 @@ export default function App() {
       setNotice("已保存动作预览模型。VMD/VPD 资源卡会使用该模型生成动作或姿势缩略图。");
       setError("");
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
     } finally {
       setSettingsBusy(false);
     }
@@ -599,7 +692,7 @@ export default function App() {
       setNotice("已清除动作预览模型设置。");
       setError("");
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
     } finally {
       setSettingsBusy(false);
     }
@@ -613,7 +706,7 @@ export default function App() {
       setNotice("已保存缩略图并发设置，新设置立即生效。");
       setError("");
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
     } finally {
       setSettingsBusy(false);
     }
@@ -626,7 +719,7 @@ export default function App() {
       setStorageInfo(storage);
       setNotice("数据库整理完成，已保留最近 1000 条任务记录。");
       setError("");
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
     finally { setSettingsBusy(false); }
   }
 
@@ -648,7 +741,7 @@ export default function App() {
       setError("");
       setNotice("");
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
     } finally {
       setBusy(false);
     }
@@ -674,7 +767,7 @@ export default function App() {
       setOperationJournalOpen(true);
       setError("");
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
     }
   }
 
@@ -686,7 +779,7 @@ export default function App() {
       await refresh();
       setNotice("恢复记录已标记为已核对。");
       setError("");
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function executePlannedAssetOperation() {
@@ -705,7 +798,7 @@ export default function App() {
         setOperationJournal(await invoke<AssetOperationJournalEntry[]>("operation_journal_list", { limit: 100 }));
       }
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
     } finally {
       setBusy(false);
     }
@@ -717,7 +810,7 @@ export default function App() {
       setNotice("已在资源管理器中定位源文件。");
       setError("");
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
       setNotice("");
     }
   }
@@ -728,19 +821,13 @@ export default function App() {
       setNotice("已打开资产源目录。");
       setError("");
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
       setNotice("");
     }
   }
 
   function addAnyRoot() {
-    const value = window.prompt("选择资产类型：model / motion / scene，也可输入 模型 / 动作 / 场景");
-    if (!value?.trim()) return;
-    const aliases: Record<string, AssetType> = { 模型: "model", 动作: "motion", 场景: "scene", stage: "scene" };
-    const normalized = value.trim().toLowerCase();
-    const type = aliases[normalized] ?? (isAssetType(normalized) ? normalized : null);
-    if (type) void addRoot(type);
-    else setError("请输入 model、motion、scene 或对应的中文类型。");
+    addRoot();
   }
 
   async function scanRoot(root: Root, fullCheck = false) {
@@ -755,7 +842,7 @@ export default function App() {
       scanStatesRef.current = [...scanStatesRef.current.filter((item) => item.rootId !== root.id), state];
       setNotice(`${root.displayName} 已加入${fullCheck ? "完整检查" : "扫描"}队列。`);
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
       setNotice("");
     }
   }
@@ -767,7 +854,7 @@ export default function App() {
       scanStatesRef.current = states;
       setScanStates(states);
       setNotice("已请求停止扫描。已建立的索引记录会保留。");
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function pauseScan(rootId: string) {
@@ -776,7 +863,7 @@ export default function App() {
       const states = await invoke<ScanState[]>("scan_states");
       scanStatesRef.current = states;
       setScanStates(states);
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function moveScan(rootId: string, direction: -1 | 1) {
@@ -785,7 +872,7 @@ export default function App() {
       const states = await invoke<ScanState[]>("scan_states");
       scanStatesRef.current = states;
       setScanStates(states);
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function queueCards(root: Root) {
@@ -794,7 +881,7 @@ export default function App() {
       const count = await invoke<number>("cards_queue_root", { rootId: root.id });
       await refresh();
       setNotice(`${root.displayName} 已加入 ${count} 个资源卡生成任务。`);
-    } catch (reason) { setError(String(reason)); setNotice(""); }
+    } catch (reason) { setError(toUiError(reason)); setNotice(""); }
   }
 
   async function updateRoot(root: Root, changes: { enabled?: boolean; scanRecursive?: boolean; displayName?: string }) {
@@ -807,8 +894,8 @@ export default function App() {
       });
       setRoots((current) => current.map((item) => item.id === updated.id ? updated : item));
       await refresh();
-      setNotice(changes.displayName !== undefined ? "已更新目录名称。" : changes.enabled !== undefined ? (updated.enabled ? "已恢复目录扫描。" : "已暂停目录扫描。") : "已更新递归扫描设置。");
-    } catch (reason) { setError(String(reason)); }
+      setNotice(changes.displayName !== undefined ? "已更新目录名称。" : changes.enabled !== undefined ? (updated.enabled ? "已启用目录监视与后续扫描。" : "已停用目录监视与后续扫描。") : updated.scanRecursive ? "已开启递归扫描；下次扫描会检查目录及其子目录。" : "已关闭递归扫描；下次扫描仅检查顶层文件，子目录已有索引状态会保留。");
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   function renameRoot(root: Root) {
@@ -825,7 +912,7 @@ export default function App() {
       setSelected(null);
       await refresh();
       setNotice("已从 Library 移除目录索引。");
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function createCard(assetId: string) {
@@ -836,7 +923,7 @@ export default function App() {
       await refresh();
       setNotice(result.id ? "缩略图任务已加入队列。" : result.message ?? `资源卡已写入：${result.cardPath}`);
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
       setNotice("");
     } finally {
       setBusy(false);
@@ -848,7 +935,7 @@ export default function App() {
       await invoke("jobs_cancel", { jobId });
       await refresh();
       setNotice("已取消缩略图任务。");
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function retryJob(jobId: string) {
@@ -856,7 +943,7 @@ export default function App() {
       await invoke("jobs_retry", { jobId });
       await refresh();
       setNotice("已重新加入缩略图队列。");
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function verifyCard(assetId: string) {
@@ -864,7 +951,7 @@ export default function App() {
       const result = await invoke<{ status: string; message?: string }>("card_verify", { assetId });
       await refresh();
       setNotice(result.message ?? `资源卡校验结果：${result.status}`);
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function addTag() {
@@ -877,7 +964,7 @@ export default function App() {
       setAssetTags(await invoke<AssetTag[]>("asset_tags", { assetId }));
       await refresh();
       setNotice(result.blockedByUser ? "此标签已被手动移除，自动标签来源不会重新添加它。" : "已保存用户标签。");
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function addTagToSelection() {
@@ -901,11 +988,11 @@ export default function App() {
       setNotice(`批量标签已完成：更新 ${changed}/${mutations.length} 项，受手动移除规则阻止 ${blocked} 项。`);
       if (selectedId) {
         try { setAssetTags(await invoke<AssetTag[]>("asset_tags", { assetId: selectedId })); }
-        catch (reason) { setError(`详情标签刷新失败：${String(reason)}`); }
+        catch (reason) { setError(`详情标签刷新失败：${toUiError(reason)}`); }
       }
       await refresh();
     } catch (reason) {
-      setError(`批量标签失败：${String(reason)}`);
+      setError(`批量标签失败：${toUiError(reason)}`);
     } finally {
       setBusy(false);
     }
@@ -930,11 +1017,11 @@ export default function App() {
       setNotice(`批量移除标签完成：移除 ${changed}/${mutations.length} 项，已为所选资产记录手动移除规则。`);
       if (selectedId) {
         try { setAssetTags(await invoke<AssetTag[]>("asset_tags", { assetId: selectedId })); }
-        catch (reason) { setError(`详情标签刷新失败：${String(reason)}`); }
+        catch (reason) { setError(`详情标签刷新失败：${toUiError(reason)}`); }
       }
       await refresh();
     } catch (reason) {
-      setError(`批量移除标签失败：${String(reason)}`);
+      setError(`批量移除标签失败：${toUiError(reason)}`);
     } finally {
       setBusy(false);
     }
@@ -951,7 +1038,7 @@ export default function App() {
       setNotice(`${favorite ? "批量收藏" : "批量取消收藏"}已完成：${changed}/${assetIds.length} 项状态发生变化。`);
       await refresh();
     } catch (reason) {
-      setError(`批量${favorite ? "收藏" : "取消收藏"}失败：${String(reason)}`);
+      setError(`批量${favorite ? "收藏" : "取消收藏"}失败：${toUiError(reason)}`);
     } finally {
       setBusy(false);
     }
@@ -978,14 +1065,14 @@ export default function App() {
       setAssetTags(await invoke<AssetTag[]>("asset_tags", { assetId }));
       await refresh();
       setNotice(`已移除标签“${name}”。`);
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function toggleFavorite(asset: Asset) {
     try {
       await invoke("favorite_set", { assetId: asset.id, favorite: !asset.isFavorite });
       await refresh();
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function confirmRelation(relation: AssetRelation) {
@@ -993,7 +1080,7 @@ export default function App() {
       await invoke("relation_confirm", { relationId: relation.id });
       setAssetRelations((current) => current.map((item) => item.id === relation.id ? { ...item, confirmed: true } : item));
       setNotice("已确认这条关系建议。");
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   function changeFilterRule(index: number, updates: Partial<BuilderRule>) {
@@ -1059,7 +1146,7 @@ export default function App() {
       setSearchText("");
       setNotice(`已保存并应用智能集合“${saved.name}”。`);
       setError("");
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   async function removeSmartFilter(filter: SavedFilter) {
@@ -1068,7 +1155,7 @@ export default function App() {
       await invoke("filter_remove", { filterId: filter.id });
       if (activeSavedFilterId === filter.id) setActiveSavedFilterId(null);
       else await refresh();
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { setError(toUiError(reason)); }
   }
 
   function submitSearch(event: React.FormEvent) {
@@ -1116,20 +1203,18 @@ export default function App() {
               <span className={`type-icon ${type}`}>{categoryGlyphs[type]}</span><span>{categoryLabels[type]}</span><span className="count">{counts[type]}</span>
             </button>
             {(activeType === type || activeType === "all") && <div className="root-list">
-              {roots.filter((root) => root.assetType === type).map((root) => (
-                <div className={`root-row ${activeRoot === root.id ? "selected" : ""}`} key={root.id}>
+              {roots.filter((root) => root.assetType === type).map((root) => {
+                const rootScan = scanStates.find((scan) => scan.rootId === root.id);
+                return <div className={`root-row ${activeRoot === root.id ? "selected" : ""}`} key={root.id}>
                   <button className="root-name" title={root.path} onClick={() => { setActiveType(type); setActiveRoot(root.id); setActiveSavedFilterId(null); setFavoritesOnly(false); setDuplicatesOnly(false); setSelected(null); }}>
                     <span className={`root-dot ${root.enabled ? "" : "paused"}`} /><span className="root-label">{root.displayName}</span><span className="count">{counts.byRoot[root.id] ?? 0}</span>
                   </button>
-                  {scanStates.find((scan) => scan.rootId === root.id && activeScanStatuses.has(scan.status)) &&
-                    <span className="root-scan-percent" title="扫描进度">{Math.round((scanStates.find((scan) => scan.rootId === root.id)?.progress ?? 0) * 100)}%</span>}
-                  <button className="root-action" title="修改显示名称" disabled={!!activeScans.length} onClick={() => renameRoot(root)}>✎</button>
-                  <button className="root-action" title="扫描目录" disabled={busy || !root.enabled} onClick={() => void scanRoot(root)}>↻</button>
-                  <button className="root-action" title="完整检查源文件内容及资源卡版本" disabled={busy || !root.enabled || scanStates.some((scan) => scan.rootId === root.id && (activeScanStatuses.has(scan.status) || scan.status === "Paused"))} onClick={() => void scanRoot(root, true)}>✓</button>
-                  <button className="root-action" title="批量生成本目录资源卡和缩略图" disabled={busy || !root.enabled || activeScans.some((scan) => scan.rootId === root.id)} onClick={() => void queueCards(root)}>▧</button>
-                  <button className="root-action remove" title="从 Library 移除" disabled={!!activeScans.length} onClick={() => void removeRoot(root)}>×</button>
-                </div>
-              ))}
+                  {rootScan && activeScanStatuses.has(rootScan.status) &&
+                    <span className="root-scan-percent" title="扫描进度">{Math.round(rootScan.progress * 100)}%</span>}
+                  <button className="root-action root-primary-action" aria-label={rootScan?.status === "Paused" ? `继续 ${root.displayName} 的本次扫描` : `扫描 ${root.displayName}`} title={rootScan?.status === "Paused" ? "继续本次扫描" : "扫描目录"} disabled={busy || !root.enabled} onClick={() => void scanRoot(root)}>{rootScan?.status === "Paused" ? "▶" : "↻"}</button>
+                  <button className="root-action root-more-action" aria-label={`${root.displayName} 更多操作`} aria-haspopup="menu" aria-expanded={rootMenu?.root.id === root.id} title="更多目录操作" onClick={(event) => openRootMenu(event, root)}>⋯</button>
+                </div>;
+              })}
               <button className="add-root" onClick={() => void addRoot(type)}><span>＋</span> 添加目录</button>
             </div>}
           </div>
@@ -1269,8 +1354,8 @@ export default function App() {
           <div className="inspector-title"><div><div className="inspector-type">{categoryLabels[selected.assetType]}</div><h3>{selected.name}</h3></div><button className={`favorite-button ${selected.isFavorite ? "favorited" : ""}`} title={selected.isFavorite ? "取消收藏" : "添加收藏"} onClick={() => void toggleFavorite(selected)}>{selected.isFavorite ? "★" : "☆"}</button></div>
           <div className="inspector-section"><div className="section-title">基本信息</div><div className="detail-list">
             {Object.entries(selected.metadata).filter(([key, value]) => metadataLabels[key] && (typeof value === "number" || typeof value === "boolean" || typeof value === "string")).slice(0, 10).map(([key, value]) => <div className="detail-row" key={key}><span>{metadataLabels[key]}</span><strong>{formatValue(value)}</strong></div>)}
-            <div className="detail-row"><span>资产状态</span><strong className={selected.statuses.includes("ParseFailed") || selected.statuses.includes("MissingSource") ? "state-warn" : "state-ready"}>{assetStatusText(selected.statuses)}</strong></div>
-            {selected.statuses.includes("NeedsReview") && reviewReason(selected) && <div className="detail-row review-reason"><span>资源提示</span><strong>{reviewReason(selected)}</strong></div>}
+            <div className="detail-row"><span>资产状态</span><strong className={selected.statuses.includes("ParseFailed") || selected.statuses.includes("MissingSource") || selected.statuses.includes("NeedsReview") ? "state-warn" : "state-ready"}>{assetStatusText(selected.statuses)}</strong></div>
+            {selected.statuses.includes("NeedsReview") && <div className="detail-row review-reason"><span>资源提示</span><strong>{reviewReason(selected) || "存在待复核标记，但没有可显示的详细原因；重新扫描可刷新自动检测信息。"}</strong></div>}
             <div className="detail-row"><span>资源卡</span><strong className={selected.cardStatus === "CardValid" ? "state-ready" : "state-muted"}>{selected.cardStatus}{selected.cardStatus === "CardValid" && !selected.hasThumbnail ? " · 预览待生成" : ""}</strong><span>{(selected.cardStatus !== "CardValid" || !selected.hasThumbnail) && <button className="tiny-link" disabled={busy} onClick={() => void createCard(selected.id)}>创建 / 刷新</button>}<button className="tiny-link" disabled={busy} onClick={() => void verifyCard(selected.id)}>校验</button></span></div>
           </div></div>
           <div className="inspector-section source-section"><div className="section-title">源文件</div><div className="source-path" title={selected.primarySource}><span className="file-icon">▧</span><div><strong>{selected.primarySource.split(/[\\/]/).pop()}</strong><small>{selected.assetDirectory}</small></div></div><div className="asset-file-actions"><button disabled={busy} onClick={() => void planRenameAsset(selected)}>重命名资产包</button><button disabled={busy} onClick={() => void planMoveAssets([selected.id])}>移动…</button><button disabled={busy} onClick={() => void requestAssetOperation("recycle", [selected.id])}>移到回收站…</button></div></div>
@@ -1305,6 +1390,16 @@ export default function App() {
         <button role="menuitem" onClick={() => { void toggleFavorite(assetMenu.asset); setAssetMenu(null); }}>{assetMenu.asset.isFavorite ? "取消收藏" : "添加收藏"}</button>
         <button role="menuitem" disabled={busy} onClick={() => { void createCard(assetMenu.asset.id); setAssetMenu(null); }}>刷新资源卡与缩略图</button>
       </div>}
+      {rootMenu && <div className="asset-context-menu root-context-menu" ref={rootMenuRef} role="menu" aria-label={`${rootMenu.root.displayName} 目录操作`} style={{ left: rootMenu.x, top: rootMenu.y }}>
+        <button role="menuitem" disabled={!!activeScans.length} onClick={() => { renameRoot(rootMenu.root); setRootMenu(null); }}>修改显示名称</button>
+        <button role="menuitem" disabled={!!activeScans.length} onClick={() => { void updateRoot(rootMenu.root, { enabled: !rootMenu.root.enabled }); setRootMenu(null); }}>{rootMenu.root.enabled ? "停用目录监视与后续扫描" : "启用目录监视与后续扫描"}</button>
+        <button role="menuitem" disabled={!!activeScans.length} title="设置影响后续扫描；关闭递归时，现有子目录索引状态会保留。" onClick={() => { void updateRoot(rootMenu.root, { scanRecursive: !rootMenu.root.scanRecursive }); setRootMenu(null); }}>递归扫描：{rootMenu.root.scanRecursive ? "已开启 · 点击关闭" : "已关闭 · 点击开启"}</button>
+        <div className="asset-context-separator" role="separator" />
+        <button role="menuitem" disabled={busy || !rootMenu.root.enabled || scanStates.some((scan) => scan.rootId === rootMenu.root.id && (activeScanStatuses.has(scan.status) || scan.status === "Paused"))} onClick={() => { void scanRoot(rootMenu.root, true); setRootMenu(null); }}>完整检查源文件与资源卡</button>
+        <button role="menuitem" disabled={busy || !rootMenu.root.enabled || activeScans.some((scan) => scan.rootId === rootMenu.root.id)} onClick={() => { void queueCards(rootMenu.root); setRootMenu(null); }}>生成资源卡和缩略图</button>
+        <div className="asset-context-separator" role="separator" />
+        <button role="menuitem" className="root-menu-remove" disabled={!!activeScans.length} onClick={() => { void removeRoot(rootMenu.root); setRootMenu(null); }}>从 Library 移除目录</button>
+      </div>}
       {scanQueueOpen && <div className="operation-modal-backdrop" role="presentation"><section className="operation-modal scan-queue-modal" role="dialog" aria-modal="true" aria-labelledby="scan-queue-title">
         <div className="settings-modal-heading"><div><span>SCAN QUEUE</span><h2 id="scan-queue-title">扫描索引队列</h2></div><button className="icon-button" aria-label="关闭扫描队列" onClick={() => setScanQueueOpen(false)}>×</button></div>
         <p className="operation-summary">扫描按队列顺序依次执行。暂停会保留已建立的索引；继续时会重新核对该目录。</p>
@@ -1336,8 +1431,8 @@ export default function App() {
         <div className="settings-modal-heading"><div><span>PACKAGE OPERATION</span><h2 id="operation-plan-title">确认资产操作</h2></div><button className="icon-button" aria-label="关闭操作计划" onClick={() => setAssetOperationPlan(null)}>×</button></div>
         <p className="operation-summary">{assetOperationPlan.operation === "move" ? "移动" : assetOperationPlan.operation === "rename" ? "重命名" : "发送到 Windows 回收站"}将影响 {assetOperationPlan.sourcePaths.length} 个资产包、{assetOperationPlan.affectedAssets.length} 项索引资产。</p>
         <div className="operation-path-list">{assetOperationPlan.sourcePaths.map((source, index) => <div className="operation-path-row" key={source}><span>{source}</span>{assetOperationPlan.destinationPaths[index] && <><b>→</b><span>{assetOperationPlan.destinationPaths[index]}</span></>}</div>)}</div>
-        {assetOperationPlan.affectedAssets.length > 0 && <div className="operation-assets"><strong>受影响资产</strong><div>{assetOperationPlan.affectedAssets.slice(0, 12).map((asset) => <span key={asset.id}>{asset.name}</span>)}{assetOperationPlan.affectedAssets.length > 12 && <span>还有 {assetOperationPlan.affectedAssets.length - 12} 项</span>}</div></div>}
-        {assetOperationPlan.dependencyPaths.length > 0 && <div className="operation-assets"><strong>包内依赖文件 · {assetOperationPlan.dependencyPaths.length}</strong><div>{assetOperationPlan.dependencyPaths.slice(0, 8).map((path) => <span title={path} key={path}>{path}</span>)}{assetOperationPlan.dependencyPaths.length > 8 && <span>还有 {assetOperationPlan.dependencyPaths.length - 8} 个依赖</span>}</div></div>}
+        {assetOperationPlan.affectedAssets.length > 0 && <div className="operation-assets"><strong>受影响资产 · {assetOperationPlan.affectedAssets.length}</strong><details><summary>展开全部资产</summary><div>{assetOperationPlan.affectedAssets.map((asset) => <span title={asset.primarySource} key={asset.id}>{asset.name}</span>)}</div></details></div>}
+        {assetOperationPlan.dependencyPaths.length > 0 && <div className="operation-assets"><strong>包内依赖文件 · {assetOperationPlan.dependencyPaths.length}</strong><details><summary>展开全部依赖</summary><div>{assetOperationPlan.dependencyPaths.map((path) => <span title={path} key={path}>{path}</span>)}</div></details></div>}
         {assetOperationPlan.warnings.length > 0 && <div className="operation-warnings"><strong>安全检查未通过</strong>{assetOperationPlan.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
         <footer className="operation-modal-actions"><button onClick={() => setAssetOperationPlan(null)}>取消</button><button className={assetOperationPlan.operation === "recycle" ? "danger" : "primary"} disabled={!assetOperationPlan.canExecute || busy} onClick={() => void executePlannedAssetOperation()}>{busy ? "正在执行…" : assetOperationPlan.operation === "recycle" ? "确认移到回收站" : "确认执行"}</button></footer>
       </section></div>}
@@ -1372,6 +1467,17 @@ export default function App() {
         </div>
         {storageInfo && <div className="settings-field storage-settings"><label>便携数据库</label><p title={storageInfo.path}>{storageInfo.path}</p><div>数据库 {formatMiB(storageInfo.databaseBytes)} / {formatMiB(storageInfo.databaseLimitBytes)} · WAL {formatMiB(storageInfo.walBytes)}（目标不超过 {formatMiB(storageInfo.walTargetBytes)}）</div><div className="settings-modal-actions"><button disabled={settingsBusy || activeScans.length > 0 || activeThumbnailCount > 0} onClick={() => void compactStorage()}>整理数据库和历史任务</button></div></div>}
         <footer>模型文件保留在原位置；数据库保存在程序旁的 data 目录。</footer>
+      </section></div>}
+      {addRootOpen && <div className="operation-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !addRootBusy) setAddRootOpen(false); }}><section className="operation-modal add-root-modal" role="dialog" aria-modal="true" aria-labelledby="add-root-title">
+        <div className="settings-modal-heading"><div><span>ADD LIBRARY ROOT</span><h2 id="add-root-title">添加目录并扫描</h2></div><button className="icon-button" aria-label="关闭添加目录" disabled={addRootBusy} onClick={() => setAddRootOpen(false)}>×</button></div>
+        <form className="add-root-form" onSubmit={(event) => { event.preventDefault(); void submitAddRoot(); }}>
+          <label className="add-root-field">资产类型<select value={addRootType} disabled={addRootBusy} onChange={(event) => setAddRootType(event.target.value as AssetType)}><option value="model">模型</option><option value="motion">动作</option><option value="scene">场景</option></select></label>
+          <label className="add-root-field">目录路径<div className="add-root-path-row"><input aria-label="目录路径" value={addRootPath} disabled={addRootBusy} placeholder="选择或输入本地目录路径" onChange={(event) => setAddRootPath(event.target.value)} /><button type="button" disabled={addRootBusy} onClick={() => void chooseAddRootDirectory()}>选择目录</button></div></label>
+          <label className="add-root-field">显示名称（可选）<input value={addRootName} maxLength={128} disabled={addRootBusy} placeholder="默认使用目录名称" onChange={(event) => setAddRootName(event.target.value)} /></label>
+          <label className="add-root-recursive"><input type="checkbox" checked={addRootRecursive} disabled={addRootBusy} onChange={(event) => setAddRootRecursive(event.target.checked)} /><span>递归扫描子目录</span></label>
+          {error && <div className="add-root-error" role="alert">{error}</div>}
+          <footer className="operation-modal-actions"><button type="button" disabled={addRootBusy} onClick={() => setAddRootOpen(false)}>取消</button><button className="primary" type="submit" disabled={addRootBusy}>{addRootBusy ? "正在添加并扫描…" : "添加并扫描"}</button></footer>
+        </form>
       </section></div>}
     </div>
   );

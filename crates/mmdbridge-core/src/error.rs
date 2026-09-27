@@ -47,3 +47,35 @@ pub enum CoreError {
     #[error("library lock is poisoned")]
     LockPoisoned,
 }
+
+impl CoreError {
+    /// Whether this request can be retried immediately with the same arguments.
+    ///
+    /// Known deterministic request/state errors, unsupported/existing-target file
+    /// operations, and explicit cancellations return false. Other error categories
+    /// keep the existing retryable default until they carry more specific context.
+    pub fn is_recoverable(&self) -> bool {
+        match self {
+            Self::Io(error) => !matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::AlreadyExists
+            ),
+            Self::Json(_) => false,
+            _ => !matches!(
+                self,
+                Self::RootNotFound(_)
+                    | Self::RootDisabled(_)
+                    | Self::ScanCancelled
+                    | Self::ScanPaused
+                    | Self::StorageLimit(_)
+                    | Self::ThumbnailCancelled
+                    | Self::JobNotFound(_)
+                    | Self::AssetNotFound(_)
+                    | Self::InvalidAssetType(_)
+                    | Self::InvalidTag(_)
+                    | Self::InvalidFilter(_)
+                    | Self::LockPoisoned
+            ),
+        }
+    }
+}

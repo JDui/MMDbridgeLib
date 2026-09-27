@@ -274,7 +274,15 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            let output = json!({"error_code":error_code(&error), "message":error.to_string(), "source":null, "recoverable":true});
+            let (asset_id, root_id, job_id) = match &error {
+                CoreError::AssetNotFound(asset_id) => (Some(asset_id.as_str()), None, None),
+                CoreError::RootNotFound(root_id) | CoreError::RootDisabled(root_id) => {
+                    (None, Some(root_id.as_str()), None)
+                }
+                CoreError::JobNotFound(job_id) => (None, None, Some(job_id.as_str())),
+                _ => (None, None, None),
+            };
+            let output = json!({"error_code":error_code(&error), "message":error.to_string(), "asset_id":asset_id, "root_id":root_id, "job_id":job_id, "source":null, "recoverable":error.is_recoverable()});
             eprintln!(
                 "{}",
                 serde_json::to_string_pretty(&output)

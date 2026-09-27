@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "./vendor/three.module.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
+import { toUiError } from "./uiError";
 import "./model-viewer.css";
 
 type ViewerAsset = { id?: string; name: string; primarySource: string; assetType?: "model" | "scene" };
@@ -302,7 +303,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
         renderer.render(scene, camera);
       });
     } catch (reason) {
-      setError(String(reason));
+      setError(toUiError(reason));
       setLoading(false);
     }
     return () => {
@@ -508,7 +509,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       })
       .catch((reason: unknown) => {
         if (active) {
-          setError(String(reason));
+          setError(toUiError(reason));
           setLoading(false);
         }
       });
