@@ -1,13 +1,13 @@
 use std::{
-    collections::HashSet,
-    path::Path,
-    sync::{Arc, Mutex},
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
 use chrono::Utc;
 use mmd_anim_format::parse_pmx_model;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
 use crate::{
@@ -15,8 +15,9 @@ use crate::{
     thumbnail::GeneratedThumbnail,
     thumbnail_concurrency::ThumbnailConcurrencySettings,
     types::{
-        Asset, AssetCursor, AssetPage, AssetTag, AssetType, CardResult, CardValidation, FilterExpr,
-        Root, SavedFilter, ScanReport, ScanState, TagMutation,
+        Asset, AssetCursor, AssetDirectory, AssetPage, AssetTag, AssetType, CardResult,
+        CardValidation, DirectoryPage, FilterExpr, Root, SavedFilter, ScanReport, ScanState,
+        TagMutation,
     },
 };
 
@@ -24,9 +25,16 @@ use crate::{
 pub struct Library {
     connection: Arc<Mutex<Connection>>,
     scan_lock: Arc<Mutex<()>>,
+    visibility_lock: Arc<Mutex<()>>,
 }
 
 impl Library {
+    pub(crate) fn visibility_guard(&self) -> CoreResult<MutexGuard<'_, ()>> {
+        self.visibility_lock
+            .lock()
+            .map_err(|_| CoreError::LockPoisoned)
+    }
+
     pub const DATABASE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
     pub const WAL_TARGET_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -59,6 +67,7 @@ impl Library {
         let library = Self {
             connection: Arc::new(Mutex::new(connection)),
             scan_lock: Arc::new(Mutex::new(())),
+            visibility_lock: Arc::new(Mutex::new(())),
         };
         library.initialize_schema()?;
         library.thumbnail_concurrency()?;
@@ -71,6 +80,7 @@ impl Library {
         let library = Self {
             connection: Arc::new(Mutex::new(connection)),
             scan_lock: Arc::new(Mutex::new(())),
+            visibility_lock: Arc::new(Mutex::new(())),
         };
         library.initialize_schema()?;
         library.thumbnail_concurrency()?;
@@ -94,7 +104,7 @@ impl Library {
         let _scan_guard = self.scan_lock.lock().map_err(|_| CoreError::LockPoisoned)?;
         let connection = self.connection()?;
         let active_scans: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM scan_state WHERE status IN ('Pending','Pausing','Discovering','Indexing','Verifying','Relations','Duplicates')",
+            "SELECT COUNT(*) FROM scan_state WHERE status IN ('Pending','Pausing','Discovering','Indexing','Verifying','Relations')",
             [], |row| row.get(0),
         )?;
         let active_cards: i64 = connection.query_row(
@@ -118,6 +128,8 @@ impl Library {
             .connection
             .lock()
             .map_err(|_| CoreError::LockPoisoned)?;
+        let schema_version: i64 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         connection.execute_batch(
             "BEGIN;
              CREATE TABLE IF NOT EXISTS roots (
@@ -132,6 +144,8 @@ impl Library {
                  id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
                  asset_type TEXT NOT NULL, name TEXT NOT NULL, primary_source TEXT NOT NULL,
                  asset_directory TEXT NOT NULL, fingerprint TEXT NOT NULL DEFAULT '', statuses_json TEXT NOT NULL DEFAULT '[]',
+                 retired_format INTEGER NOT NULL DEFAULT 0 CHECK(retired_format IN (0,1)),
+                 visibility TEXT NOT NULL DEFAULT 'normal' CHECK(visibility IN ('normal','auxiliary')),
                  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
                  UNIQUE(root_id, primary_source)
              );
@@ -147,12 +161,6 @@ impl Library {
                  root_id TEXT NOT NULL, directory TEXT NOT NULL, asset_count INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY(root_id, directory)
              );
-             INSERT OR IGNORE INTO asset_counts(root_id,asset_type,asset_count)
-                 SELECT root_id,asset_type,COUNT(*) FROM assets
-                 WHERE NOT EXISTS(SELECT 1 FROM asset_counts) GROUP BY root_id,asset_type;
-             INSERT OR IGNORE INTO asset_directory_counts(root_id,directory,asset_count)
-                 SELECT root_id,asset_directory,COUNT(*) FROM assets
-                 WHERE NOT EXISTS(SELECT 1 FROM asset_directory_counts) GROUP BY root_id,asset_directory;
              CREATE TRIGGER IF NOT EXISTS assets_count_insert AFTER INSERT ON assets BEGIN
                  INSERT INTO asset_counts(root_id,asset_type,asset_count) VALUES (NEW.root_id,NEW.asset_type,1)
                  ON CONFLICT(root_id,asset_type) DO UPDATE SET asset_count=asset_count+1;
@@ -221,13 +229,6 @@ impl Library {
                  target_asset TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
                  confidence REAL NOT NULL, reason_json TEXT NOT NULL, confirmed INTEGER NOT NULL DEFAULT 0
              );
-             CREATE TABLE IF NOT EXISTS duplicates (
-                 id TEXT PRIMARY KEY, asset_a TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-                 asset_b TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-                 similarity REAL NOT NULL, reason_json TEXT NOT NULL, UNIQUE(asset_a, asset_b)
-             );
-             CREATE INDEX IF NOT EXISTS idx_duplicates_asset_a ON duplicates(asset_a);
-             CREATE INDEX IF NOT EXISTS idx_duplicates_asset_b ON duplicates(asset_b);
              CREATE TABLE IF NOT EXISTS versions (
                  family_id TEXT NOT NULL, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
                  version_label TEXT NOT NULL, confidence REAL NOT NULL, reason_json TEXT NOT NULL,
@@ -235,7 +236,9 @@ impl Library {
              );
              CREATE TABLE IF NOT EXISTS cards (
                  asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
-                 card_path TEXT NOT NULL, status TEXT NOT NULL, manifest_json TEXT, last_checked_at TEXT NOT NULL
+                 card_path TEXT NOT NULL, status TEXT NOT NULL, manifest_json TEXT, last_checked_at TEXT NOT NULL,
+                 file_size INTEGER, modified_ns INTEGER, manifest_revision TEXT, renderer_revision TEXT,
+                 has_thumbnail INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS jobs (
                  id TEXT PRIMARY KEY, asset_id TEXT REFERENCES assets(id) ON DELETE CASCADE,
@@ -262,9 +265,32 @@ impl Library {
                  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                  expression_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
              );
-             PRAGMA user_version = 9;
-             COMMIT;",
+             ",
         )?;
+        // Older schemas gain retired_format in the later v11 migration.
+        let active_asset_filter = match schema_version {
+            12.. => "retired_format=0 AND visibility='normal' AND ",
+            11 => "retired_format=0 AND ",
+            _ => "",
+        };
+        connection.execute_batch(&format!(
+            "INSERT OR IGNORE INTO asset_counts(root_id,asset_type,asset_count)
+                 SELECT root_id,asset_type,COUNT(*) FROM assets
+                 WHERE {active_asset_filter}NOT EXISTS(SELECT 1 FROM asset_counts) GROUP BY root_id,asset_type;
+             INSERT OR IGNORE INTO asset_directory_counts(root_id,directory,asset_count)
+                 SELECT root_id,asset_directory,COUNT(*) FROM assets
+                 WHERE {active_asset_filter}NOT EXISTS(SELECT 1 FROM asset_directory_counts) GROUP BY root_id,asset_directory;"
+        ))?;
+        if schema_version < 10 {
+            connection.execute_batch(
+                "UPDATE roots SET scan_status='Paused'
+                   WHERE id IN (SELECT root_id FROM scan_state WHERE status='Duplicates');
+                 UPDATE scan_state SET status='Paused' WHERE status='Duplicates';
+                 DROP TABLE IF EXISTS duplicates;
+                 PRAGMA user_version = 10;",
+            )?;
+        }
+        connection.execute_batch("COMMIT;")?;
         let columns = connection
             .prepare("PRAGMA table_info(scan_state)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -280,6 +306,296 @@ impl Library {
         }
         if !columns.contains("full_check") {
             connection.execute("ALTER TABLE scan_state ADD COLUMN full_check INTEGER NOT NULL DEFAULT 0", [])?;
+        }
+        if schema_version < 11 {
+            let asset_columns = connection
+                .prepare("PRAGMA table_info(assets)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<HashSet<_>, _>>()?;
+            let add_retired_format = if asset_columns.contains("retired_format") {
+                ""
+            } else {
+                "ALTER TABLE assets ADD COLUMN retired_format INTEGER NOT NULL DEFAULT 0 CHECK(retired_format IN (0,1));"
+            };
+            let migration = format!(
+                "BEGIN;
+                 {add_retired_format}
+                 UPDATE assets SET retired_format=1
+                   WHERE asset_type='scene' AND lower(primary_source) LIKE '%.x';
+                 UPDATE jobs SET status='Failed',progress=0,
+                   error_json=json_object('message','格式已不再支持：X'),
+                   updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                   WHERE kind='thumbnail' AND status IN ('Pending','Parsing','Rendering','Encoding')
+                     AND asset_id IN (SELECT id FROM assets WHERE retired_format=1);
+                 DELETE FROM asset_counts;
+                 INSERT INTO asset_counts(root_id,asset_type,asset_count)
+                   SELECT root_id,asset_type,COUNT(*) FROM assets WHERE retired_format=0 GROUP BY root_id,asset_type;
+                 DELETE FROM asset_directory_counts;
+                 INSERT INTO asset_directory_counts(root_id,directory,asset_count)
+                   SELECT root_id,asset_directory,COUNT(*) FROM assets WHERE retired_format=0 GROUP BY root_id,asset_directory;
+                 DROP TRIGGER IF EXISTS assets_count_insert;
+                 DROP TRIGGER IF EXISTS assets_count_delete;
+                 DROP TRIGGER IF EXISTS assets_count_move;
+                 DROP TRIGGER IF EXISTS assets_directory_count_move;
+                 CREATE TRIGGER assets_count_insert AFTER INSERT ON assets WHEN NEW.retired_format=0 BEGIN
+                   INSERT INTO asset_counts(root_id,asset_type,asset_count) VALUES (NEW.root_id,NEW.asset_type,1)
+                     ON CONFLICT(root_id,asset_type) DO UPDATE SET asset_count=asset_count+1;
+                   INSERT INTO asset_directory_counts(root_id,directory,asset_count) VALUES (NEW.root_id,NEW.asset_directory,1)
+                     ON CONFLICT(root_id,directory) DO UPDATE SET asset_count=asset_count+1;
+                 END;
+                 CREATE TRIGGER assets_count_delete AFTER DELETE ON assets WHEN OLD.retired_format=0 BEGIN
+                   UPDATE asset_counts SET asset_count=asset_count-1
+                     WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type;
+                   UPDATE asset_directory_counts SET asset_count=asset_count-1
+                     WHERE root_id=OLD.root_id AND directory=OLD.asset_directory;
+                   DELETE FROM asset_counts WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type AND asset_count<=0;
+                   DELETE FROM asset_directory_counts WHERE root_id=OLD.root_id AND directory=OLD.asset_directory AND asset_count<=0;
+                 END;
+                 CREATE TRIGGER assets_count_move AFTER UPDATE OF root_id,asset_type,retired_format ON assets
+                 WHEN OLD.root_id!=NEW.root_id OR OLD.asset_type!=NEW.asset_type OR OLD.retired_format!=NEW.retired_format BEGIN
+                   UPDATE asset_counts SET asset_count=asset_count-1
+                     WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type AND OLD.retired_format=0;
+                   INSERT INTO asset_counts(root_id,asset_type,asset_count)
+                     VALUES (NEW.root_id,NEW.asset_type,CASE WHEN NEW.retired_format=0 THEN 1 ELSE 0 END)
+                     ON CONFLICT(root_id,asset_type) DO UPDATE SET asset_count=asset_count+excluded.asset_count;
+                   DELETE FROM asset_counts WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type AND asset_count<=0;
+                   DELETE FROM asset_counts WHERE root_id=NEW.root_id AND asset_type=NEW.asset_type AND asset_count<=0;
+                 END;
+                 CREATE TRIGGER assets_directory_count_move AFTER UPDATE OF root_id,asset_directory,retired_format ON assets
+                 WHEN OLD.root_id!=NEW.root_id OR OLD.asset_directory!=NEW.asset_directory OR OLD.retired_format!=NEW.retired_format BEGIN
+                   UPDATE asset_directory_counts SET asset_count=asset_count-1
+                     WHERE root_id=OLD.root_id AND directory=OLD.asset_directory AND OLD.retired_format=0;
+                   INSERT INTO asset_directory_counts(root_id,directory,asset_count)
+                     VALUES (NEW.root_id,NEW.asset_directory,CASE WHEN NEW.retired_format=0 THEN 1 ELSE 0 END)
+                     ON CONFLICT(root_id,directory) DO UPDATE SET asset_count=asset_count+excluded.asset_count;
+                   DELETE FROM asset_directory_counts WHERE root_id=OLD.root_id AND directory=OLD.asset_directory AND asset_count<=0;
+                   DELETE FROM asset_directory_counts WHERE root_id=NEW.root_id AND directory=NEW.asset_directory AND asset_count<=0;
+                 END;
+                 PRAGMA user_version = 11;
+                 COMMIT;"
+            );
+            connection.execute_batch(&migration)?;
+        }
+        if schema_version < 12 {
+            let asset_columns = connection
+                .prepare("PRAGMA table_info(assets)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<HashSet<_>, _>>()?;
+            let add_visibility = if asset_columns.contains("visibility") {
+                ""
+            } else {
+                "ALTER TABLE assets ADD COLUMN visibility TEXT NOT NULL DEFAULT 'normal' CHECK(visibility IN ('normal','auxiliary'));"
+            };
+            let migration = format!(
+                "BEGIN;
+                 {add_visibility}
+                 UPDATE assets SET visibility='auxiliary'
+                   WHERE asset_type='motion' AND lower(primary_source) LIKE '%.vmd'
+                     AND instr(statuses_json,'ParseFailed')=0
+                     AND EXISTS(
+                       SELECT 1 FROM metadata m
+                       WHERE m.asset_id=assets.id AND m.key='parsed'
+                         AND json_valid(m.value_json)
+                         AND json_extract(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.file_type')='vmd'
+                         AND json_type(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.bones')='integer'
+                         AND json_type(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.morphs')='integer'
+                         AND json_type(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.cameras')='integer'
+                         AND json_type(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.lights')='integer'
+                         AND json_type(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.selfShadows')='integer'
+                         AND json_type(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.properties')='integer'
+                         AND json_extract(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.cameras')>0
+                         AND json_extract(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.bones')=0
+                         AND json_extract(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.morphs')=0
+                         AND json_extract(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.lights')=0
+                         AND json_extract(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.selfShadows')=0
+                         AND json_extract(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.key_counts.properties')=0
+                         AND json_type(CASE WHEN json_valid(m.value_json) THEN m.value_json ELSE '{{}}' END,'$.error') IS NULL
+                     );
+                 UPDATE metadata SET value_json=json_set(
+                   value_json,'$.is_camera_only',
+                   json((SELECT CASE WHEN visibility='auxiliary' THEN 'true' ELSE 'false' END
+                         FROM assets WHERE assets.id=metadata.asset_id)))
+                   WHERE key='parsed' AND json_valid(value_json)
+                     AND json_extract(CASE WHEN json_valid(value_json) THEN value_json ELSE '{{}}' END,'$.file_type')='vmd'
+                     AND asset_id IN (SELECT id FROM assets WHERE asset_type='motion' AND lower(primary_source) LIKE '%.vmd');
+                 UPDATE jobs SET status='Cancelled',progress=0,
+                   error_json=json_object('message','纯 Camera 不再进入普通资源卡队列'),
+                   updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                   WHERE kind='thumbnail' AND status IN ('Pending','Parsing','Rendering','Encoding')
+                     AND asset_id IN (SELECT id FROM assets WHERE visibility='auxiliary');
+                 DELETE FROM asset_counts;
+                 INSERT INTO asset_counts(root_id,asset_type,asset_count)
+                   SELECT root_id,asset_type,COUNT(*) FROM assets
+                   WHERE retired_format=0 AND visibility='normal' GROUP BY root_id,asset_type;
+                 DELETE FROM asset_directory_counts;
+                 INSERT INTO asset_directory_counts(root_id,directory,asset_count)
+                   SELECT root_id,asset_directory,COUNT(*) FROM assets
+                   WHERE retired_format=0 AND visibility='normal' GROUP BY root_id,asset_directory;
+                 DROP TRIGGER IF EXISTS assets_count_insert;
+                 DROP TRIGGER IF EXISTS assets_count_delete;
+                 DROP TRIGGER IF EXISTS assets_count_move;
+                 DROP TRIGGER IF EXISTS assets_directory_count_move;
+                 CREATE TRIGGER assets_count_insert AFTER INSERT ON assets
+                   WHEN NEW.retired_format=0 AND NEW.visibility='normal' BEGIN
+                   INSERT INTO asset_counts(root_id,asset_type,asset_count) VALUES (NEW.root_id,NEW.asset_type,1)
+                     ON CONFLICT(root_id,asset_type) DO UPDATE SET asset_count=asset_count+1;
+                   INSERT INTO asset_directory_counts(root_id,directory,asset_count) VALUES (NEW.root_id,NEW.asset_directory,1)
+                     ON CONFLICT(root_id,directory) DO UPDATE SET asset_count=asset_count+1;
+                 END;
+                 CREATE TRIGGER assets_count_delete AFTER DELETE ON assets
+                   WHEN OLD.retired_format=0 AND OLD.visibility='normal' BEGIN
+                   UPDATE asset_counts SET asset_count=asset_count-1
+                     WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type;
+                   UPDATE asset_directory_counts SET asset_count=asset_count-1
+                     WHERE root_id=OLD.root_id AND directory=OLD.asset_directory;
+                   DELETE FROM asset_counts WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type AND asset_count<=0;
+                   DELETE FROM asset_directory_counts WHERE root_id=OLD.root_id AND directory=OLD.asset_directory AND asset_count<=0;
+                 END;
+                 CREATE TRIGGER assets_count_move AFTER UPDATE OF root_id,asset_type,retired_format,visibility ON assets
+                   WHEN OLD.root_id!=NEW.root_id OR OLD.asset_type!=NEW.asset_type
+                     OR OLD.retired_format!=NEW.retired_format OR OLD.visibility!=NEW.visibility BEGIN
+                   UPDATE asset_counts SET asset_count=asset_count-1
+                     WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type
+                       AND OLD.retired_format=0 AND OLD.visibility='normal';
+                   INSERT INTO asset_counts(root_id,asset_type,asset_count)
+                     VALUES (NEW.root_id,NEW.asset_type,
+                       CASE WHEN NEW.retired_format=0 AND NEW.visibility='normal' THEN 1 ELSE 0 END)
+                     ON CONFLICT(root_id,asset_type) DO UPDATE SET asset_count=asset_count+excluded.asset_count;
+                   DELETE FROM asset_counts WHERE root_id=OLD.root_id AND asset_type=OLD.asset_type AND asset_count<=0;
+                   DELETE FROM asset_counts WHERE root_id=NEW.root_id AND asset_type=NEW.asset_type AND asset_count<=0;
+                 END;
+                 CREATE TRIGGER assets_directory_count_move AFTER UPDATE OF root_id,asset_directory,retired_format,visibility ON assets
+                   WHEN OLD.root_id!=NEW.root_id OR OLD.asset_directory!=NEW.asset_directory
+                     OR OLD.retired_format!=NEW.retired_format OR OLD.visibility!=NEW.visibility BEGIN
+                   UPDATE asset_directory_counts SET asset_count=asset_count-1
+                     WHERE root_id=OLD.root_id AND directory=OLD.asset_directory
+                       AND OLD.retired_format=0 AND OLD.visibility='normal';
+                   INSERT INTO asset_directory_counts(root_id,directory,asset_count)
+                     VALUES (NEW.root_id,NEW.asset_directory,
+                       CASE WHEN NEW.retired_format=0 AND NEW.visibility='normal' THEN 1 ELSE 0 END)
+                     ON CONFLICT(root_id,directory) DO UPDATE SET asset_count=asset_count+excluded.asset_count;
+                   DELETE FROM asset_directory_counts WHERE root_id=OLD.root_id AND directory=OLD.asset_directory AND asset_count<=0;
+                   DELETE FROM asset_directory_counts WHERE root_id=NEW.root_id AND directory=NEW.asset_directory AND asset_count<=0;
+                 END;
+                 PRAGMA user_version = 12;
+                 COMMIT;"
+            );
+            connection.execute_batch(&migration)?;
+        }
+        if schema_version < 13 {
+            let card_columns = connection
+                .prepare("PRAGMA table_info(cards)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<HashSet<_>, _>>()?;
+            let mut migration = String::from("BEGIN;");
+            for (name, declaration) in [
+                ("file_size", "INTEGER"),
+                ("modified_ns", "INTEGER"),
+                ("manifest_revision", "TEXT"),
+                ("renderer_revision", "TEXT"),
+                ("has_thumbnail", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                if !card_columns.contains(name) {
+                    migration.push_str(&format!("ALTER TABLE cards ADD COLUMN {name} {declaration};"));
+                }
+            }
+            migration.push_str(
+                "UPDATE cards SET has_thumbnail=0,file_size=NULL,modified_ns=NULL,
+                   manifest_revision=NULL,renderer_revision=NULL;",
+            );
+            migration.push_str("PRAGMA user_version = 13; COMMIT;");
+            connection.execute_batch(&migration)?;
+        }
+        if schema_version < 14 {
+            let scan_columns = connection
+                .prepare("PRAGMA table_info(scan_state)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<HashSet<_>, _>>()?;
+            let file_columns = connection
+                .prepare("PRAGMA table_info(asset_files)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<HashSet<_>, _>>()?;
+            let add_generation = if scan_columns.contains("dirty_generation") {
+                ""
+            } else {
+                "ALTER TABLE scan_state ADD COLUMN dirty_generation INTEGER NOT NULL DEFAULT 0;"
+            };
+            let add_claim_owner = if scan_columns.contains("claim_owner") {
+                ""
+            } else {
+                "ALTER TABLE scan_state ADD COLUMN claim_owner INTEGER;"
+            };
+            let add_path_key = if file_columns.contains("path_key") {
+                ""
+            } else {
+                "ALTER TABLE asset_files ADD COLUMN path_key TEXT NOT NULL DEFAULT '';"
+            };
+            connection.execute_batch(&format!(
+                "BEGIN;
+                 {add_generation}
+                 {add_claim_owner}
+                 {add_path_key}
+                 CREATE TABLE IF NOT EXISTS scan_changes (
+                   root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+                   path_key TEXT NOT NULL, path TEXT NOT NULL,
+                   scope TEXT NOT NULL CHECK(scope IN ('file','subtree','root')),
+                   generation INTEGER NOT NULL, updated_at TEXT NOT NULL,
+                   PRIMARY KEY(root_id,path_key)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_scan_changes_generation
+                   ON scan_changes(root_id,generation);
+                 COMMIT;"
+            ))?;
+
+            let files = {
+                let mut statement = connection.prepare(
+                    "SELECT id,path FROM asset_files WHERE path_key=''",
+                )?;
+                statement
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            if !files.is_empty() {
+                let transaction = connection.unchecked_transaction()?;
+                for (id, path) in files {
+                    transaction.execute(
+                        "UPDATE asset_files SET path_key=?2 WHERE id=?1",
+                        params![id, scanner::scan_path_key(Path::new(&path))],
+                    )?;
+                }
+                transaction.commit()?;
+            }
+            connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_asset_files_path_key_asset
+                   ON asset_files(path_key,asset_id);
+                 BEGIN;
+                 UPDATE scan_state SET dirty_generation=dirty_generation+1
+                 WHERE status IN ('Pending','Paused','Failed','Pausing','Discovering','Indexing','Verifying','Relations');
+                 INSERT OR IGNORE INTO scan_changes(root_id,path_key,path,scope,generation,updated_at)
+                   SELECT root_id,'','root','root',MAX(1,dirty_generation),updated_at
+                   FROM scan_state
+                   WHERE status IN ('Pending','Paused','Failed','Pausing','Discovering','Indexing','Verifying','Relations');
+                 PRAGMA user_version = 14;
+                 COMMIT;",
+            )?;
+        }
+        if schema_version < 15 {
+            connection.execute_batch(
+                "BEGIN;
+                 UPDATE assets SET statuses_json = CASE
+                   WHEN json_valid(statuses_json) THEN
+                     COALESCE(NULLIF((SELECT json_group_array(value)
+                       FROM json_each(assets.statuses_json) WHERE value <> 'NeedsReview'), '[]'), '[\"Ready\"]')
+                   ELSE '[\"Ready\"]' END
+                 WHERE instr(statuses_json,'NeedsReview')>0;
+                 UPDATE metadata SET value_json=json_remove(value_json,
+                   '$.candidate_reason','$.card_identity_ambiguous')
+                 WHERE key='parsed' AND json_valid(value_json)
+                   AND (instr(value_json,'candidate_reason')>0
+                     OR instr(value_json,'card_identity_ambiguous')>0);
+                 PRAGMA user_version = 15;
+                 COMMIT;",
+            )?;
         }
         Ok(())
     }
@@ -308,6 +624,39 @@ impl Library {
         Ok(serde_json::json!({"all":model+motion+scene,"model":model,"motion":motion,"scene":scene,"byRoot":by_root}))
     }
 
+    pub(crate) fn ensure_asset_active(&self, asset_id: &str) -> CoreResult<()> {
+        let connection = self.connection()?;
+        let retired: Option<bool> = connection
+            .query_row(
+                "SELECT retired_format FROM assets WHERE id=?1",
+                [asset_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match retired {
+            None => Err(CoreError::AssetNotFound(asset_id.to_owned())),
+            Some(true) => Err(CoreError::UnsupportedAssetFormat("X".to_owned())),
+            Some(false) => Ok(()),
+        }
+    }
+
+    pub(crate) fn ensure_asset_visible(&self, asset_id: &str) -> CoreResult<()> {
+        let connection = self.connection()?;
+        let asset: Option<(bool, String)> = connection
+            .query_row(
+                "SELECT retired_format,visibility FROM assets WHERE id=?1",
+                [asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match asset {
+            None => Err(CoreError::AssetNotFound(asset_id.to_owned())),
+            Some((true, _)) => Err(CoreError::UnsupportedAssetFormat("X".to_owned())),
+            Some((false, visibility)) if visibility == "normal" => Ok(()),
+            Some((false, _)) => Err(CoreError::AssetNotFound(asset_id.to_owned())),
+        }
+    }
+
     pub fn asset_directories(&self, root_id: &str) -> CoreResult<Vec<serde_json::Value>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -318,6 +667,80 @@ impl Library {
             Ok(serde_json::json!({"path":row.get::<_,String>(0)?, "count":row.get::<_,i64>(1)?}))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn directory_page(
+        &self,
+        root_id: &str,
+        requested_path: Option<&str>,
+        recursive_scope: bool,
+    ) -> CoreResult<DirectoryPage> {
+        let root = self.list_roots()?.into_iter()
+            .find(|root| root.id == root_id)
+            .ok_or_else(|| CoreError::RootNotFound(root_id.to_owned()))?;
+        let root_path = PathBuf::from(&root.path);
+        let mut path = requested_path.map(PathBuf::from).unwrap_or_else(|| root_path.clone());
+        if !directory_path_within(&path, &root_path) {
+            path = root_path.clone();
+        }
+        path = normalize_directory_path(&path);
+        let mut adjusted = requested_path.is_some_and(|requested| !directory_path_equal(&path, Path::new(requested)));
+        while !path.is_dir() && !directory_path_equal(&path, &root_path) {
+            adjusted = true;
+            if !path.pop() { break; }
+        }
+        if !path.is_dir() {
+            path = root_path.clone();
+            adjusted = true;
+        }
+        if let (Ok(canonical_root), Ok(canonical_path)) = (std::fs::canonicalize(&root_path), std::fs::canonicalize(&path)) {
+            if directory_path_within(&canonical_path, &canonical_root) {
+                path = canonical_path;
+            } else {
+                path = root_path.clone();
+                adjusted = true;
+            }
+        }
+
+        let path_text = path.to_string_lossy().into_owned();
+        let path_prefix = path_text.trim_end_matches(['\\', '/']).to_owned();
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT directory,asset_count FROM asset_directory_counts
+             WHERE root_id=?1 AND (directory=?2 COLLATE NOCASE
+               OR substr(directory,1,length(?3)+1)=(?3 || char(92)) COLLATE NOCASE
+               OR substr(directory,1,length(?3)+1)=(?3 || '/') COLLATE NOCASE)
+             ORDER BY directory COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map(params![root_id, path_text, path_prefix], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut recursive_count = 0_i64;
+        let mut direct_count = 0_i64;
+        let mut children = HashMap::<String, i64>::new();
+        for row in rows {
+            let (directory, count) = row?;
+            if directory_path_equal(Path::new(&directory), &path) {
+                direct_count += count;
+                recursive_count += count;
+                continue;
+            }
+            let Some(suffix) = relative_directory_suffix(&path_text, &directory) else { continue; };
+            recursive_count += count;
+            let child_name = suffix.split(['\\', '/']).next().unwrap_or_default();
+            if child_name.is_empty() { continue; }
+            let child_path = path.join(child_name).to_string_lossy().into_owned();
+            *children.entry(child_path).or_default() += count;
+        }
+        let child_directories = children.into_iter()
+            .map(|(path, count)| AssetDirectory { path, count })
+            .collect::<Vec<_>>();
+        Ok(DirectoryPage {
+            path: path_text,
+            visible_count: if recursive_scope { recursive_count } else { direct_count },
+            child_directories,
+            adjusted,
+        })
     }
 
     pub fn add_root(
@@ -475,24 +898,30 @@ impl Library {
         };
         if removed {
             self.rebuild_relations()?;
-            self.rebuild_duplicates()?;
         }
         Ok(removed)
     }
 
     pub fn scan_root(&self, root_id: &str) -> CoreResult<ScanReport> {
-        self.scan_root_with_mode(root_id, false)
+        let _ = self.enqueue_scan(root_id)?;
+        let work = self.claim_pending_scan(root_id)?
+            .ok_or_else(|| CoreError::InvalidRoot("该目录已有扫描任务；请在扫描队列中管理".to_owned()))?;
+        self.scan_with_work(root_id, &work)
     }
 
-    pub(crate) fn scan_queued_root(&self, root_id: &str) -> CoreResult<ScanReport> {
-        let full_check = self.connection()?.query_row(
-            "SELECT full_check FROM scan_state WHERE root_id=?1", [root_id],
-            |row| row.get::<_, i64>(0),
-        ).optional()?.unwrap_or(0) != 0;
-        self.scan_root_with_mode(root_id, full_check)
+    pub(crate) fn scan_queued_root(
+        &self,
+        root_id: &str,
+        work: &crate::types::ScanWork,
+    ) -> CoreResult<ScanReport> {
+        self.scan_with_work(root_id, work)
     }
 
-    fn scan_root_with_mode(&self, root_id: &str, full_check: bool) -> CoreResult<ScanReport> {
+    fn scan_with_work(
+        &self,
+        root_id: &str,
+        work: &crate::types::ScanWork,
+    ) -> CoreResult<ScanReport> {
         let _scan_guard = self.scan_lock.lock().map_err(|_| CoreError::LockPoisoned)?;
         let root = {
             let connection = self
@@ -512,16 +941,8 @@ impl Library {
         if !root.enabled {
             return Err(CoreError::RootDisabled(root_id.to_owned()));
         }
-        match self.begin_scan(root_id) {
-            Ok(()) => {}
-            Err(error @ (CoreError::ScanCancelled | CoreError::ScanPaused)) => {
-                self.finish_scan(root_id, &Err(error))?;
-                return Err(self.scan_interruption(root_id)?);
-            }
-            Err(error) => return Err(error),
-        }
-        let result = scanner::scan(self, &root, full_check);
-        self.finish_scan(root_id, &result)?;
+        let result = scanner::scan(self, &root, work);
+        self.finish_scan(root_id, work, &result)?;
         result
     }
 
@@ -531,6 +952,14 @@ impl Library {
 
     pub fn enqueue_full_check(&self, root_id: &str) -> CoreResult<ScanState> {
         crate::scan_queue::enqueue(self, root_id, true)
+    }
+
+    pub fn enqueue_scan_changes(
+        &self,
+        root_id: &str,
+        changes: &[crate::types::ScanChange],
+    ) -> CoreResult<Option<ScanState>> {
+        crate::scan_queue::enqueue_changes(self, root_id, changes)
     }
 
     pub fn resume_scan_jobs(&self) -> CoreResult<()> {
@@ -543,7 +972,7 @@ impl Library {
         let changed = connection.execute(
             "UPDATE scan_state SET status=CASE WHEN status IN ('Pending','Paused') THEN 'Cancelled' ELSE 'Cancelling' END,
                error_json=NULL,updated_at=?2
-             WHERE root_id=?1 AND status IN ('Pending','Paused','Pausing','Discovering','Indexing','Verifying','Relations','Duplicates')",
+             WHERE root_id=?1 AND status IN ('Pending','Paused','Pausing','Discovering','Indexing','Verifying','Relations')",
             params![root_id, now],
         )?;
         if changed > 0 {
@@ -557,7 +986,7 @@ impl Library {
         let changed = connection.execute(
             "UPDATE scan_state SET status=CASE WHEN status='Pending' THEN 'Paused' ELSE 'Pausing' END,
                updated_at=?2 WHERE root_id=?1 AND status IN
-               ('Pending','Discovering','Indexing','Verifying','Relations','Duplicates')",
+               ('Pending','Discovering','Indexing','Verifying','Relations')",
             params![root_id, Utc::now().to_rfc3339()],
         )?;
         if changed > 0 {
@@ -577,9 +1006,11 @@ impl Library {
     pub fn list_scan_states(&self) -> CoreResult<Vec<ScanState>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT root_id,status,progress,files_seen,files_processed,error_json,updated_at,queue_order,full_check
-             FROM scan_state ORDER BY CASE WHEN status='Pending' THEN 0 ELSE 1 END,
-             CASE WHEN status='Pending' THEN queue_order END,updated_at DESC",
+            "SELECT s.root_id,s.status,s.progress,s.files_seen,s.files_processed,s.error_json,s.updated_at,s.queue_order,s.full_check,
+               CASE WHEN EXISTS(SELECT 1 FROM scan_changes c WHERE c.root_id=s.root_id AND c.scope='root') THEN 'full'
+                    WHEN EXISTS(SELECT 1 FROM scan_changes c WHERE c.root_id=s.root_id) THEN 'local' ELSE 'none' END
+             FROM scan_state s ORDER BY CASE WHEN s.status='Pending' THEN 0 ELSE 1 END,
+             CASE WHEN s.status='Pending' THEN s.queue_order END,s.updated_at DESC",
         )?;
         let rows = statement.query_map([], |row| {
             let error_json: Option<String> = row.get(5)?;
@@ -588,6 +1019,7 @@ impl Library {
                 status: row.get(1)?,
                 queue_order: row.get(7)?,
                 full_check: row.get::<_, i64>(8)? != 0,
+                scope: row.get(9)?,
                 progress: row.get(2)?,
                 files_seen: row.get::<_, i64>(3)?.max(0) as usize,
                 files_processed: row.get::<_, i64>(4)?.max(0) as usize,
@@ -601,30 +1033,36 @@ impl Library {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub(crate) fn begin_scan(&self, root_id: &str) -> CoreResult<()> {
-        let now = Utc::now().to_rfc3339();
-        let connection = self.connection()?;
-        let changed = connection.execute(
-            "INSERT INTO scan_state(root_id,status,progress,error_json,updated_at,files_seen,files_processed)
-             VALUES (?1,'Discovering',0,NULL,?2,0,0)
-             ON CONFLICT(root_id) DO UPDATE SET status='Discovering',progress=0,error_json=NULL,
-               updated_at=excluded.updated_at,files_seen=0,files_processed=0
-             WHERE scan_state.status NOT IN ('Cancelling','Paused','Pausing','Cancelled')",
-            params![root_id, now],
-        )?;
-        if changed == 0 { return Err(self.scan_interruption_locked(&connection, root_id)?); }
-        connection.execute("UPDATE roots SET scan_status='Scanning' WHERE id=?1", [root_id])?;
-        Ok(())
-    }
-
-    pub(crate) fn claim_pending_scan(&self, root_id: &str) -> CoreResult<bool> {
-        let connection = self.connection()?;
-        let changed = connection.execute(
-            "UPDATE scan_state SET status='Discovering',updated_at=?2
+    pub(crate) fn claim_pending_scan(
+        &self,
+        root_id: &str,
+    ) -> CoreResult<Option<crate::types::ScanWork>> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE scan_state SET status='Discovering',claim_owner=?3,updated_at=?2
              WHERE root_id=?1 AND status='Pending'",
-            params![root_id, Utc::now().to_rfc3339()],
+            params![root_id, Utc::now().to_rfc3339(), i64::from(std::process::id())],
         )?;
-        Ok(changed > 0)
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        transaction.execute("UPDATE roots SET scan_status='Scanning' WHERE id=?1", [root_id])?;
+        let (generation, full_check): (i64, bool) = transaction.query_row(
+            "SELECT dirty_generation,full_check!=0 FROM scan_state WHERE root_id=?1",
+            [root_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let changes = {
+            let mut statement = transaction.prepare(
+                "SELECT path,scope FROM scan_changes WHERE root_id=?1 AND generation<=?2 ORDER BY scope,path_key",
+            )?;
+            statement.query_map(params![root_id, generation], |row| {
+                Ok(crate::types::PendingScanChange { path: row.get(0)?, scope: row.get(1)? })
+            })?.collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
+        Ok(Some(crate::types::ScanWork { generation, full_check, changes }))
     }
 
     pub(crate) fn update_scan_progress(
@@ -641,11 +1079,6 @@ impl Library {
         Ok(())
     }
 
-    fn scan_interruption(&self, root_id: &str) -> CoreResult<CoreError> {
-        let connection = self.connection()?;
-        self.scan_interruption_locked(&connection, root_id)
-    }
-
     fn scan_interruption_locked(&self, connection: &Connection, root_id: &str) -> CoreResult<CoreError> {
         let status: Option<String> = connection.query_row(
             "SELECT status FROM scan_state WHERE root_id=?1", [root_id], |row| row.get(0),
@@ -657,33 +1090,60 @@ impl Library {
         })
     }
 
-    pub(crate) fn finish_scan(&self, root_id: &str, result: &CoreResult<ScanReport>) -> CoreResult<()> {
-        let connection = self.connection()?;
+    pub(crate) fn finish_scan(
+        &self,
+        root_id: &str,
+        work: &crate::types::ScanWork,
+        result: &CoreResult<ScanReport>,
+    ) -> CoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now().to_rfc3339();
         match result {
             Ok(report) => {
-                let changed = connection.execute("UPDATE scan_state SET status='Completed',progress=1,files_seen=?2,
-                    files_processed=?2,error_json=NULL,updated_at=?3
-                    WHERE root_id=?1 AND status NOT IN ('Cancelled','Cancelling','Paused','Pausing')",
-                    params![root_id, report.files_seen as i64, now])?;
-                if changed > 0 {
-                    connection.execute("UPDATE roots SET scan_status='Ready',last_scan_at=?2 WHERE id=?1",
-                        params![root_id, now])?;
-                } else {
-                    let paused = matches!(self.scan_interruption_locked(&connection, root_id)?, CoreError::ScanPaused);
+                let status: Option<String> = transaction.query_row(
+                    "SELECT status FROM scan_state WHERE root_id=?1", [root_id], |row| row.get(0),
+                ).optional()?;
+                if matches!(status.as_deref(), Some("Paused" | "Pausing" | "Cancelled" | "Cancelling")) {
+                    let paused = matches!(status.as_deref(), Some("Paused" | "Pausing"));
                     let status = if paused { "Paused" } else { "Cancelled" };
-                    connection.execute("UPDATE scan_state SET status=?2,updated_at=?3 WHERE root_id=?1",
+                    transaction.execute("UPDATE scan_state SET status=?2,claim_owner=NULL,updated_at=?3 WHERE root_id=?1",
                         params![root_id, status, now])?;
-                    connection.execute("UPDATE roots SET scan_status=?2 WHERE id=?1", params![root_id, status])?;
+                    transaction.execute("UPDATE roots SET scan_status=?2 WHERE id=?1", params![root_id, status])?;
+                } else {
+                    transaction.execute(
+                        "DELETE FROM scan_changes WHERE root_id=?1 AND generation<=?2",
+                        params![root_id, work.generation],
+                    )?;
+                    let has_pending: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM scan_changes WHERE root_id=?1)", [root_id], |row| row.get(0),
+                    )?;
+                    if has_pending {
+                        let queue_order: i64 = transaction.query_row(
+                            "SELECT COALESCE(MAX(queue_order),0)+1 FROM scan_state", [], |row| row.get(0),
+                        )?;
+                        transaction.execute(
+                            "UPDATE scan_state SET status='Pending',progress=0,files_seen=0,files_processed=0,
+                             full_check=0,error_json=NULL,claim_owner=NULL,queue_order=?2,updated_at=?3 WHERE root_id=?1",
+                            params![root_id, queue_order, now],
+                        )?;
+                        transaction.execute("UPDATE roots SET scan_status='Pending' WHERE id=?1", [root_id])?;
+                    } else {
+                        transaction.execute("UPDATE scan_state SET status='Completed',progress=1,files_seen=?2,
+                            files_processed=?2,full_check=0,error_json=NULL,claim_owner=NULL,updated_at=?3 WHERE root_id=?1",
+                            params![root_id, report.files_seen as i64, now])?;
+                        transaction.execute("UPDATE roots SET scan_status='Ready',last_scan_at=?2 WHERE id=?1",
+                            params![root_id, now])?;
+                    }
                 }
             }
             Err(CoreError::ScanCancelled) => {
-                connection.execute("UPDATE scan_state SET status='Cancelled',updated_at=?2 WHERE root_id=?1",
+                transaction.execute("UPDATE scan_state SET status='Cancelled',claim_owner=NULL,updated_at=?2 WHERE root_id=?1",
                     params![root_id, now])?;
-                connection.execute("UPDATE roots SET scan_status='Cancelled' WHERE id=?1", [root_id])?;
+                transaction.execute("UPDATE roots SET scan_status='Cancelled' WHERE id=?1", [root_id])?;
             }
             Err(CoreError::ScanPaused) => {
-                let status: Option<String> = connection.query_row(
+                let status: Option<String> = transaction.query_row(
                     "SELECT status FROM scan_state WHERE root_id=?1", [root_id], |row| row.get(0),
                 ).optional()?;
                 let final_status = match status.as_deref() {
@@ -692,18 +1152,19 @@ impl Library {
                     _ => None,
                 };
                 if let Some(final_status) = final_status {
-                    connection.execute("UPDATE scan_state SET status=?2,updated_at=?3 WHERE root_id=?1",
+                    transaction.execute("UPDATE scan_state SET status=?2,claim_owner=NULL,updated_at=?3 WHERE root_id=?1",
                         params![root_id, final_status, now])?;
-                    connection.execute("UPDATE roots SET scan_status=?2 WHERE id=?1",
+                    transaction.execute("UPDATE roots SET scan_status=?2 WHERE id=?1",
                         params![root_id, final_status])?;
                 }
             }
             Err(error) => {
-                connection.execute("UPDATE scan_state SET status='Failed',error_json=?2,updated_at=?3 WHERE root_id=?1",
+                transaction.execute("UPDATE scan_state SET status='Failed',error_json=?2,claim_owner=NULL,updated_at=?3 WHERE root_id=?1",
                     params![root_id, serde_json::json!({"message": error.to_string()}).to_string(), now])?;
-                connection.execute("UPDATE roots SET scan_status='Failed' WHERE id=?1", [root_id])?;
+                transaction.execute("UPDATE roots SET scan_status='Failed' WHERE id=?1", [root_id])?;
             }
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1055,6 +1516,7 @@ impl Library {
         limit: usize,
         motion_format: Option<&str>,
         directory_path: Option<&str>,
+        recursive_scope: bool,
     ) -> CoreResult<AssetPage> {
         scanner::list_asset_page(
             self,
@@ -1066,18 +1528,8 @@ impl Library {
             limit,
             motion_format,
             directory_path,
+            recursive_scope,
         )
-    }
-
-    pub fn list_duplicate_asset_page(
-        &self,
-        asset_type: Option<AssetType>,
-        query: Option<&str>,
-        root_id: Option<&str>,
-        cursor: Option<&AssetCursor>,
-        limit: usize,
-    ) -> CoreResult<AssetPage> {
-        scanner::list_duplicate_asset_page(self, asset_type, query, root_id, cursor, limit)
     }
 
     pub fn inspect_asset(&self, asset_id: &str) -> CoreResult<Asset> {
@@ -1120,6 +1572,7 @@ impl Library {
                 "该资产正在执行文件操作，暂时不能创建资源卡".to_owned(),
             ));
         }
+        self.ensure_asset_active(asset_id)?;
         let asset = self.inspect_asset(asset_id)?;
         let extension = Path::new(&asset.primary_source)
             .extension()
@@ -1222,16 +1675,29 @@ impl Library {
                 "请先在设置中指定 Motion Preview Model（PMX）".to_owned(),
             ));
         }
+        let renderer_revision = crate::cards::expected_renderer_revision(self, root.asset_type)?;
         let mut cursor = None;
         let mut job_ids = Vec::new();
         loop {
-            let page = self.list_asset_page(Some(root.asset_type), None, Some(root_id), false, cursor.as_ref(), 500, None, None)?;
+            let page = self.list_asset_page(Some(root.asset_type), None, Some(root_id), false, cursor.as_ref(), 500, None, None, true)?;
             for asset in page.items {
-                if asset.card_status == "CardValid" && asset.has_thumbnail { continue; }
                 if asset.statuses.iter().any(|status| matches!(status.as_str(),
                     "MissingSource" | "ParseFailed" | "Unsupported")) { continue; }
                 let extension = Path::new(&asset.primary_source).extension().and_then(|value| value.to_str());
                 if !extension.is_some_and(|value| asset.asset_type.supports_thumbnail_extension(value)) { continue; }
+                let validation = match crate::cards::verify_if_changed(
+                    self,
+                    &asset.id,
+                    &renderer_revision,
+                )? {
+                    Some(validation) => validation,
+                    None => crate::cards::verify_with_renderer_revision(
+                        self,
+                        &asset.id,
+                        &renderer_revision,
+                    )?,
+                };
+                if validation.status == "CardValid" && validation.has_thumbnail { continue; }
                 let job = self.enqueue_thumbnail(&asset.id, 0)?;
                 if let Some(id) = job.get("id").and_then(serde_json::Value::as_str) {
                     job_ids.push(id.to_owned());
@@ -1264,7 +1730,7 @@ impl Library {
             .is_some_and(|extension| asset.asset_type.supports_thumbnail_extension(extension));
         if !supported {
             return Err(CoreError::ThumbnailRender(
-                "当前渲染器支持 PMX 模型/场景、PMD 和文本 X 场景，以及配置了 Motion Preview Model 的 VMD/VPD 动作".to_owned(),
+                "当前渲染器支持 PMX 模型/场景、PMD 场景，以及配置了 Motion Preview Model 的 VMD/VPD 动作".to_owned(),
             ));
         }
         if asset.asset_type == AssetType::Motion {
@@ -1329,6 +1795,25 @@ impl Library {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    fn ensure_active_asset_in_transaction(
+        transaction: &Transaction<'_>,
+        asset_id: &str,
+    ) -> CoreResult<()> {
+        let asset: Option<(bool, String)> = transaction
+            .query_row(
+                "SELECT retired_format,visibility FROM assets WHERE id=?1",
+                [asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match asset {
+            None => Err(CoreError::AssetNotFound(asset_id.to_owned())),
+            Some((true, _)) => Err(CoreError::UnsupportedAssetFormat("X".to_owned())),
+            Some((false, visibility)) if visibility == "normal" => Ok(()),
+            Some((false, _)) => Err(CoreError::AssetNotFound(asset_id.to_owned())),
+        }
+    }
+
     pub fn add_asset_tag(
         &self,
         asset_id: &str,
@@ -1388,14 +1873,7 @@ impl Library {
         confidence: Option<f64>,
     ) -> CoreResult<TagMutation> {
         let normalized_name = name.to_lowercase();
-        let exists = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1)",
-            [asset_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !exists {
-            return Err(CoreError::AssetNotFound(asset_id.to_owned()));
-        }
+        Self::ensure_active_asset_in_transaction(transaction, asset_id)?;
         let blocked = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM asset_tag_overrides WHERE asset_id=?1 AND normalized_name=?2)",
             params![asset_id, normalized_name],
@@ -1515,14 +1993,7 @@ impl Library {
         name: &str,
     ) -> CoreResult<TagMutation> {
         let normalized_name = name.to_lowercase();
-        let exists = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1)",
-            [asset_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !exists {
-            return Err(CoreError::AssetNotFound(asset_id.to_owned()));
-        }
+        Self::ensure_active_asset_in_transaction(transaction, asset_id)?;
         let tag_id = transaction
             .query_row(
                 "SELECT id FROM tags WHERE name=?1 COLLATE NOCASE LIMIT 1",
@@ -1594,14 +2065,7 @@ impl Library {
         asset_id: &str,
         favorite: bool,
     ) -> CoreResult<bool> {
-        let exists = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1)",
-            [asset_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !exists {
-            return Err(CoreError::AssetNotFound(asset_id.to_owned()));
-        }
+        Self::ensure_active_asset_in_transaction(transaction, asset_id)?;
         let was_favorite = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM favorites WHERE asset_id=?1)",
             [asset_id],
@@ -1644,22 +2108,6 @@ impl Library {
 
     pub fn confirm_relation(&self, relation_id: &str) -> CoreResult<bool> {
         crate::relations::confirm(self, relation_id)
-    }
-
-    pub fn rebuild_duplicates(&self) -> CoreResult<crate::types::DuplicateRefreshReport> {
-        crate::duplicates::rebuild(self)
-    }
-
-    pub fn list_duplicates(
-        &self,
-        asset_id: Option<&str>,
-        limit: usize,
-    ) -> CoreResult<Vec<crate::types::AssetDuplicate>> {
-        crate::duplicates::list(self, asset_id, limit)
-    }
-
-    pub fn duplicate_count(&self) -> CoreResult<usize> {
-        crate::duplicates::count(self)
     }
 
     pub fn list_saved_filters(&self) -> CoreResult<Vec<SavedFilter>> {
@@ -1775,6 +2223,37 @@ mod storage_tests {
     use super::*;
 
     #[test]
+    fn removes_legacy_review_markers_without_losing_failure_status() {
+        let library = Library::in_memory().unwrap();
+        {
+            let connection = library.connection().unwrap();
+            connection.execute_batch(
+                "INSERT INTO roots(id,asset_type,path,path_key,display_name,created_at)
+                   VALUES ('root','model','C:/models','c:/models','Models','now');
+                 INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,statuses_json,created_at,updated_at,last_seen_at)
+                   VALUES ('a','root','model','A','C:/models/a.pmx','C:/models','[\"NeedsReview\"]','now','now','now'),
+                          ('b','root','model','B','C:/models/b.pmx','C:/models','[\"ParseFailed\",\"NeedsReview\"]','now','now','now');
+                 INSERT INTO metadata(asset_id,key,value_json)
+                   VALUES ('a','parsed','{\"candidate_reason\":\"old\",\"card_identity_ambiguous\":true,\"vertex_count\":42}');
+                 PRAGMA user_version=14;",
+            ).unwrap();
+        }
+        library.initialize_schema().unwrap();
+        let connection = library.connection().unwrap();
+        let statuses = connection.prepare("SELECT statuses_json FROM assets ORDER BY id").unwrap()
+            .query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(statuses, ["[\"Ready\"]", "[\"ParseFailed\"]"]);
+        let metadata: String = connection.query_row(
+            "SELECT value_json FROM metadata WHERE asset_id='a' AND key='parsed'", [], |row| row.get(0),
+        ).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["vertex_count"], 42);
+        assert!(metadata.get("candidate_reason").is_none());
+        assert!(metadata.get("card_identity_ambiguous").is_none());
+    }
+
+    #[test]
     fn portable_database_applies_file_limits() {
         let directory = std::env::temp_dir().join(format!("mmdbridge-storage-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
@@ -1836,6 +2315,41 @@ fn validate_tag(name: &str) -> CoreResult<String> {
         ));
     }
     Ok(name.to_owned())
+}
+
+fn directory_path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+fn directory_path_equal(left: &Path, right: &Path) -> bool {
+    directory_path_key(left) == directory_path_key(right)
+}
+
+fn directory_path_within(path: &Path, root: &Path) -> bool {
+    let path = directory_path_key(path);
+    let root = directory_path_key(root);
+    path == root || path.strip_prefix(&root).is_some_and(|suffix| suffix.starts_with('\\'))
+}
+
+fn normalize_directory_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => { normalized.pop(); }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn relative_directory_suffix<'a>(parent: &str, directory: &'a str) -> Option<&'a str> {
+    let normalized_parent = parent.replace('/', "\\").trim_end_matches('\\').to_owned();
+    let prefix = format!("{normalized_parent}\\");
+    let candidate = directory.replace('/', "\\");
+    let tail = candidate.get(..prefix.len())?;
+    if !tail.eq_ignore_ascii_case(&prefix) { return None; }
+    directory.get(prefix.len()..)
 }
 
 fn validate_tag_request(source: &str, confidence: Option<f64>) -> CoreResult<()> {

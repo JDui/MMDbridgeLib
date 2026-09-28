@@ -53,10 +53,6 @@ enum Command {
         #[command(subcommand)]
         command: RelationCommand,
     },
-    Duplicates {
-        #[command(subcommand)]
-        command: DuplicateCommand,
-    },
     Filters {
         #[command(subcommand)]
         command: FilterCommand,
@@ -137,6 +133,10 @@ enum CardCommand {
         #[arg(long)]
         preview: Option<PathBuf>,
     },
+    SyncManifest {
+        #[arg(long = "asset-id", required = true, num_args = 1..)]
+        asset_ids: Vec<String>,
+    },
     Verify {
         asset_id: String,
     },
@@ -151,6 +151,16 @@ enum TagCommand {
         asset_id: String,
         name: String,
         #[arg(long, default_value = "user")]
+        source: String,
+        #[arg(long)]
+        confidence: Option<f64>,
+    },
+    BatchAdd {
+        #[arg(long)]
+        name: String,
+        #[arg(long = "asset-id", required = true, num_args = 1..)]
+        asset_ids: Vec<String>,
+        #[arg(long, default_value = "agent")]
         source: String,
         #[arg(long)]
         confidence: Option<f64>,
@@ -191,17 +201,6 @@ enum RelationCommand {
     Confirm {
         relation_id: String,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum DuplicateCommand {
-    List {
-        #[arg(long)]
-        asset: Option<String>,
-        #[arg(long, default_value_t = 500)]
-        limit: usize,
-    },
-    Refresh,
 }
 
 #[derive(Debug, Subcommand)]
@@ -271,7 +270,15 @@ fn main() -> ExitCode {
                 "{}",
                 serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_owned())
             );
-            ExitCode::SUCCESS
+            if value
+                .get("partialFailure")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(error) => {
             let (asset_id, root_id, job_id) = match &error {
@@ -334,8 +341,7 @@ fn run() -> Result<serde_json::Value, CoreError> {
         Command::Roots {
             command: RootCommand::Remove { root_id },
         } => Ok(json!({"removed":library.remove_root(&root_id)?})),
-        Command::Scan { root, queued, full_check } => {
-            if !queued && !full_check { return Ok(json!(library.scan_root(&root)?)); }
+        Command::Scan { root, queued: _, full_check } => {
             let current = library.list_scan_states()?.into_iter()
                 .find(|state| state.root_id == root);
             match current.as_ref().map(|state| state.status.as_str()) {
@@ -343,7 +349,7 @@ fn run() -> Result<serde_json::Value, CoreError> {
                 Some("Paused") => {
                     return Err(CoreError::InvalidRoot("请先继续或停止已暂停的扫描，再开始完整检查".to_owned()));
                 }
-                Some("Pending" | "Pausing" | "Cancelling" | "Discovering" | "Indexing" | "Verifying" | "Relations" | "Duplicates") => {
+                Some("Pending" | "Pausing" | "Cancelling" | "Discovering" | "Indexing" | "Verifying" | "Relations") => {
                     return Err(CoreError::InvalidRoot("该目录已有扫描任务；请在桌面扫描队列中管理".to_owned()));
                 }
                 _ => {
@@ -355,7 +361,13 @@ fn run() -> Result<serde_json::Value, CoreError> {
                 let state = library.list_scan_states()?.into_iter()
                     .find(|state| state.root_id == root)
                     .ok_or_else(|| CoreError::RootNotFound(root.clone()))?;
-                eprintln!("扫描 {}：{} · {}/{} 文件 · {:.1}%", root, state.status,
+                let scope = match state.scope.as_str() {
+                    "full" => " · 完整发现",
+                    "local" => " · 局部更新",
+                    _ => "",
+                };
+                let full_check = if state.full_check { " · 深度检查" } else { "" };
+                eprintln!("扫描 {}：{}{}{} · {}/{} 文件 · {:.1}%", root, state.status, scope, full_check,
                     state.files_processed, state.files_seen, state.progress * 100.0);
                 match state.status.as_str() {
                     "Completed" => break Ok(json!(state)),
@@ -442,6 +454,27 @@ fn run() -> Result<serde_json::Value, CoreError> {
             Ok(json!(result))
         }
         Command::Cards {
+            command: CardCommand::SyncManifest { asset_ids },
+        } => {
+            let mut completed = Vec::new();
+            let mut failed = Vec::new();
+            for asset_id in asset_ids {
+                let result = library.card_thumbnail(&asset_id).and_then(|preview| {
+                    if preview.is_none() {
+                        return Err(CoreError::Card(format!(
+                            "资源卡没有当前可用的缩略图，无法仅同步 manifest：{asset_id}"
+                        )));
+                    }
+                    library.create_card(&asset_id, None)
+                });
+                match result {
+                    Ok(card) => completed.push(json!({"assetId":asset_id,"card":card})),
+                    Err(error) => failed.push(json!({"assetId":asset_id,"error":error.to_string()})),
+                }
+            }
+            Ok(json!({"total":completed.len() + failed.len(),"partialFailure":!failed.is_empty(),"completed":completed,"failed":failed}))
+        }
+        Command::Cards {
             command: CardCommand::Verify { asset_id },
         } => Ok(json!(library.verify_card(&asset_id)?)),
         Command::Tags {
@@ -458,6 +491,20 @@ fn run() -> Result<serde_json::Value, CoreError> {
         } => Ok(json!(
             library.add_asset_tag(&asset_id, &name, &source, confidence)?
         )),
+        Command::Tags {
+            command:
+                TagCommand::BatchAdd {
+                    name,
+                    asset_ids,
+                    source,
+                    confidence,
+                },
+        } => Ok(json!(library.add_asset_tag_batch(
+            &asset_ids,
+            &name,
+            &source,
+            confidence
+        )?)),
         Command::Tags {
             command: TagCommand::Remove { asset_id, name },
         } => Ok(json!(library.remove_asset_tag(&asset_id, &name)?)),
@@ -490,12 +537,6 @@ fn run() -> Result<serde_json::Value, CoreError> {
         } => Ok(
             json!({"relation_id":relation_id,"confirmed":library.confirm_relation(&relation_id)?}),
         ),
-        Command::Duplicates {
-            command: DuplicateCommand::List { asset, limit },
-        } => Ok(json!(library.list_duplicates(asset.as_deref(), limit)?)),
-        Command::Duplicates {
-            command: DuplicateCommand::Refresh,
-        } => Ok(json!(library.rebuild_duplicates()?)),
         Command::Filters {
             command: FilterCommand::List,
         } => Ok(json!(library.list_saved_filters()?)),
@@ -615,6 +656,7 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::JobNotFound(_) => "JobNotFound",
         CoreError::AssetNotFound(_) => "AssetNotFound",
         CoreError::InvalidAssetType(_) => "InvalidAssetType",
+        CoreError::UnsupportedAssetFormat(_) => "UnsupportedAssetFormat",
         CoreError::Card(_) => "CardError",
         CoreError::InvalidTag(_) => "InvalidTag",
         CoreError::InvalidFilter(_) => "InvalidFilter",

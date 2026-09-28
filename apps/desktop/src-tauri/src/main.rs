@@ -3,9 +3,9 @@
 mod file_watcher;
 
 use mmdbridge_core::{
-    Asset, AssetCursor, AssetDuplicate, AssetOperationJournalEntry, AssetOperationPlan, AssetPage,
-    AssetRelation, AssetTag, AssetType, CoreError, DuplicateRefreshReport, FilterExpr, Library,
-    RelationRefreshReport, Root, SavedFilter, ScanState, TagMutation,
+    Asset, AssetCursor, AssetOperationJournalEntry, AssetOperationPlan, AssetPage,
+    AssetRelation, AssetTag, AssetType, CoreError, FilterExpr, Library, RelationRefreshReport,
+    Root, SavedFilter, ScanState, TagMutation,
     ThumbnailConcurrencySettings,
 };
 use serde::Serialize;
@@ -63,6 +63,7 @@ impl From<CoreError> for ApiError {
             CoreError::JobNotFound(_) => "JobNotFound",
             CoreError::AssetNotFound(_) => "AssetNotFound",
             CoreError::InvalidAssetType(_) => "InvalidAssetType",
+            CoreError::UnsupportedAssetFormat(_) => "UnsupportedAssetFormat",
             CoreError::Card(_) => "CardError",
             CoreError::InvalidTag(_) => "InvalidTag",
             CoreError::InvalidFilter(_) => "InvalidFilter",
@@ -94,6 +95,18 @@ async fn asset_counts(state: State<'_, CoreState>) -> Result<serde_json::Value, 
 #[tauri::command]
 async fn asset_directories(state: State<'_, CoreState>, root_id: String) -> Result<Vec<serde_json::Value>, ApiError> {
     read_core(state.0.clone(), move |library| library.asset_directories(&root_id)).await
+}
+
+#[tauri::command]
+async fn asset_directory_page(
+    state: State<'_, CoreState>,
+    root_id: String,
+    path: Option<String>,
+    recursive_scope: Option<bool>,
+) -> Result<mmdbridge_core::DirectoryPage, ApiError> {
+    read_core(state.0.clone(), move |library| {
+        library.directory_page(&root_id, path.as_deref(), recursive_scope.unwrap_or(true))
+    }).await
 }
 
 #[tauri::command]
@@ -323,6 +336,7 @@ async fn assets_page(
     asset_type: Option<String>,
     motion_format: Option<String>,
     directory_path: Option<String>,
+    recursive_scope: Option<bool>,
     query: Option<String>,
     root_id: Option<String>,
     favorites_only: Option<bool>,
@@ -346,34 +360,14 @@ async fn assets_page(
         if let Some(filter_id) = filter_id {
             library.apply_saved_filter_page(&filter_id, query.as_deref(), root_id.as_deref(), cursor.as_ref(), page_size)
         } else {
-            library.list_asset_page(kind, query.as_deref(), root_id.as_deref(), favorites_only.unwrap_or(false), cursor.as_ref(), page_size, motion_format.as_deref(), directory_path.as_deref())
+            library.list_asset_page(kind, query.as_deref(), root_id.as_deref(), favorites_only.unwrap_or(false), cursor.as_ref(), page_size, motion_format.as_deref(), directory_path.as_deref(), recursive_scope.unwrap_or(true))
         }
     }).await
 }
 
 #[tauri::command]
-async fn duplicate_assets_page(
-    state: State<'_, CoreState>,
-    asset_type: Option<String>,
-    query: Option<String>,
-    root_id: Option<String>,
-    cursor: Option<AssetCursor>,
-    limit: Option<usize>,
-) -> Result<AssetPage, ApiError> {
-    let kind = match asset_type {
-        Some(value) => {
-            Some(AssetType::parse(&value).ok_or_else(|| CoreError::InvalidAssetType(value))?)
-        }
-        None => None,
-    };
-    read_core(state.0.clone(), move |library| {
-        library.list_duplicate_asset_page(kind, query.as_deref(), root_id.as_deref(), cursor.as_ref(), limit.unwrap_or(500))
-    }).await
-}
-
-#[tauri::command]
-fn asset_inspect(state: State<'_, CoreState>, asset_id: String) -> Result<Asset, ApiError> {
-    state.0.inspect_asset(&asset_id).map_err(Into::into)
+async fn asset_inspect(state: State<'_, CoreState>, asset_id: String) -> Result<Asset, ApiError> {
+    read_core(state.0.clone(), move |library| library.inspect_asset(&asset_id)).await
 }
 
 #[tauri::command]
@@ -483,11 +477,9 @@ fn thumbnail_batch(
 }
 
 #[tauri::command]
-fn card_thumbnail(state: State<'_, CoreState>, asset_id: String) -> Result<Response, ApiError> {
-    state
-        .0
-        .card_thumbnail(&asset_id)
-        .map_err(ApiError::from)?
+async fn card_thumbnail(state: State<'_, CoreState>, asset_id: String) -> Result<Response, ApiError> {
+    read_core(state.0.clone(), move |library| library.card_thumbnail(&asset_id))
+        .await?
         .map(Response::new)
         .ok_or_else(|| CoreError::Card("资源卡中没有有效缩略图".to_owned()).into())
 }
@@ -623,25 +615,6 @@ fn relation_confirm(state: State<'_, CoreState>, relation_id: String) -> Result<
 }
 
 #[tauri::command]
-async fn duplicates_list(
-    state: State<'_, CoreState>,
-    asset_id: Option<String>,
-    limit: Option<usize>,
-) -> Result<Vec<AssetDuplicate>, ApiError> {
-    read_core(state.0.clone(), move |library| library.list_duplicates(asset_id.as_deref(), limit.unwrap_or(500))).await
-}
-
-#[tauri::command]
-fn duplicates_refresh(state: State<'_, CoreState>) -> Result<DuplicateRefreshReport, ApiError> {
-    state.0.rebuild_duplicates().map_err(Into::into)
-}
-
-#[tauri::command]
-async fn duplicates_count(state: State<'_, CoreState>) -> Result<usize, ApiError> {
-    read_core(state.0.clone(), |library| library.duplicate_count()).await
-}
-
-#[tauri::command]
 async fn filters_list(state: State<'_, CoreState>) -> Result<Vec<SavedFilter>, ApiError> {
     read_core(state.0.clone(), |library| library.list_saved_filters()).await
 }
@@ -758,8 +731,8 @@ fn main() {
             assets_list,
             asset_counts,
             asset_directories,
+            asset_directory_page,
             assets_page,
-            duplicate_assets_page,
             asset_reveal,
             asset_open_directory,
             asset_inspect,
@@ -781,9 +754,6 @@ fn main() {
             relations_list,
             relations_refresh,
             relation_confirm,
-            duplicates_list,
-            duplicates_refresh,
-            duplicates_count,
             filters_list,
             filter_save,
             filter_remove,

@@ -2306,8 +2306,6 @@ dependencies = [
  "blake3",
  "bytemuck",
  "chrono",
- "encoding_rs",
- "flate2",
  "glam",
  "image",
  "mmd-anim-format",

@@ -35,14 +35,17 @@ fn read_limited(path: &Path) -> CoreResult<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
 
-fn paired_camera_path(library: &Library, asset_id: &str, directory: &str) -> CoreResult<Option<PathBuf>> {
+fn paired_camera_path(library: &Library, asset_id: &str) -> CoreResult<Option<PathBuf>> {
     let connection = library.connection()?;
     let mut statement = connection.prepare(
         "SELECT camera.primary_source FROM relations r JOIN assets camera ON camera.id=r.target_asset
+         LEFT JOIN metadata camera_metadata ON camera_metadata.asset_id=camera.id AND camera_metadata.key='parsed'
          WHERE r.relation_type='MotionCameraPair' AND r.source_asset=?1
-           AND camera.asset_directory=?2 ORDER BY r.confidence DESC LIMIT 1"
+           AND camera.retired_format=0 AND instr(camera.statuses_json,'MissingSource')=0
+           AND json_extract(CASE WHEN json_valid(camera_metadata.value_json) THEN camera_metadata.value_json ELSE '{}' END,'$.has_camera')=1
+         ORDER BY r.confirmed DESC,r.confidence DESC LIMIT 1"
     )?;
-    let result = statement.query_row([asset_id, directory], |row| row.get::<_, String>(0))
+    let result = statement.query_row([asset_id], |row| row.get::<_, String>(0))
         .optional()?;
     Ok(result.map(PathBuf::from))
 }
@@ -87,7 +90,7 @@ pub(crate) fn frame(library: &Library, asset_id: &str, requested_frame: u32) -> 
         CoreError::ModelPreview("请先设置动作预览模型 PMX".to_owned()))?;
     let motion_path = PathBuf::from(&asset.primary_source);
     let model_path = PathBuf::from(model_path);
-    let paired_path = paired_camera_path(library, asset_id, &asset.asset_directory)?;
+    let paired_path = paired_camera_path(library, asset_id)?;
     let session_lock = SESSION.get_or_init(|| Mutex::new(None));
     let mut guard = session_lock.lock().map_err(|_| CoreError::LockPoisoned)?;
     let reload = match guard.as_ref() {

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     thread,
@@ -41,8 +41,23 @@ pub struct AssetOperationPlan {
     pub package_snapshots: Vec<AssetOperationSourceSnapshot>,
     #[serde(default)]
     pub dependency_snapshots: Vec<AssetOperationDependencySnapshot>,
+    #[serde(default)]
+    pub delete_mode: Option<String>,
+    #[serde(default)]
+    pub delete_reason: Option<String>,
+    #[serde(default)]
+    pub pmx_directories: Vec<AssetOperationPmxDirectory>,
+    #[serde(default)]
+    pub preserved_paths: Vec<String>,
     pub warnings: Vec<String>,
     pub can_execute: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetOperationPmxDirectory {
+    pub path: String,
+    pub pmx_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -84,6 +99,7 @@ enum OperationKind {
     Move,
     Rename,
     Recycle,
+    DeleteModel,
 }
 
 impl OperationKind {
@@ -92,6 +108,7 @@ impl OperationKind {
             "move" => Ok(Self::Move),
             "rename" => Ok(Self::Rename),
             "recycle" => Ok(Self::Recycle),
+            "delete_model" => Ok(Self::DeleteModel),
             _ => Err(CoreError::AssetOperation(format!(
                 "unsupported operation: {value}"
             ))),
@@ -103,6 +120,7 @@ impl OperationKind {
             Self::Move => "move",
             Self::Rename => "rename",
             Self::Recycle => "recycle",
+            Self::DeleteModel => "delete_model",
         }
     }
 }
@@ -116,6 +134,7 @@ struct StoredAsset {
     root_id: String,
     root_path: String,
     asset_type: String,
+    retired_format: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +142,13 @@ struct Package {
     source: PathBuf,
     target: Option<PathBuf>,
     assets: Vec<StoredAsset>,
+}
+
+#[derive(Default)]
+struct ModelDeleteGroup {
+    parent: Option<PathBuf>,
+    selected_paths: BTreeMap<String, PathBuf>,
+    pmx_paths: Vec<PathBuf>,
 }
 
 struct PreparedPlan {
@@ -144,6 +170,13 @@ struct IndexedDependency {
 enum FileAction {
     Move { source: PathBuf, target: PathBuf },
     Recycle { source: PathBuf },
+}
+
+struct FileActionFailure {
+    message: String,
+    completed: Vec<FileAction>,
+    uncertain_paths: Vec<String>,
+    not_started_paths: Vec<String>,
 }
 
 pub(crate) fn plan(
@@ -180,6 +213,9 @@ fn prepare(
         return Err(CoreError::AssetOperation(
             "rename accepts one asset package at a time".to_owned(),
         ));
+    }
+    if kind == OperationKind::DeleteModel {
+        return prepare_model_delete(library, requested_ids);
     }
     let requested_name = if kind == OperationKind::Rename {
         Some(validate_name(new_name.unwrap_or_default())?)
@@ -272,6 +308,12 @@ fn prepare(
         let package_assets = load_assets_under_package(library, &source)?;
         if package_assets.is_empty() {
             warnings.push(format!("找不到资产包中的索引记录：{}", source.display()));
+        }
+        if package_assets.iter().any(|asset| asset.retired_format) {
+            warnings.push(format!(
+                "资产包包含已停用的 X 格式记录，当前操作已禁用：{}",
+                source.display()
+            ));
         }
         if kind != OperationKind::Recycle
             && package_assets
@@ -536,6 +578,7 @@ fn prepare(
             }
         }
         OperationKind::Recycle => {}
+        OperationKind::DeleteModel => unreachable!("model delete plans are prepared separately"),
     }
     let mut targets_seen = HashSet::<String>::new();
     for target in &destination_paths {
@@ -575,6 +618,10 @@ fn prepare(
         source_snapshots,
         package_snapshots,
         dependency_snapshots,
+        delete_mode: None,
+        delete_reason: None,
+        pmx_directories: Vec::new(),
+        preserved_paths: Vec::new(),
         warnings: warnings.clone(),
         can_execute: warnings.is_empty(),
     };
@@ -584,6 +631,479 @@ fn prepare(
         packages,
         affected_assets,
     })
+}
+
+fn prepare_model_delete(library: &Library, requested_ids: Vec<String>) -> CoreResult<PreparedPlan> {
+    let selected_assets = requested_ids
+        .iter()
+        .map(|asset_id| load_asset(library, asset_id))
+        .collect::<CoreResult<Vec<_>>>()?;
+    let mut groups = BTreeMap::<String, ModelDeleteGroup>::new();
+    for asset in selected_assets {
+        if asset.asset_type != "model"
+            || Path::new(&asset.primary_source)
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_none_or(|extension| !extension.eq_ignore_ascii_case("pmx"))
+        {
+            return Err(CoreError::AssetOperation(format!(
+                "模型删除只支持 PMX 主文件：{}",
+                asset.primary_source
+            )));
+        }
+        let root = canonical_directory(&asset.root_path)?;
+        if let Some(reparse_path) = path_reparse_component(Path::new(&asset.primary_source), &root)? {
+            return Err(CoreError::AssetOperation(format!(
+                "PMX 路径含符号链接或重解析点，无法安全回收：{}",
+                reparse_path.display()
+            )));
+        }
+        let source = canonical_file(&asset.primary_source)?;
+        if !path_is_within(&root, &source) {
+            return Err(CoreError::AssetOperation(format!(
+                "PMX 主文件不在登记的资产根目录内：{}",
+                source.display()
+            )));
+        }
+        let parent = source.parent().ok_or_else(|| {
+            CoreError::AssetOperation(format!("无法读取 PMX 父目录：{}", source.display()))
+        })?.to_path_buf();
+        let group = groups.entry(path_key(&parent)).or_default();
+        group.parent = Some(parent);
+        group.selected_paths.insert(path_key(&source), source);
+    }
+
+    let all_roots = load_roots(library)?;
+    let mut eligibility_reasons = Vec::<String>::new();
+    let mut folder_eligible = true;
+    for group in groups.values_mut() {
+        let parent = group.parent.as_ref().expect("group has a parent");
+        group.pmx_paths = enumerate_direct_pmx(parent)?;
+        group.pmx_paths.sort_by_key(|path| path_key(path));
+        group.pmx_paths.dedup_by(|left, right| same_path(left, right));
+
+        let selected_paths = group.selected_paths.values().cloned().collect::<Vec<_>>();
+        let selected_keys = selected_paths.iter().map(|path| path_key(path)).collect::<HashSet<_>>();
+        let direct_keys = group.pmx_paths.iter().map(|path| path_key(path)).collect::<HashSet<_>>();
+        let mut reasons = Vec::<String>::new();
+        if selected_keys.iter().any(|path| !direct_keys.contains(path)) {
+            reasons.push("所选 PMX 未能在当前目录完整枚举".to_owned());
+        }
+        if group.pmx_paths.len() != 1 {
+            reasons.push(format!("当前目录直接包含 {} 个 PMX", group.pmx_paths.len()));
+        }
+        if selected_paths.len() != 1 {
+            reasons.push("本批次选择了同目录中的多个 PMX".to_owned());
+        }
+        if all_roots.iter().any(|(_, root_path)| {
+            fs::canonicalize(root_path).is_ok_and(|root| same_path(&root, parent))
+        }) {
+            reasons.push("PMX 位于已登记 Root 或容器目录中".to_owned());
+        }
+        if all_roots.iter().any(|(_, root_path)| {
+            fs::canonicalize(root_path).is_ok_and(|root| path_is_within(parent, &root) && !same_path(parent, &root))
+        }) {
+            reasons.push("目录内包含另一个已登记 Root".to_owned());
+        }
+        let selected_keys = selected_paths.iter().map(|path| path_key(path)).collect::<HashSet<_>>();
+        match find_other_supported_asset(parent, &selected_keys) {
+            Ok(Some(path)) => reasons.push(format!("目录中还有其他 MMD 主文件：{}", path.display())),
+            Ok(None) => {}
+            Err(error) => reasons.push(format!("无法完整检查目录内容：{error}")),
+        }
+        match package_symlinks(parent) {
+            Ok(paths) if !paths.is_empty() => reasons.push(format!(
+                "目录含符号链接或重解析点：{}",
+                paths[0].display()
+            )),
+            Ok(_) => {}
+            Err(error) => reasons.push(format!("无法完整检查目录：{error}")),
+        }
+
+        if reasons.is_empty() {
+            let mut package_assets = load_assets_under_package(library, parent)?;
+            for asset in load_assets_with_primary_under_package(library, parent)? {
+                if package_assets.iter().all(|existing| existing.id != asset.id) {
+                    package_assets.push(asset);
+                }
+            }
+            let selected_keys = selected_paths.iter().map(|path| path_key(path)).collect::<HashSet<_>>();
+            if package_assets.iter().any(|asset| {
+                asset.retired_format
+                    || asset.asset_type != "model"
+                    || Path::new(&asset.primary_source)
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_none_or(|extension| !extension.eq_ignore_ascii_case("pmx"))
+                    || fs::canonicalize(&asset.primary_source)
+                        .ok()
+                        .is_none_or(|path| !selected_keys.contains(&path_key(&path)))
+            }) {
+                reasons.push("目录内还有其他已索引资产或退役记录".to_owned());
+            }
+            if package_assets.is_empty() {
+                reasons.push("无法确认目录中的资产索引归属".to_owned());
+            }
+            match package_entry_snapshots(parent) {
+                Ok(_) => {}
+                Err(error) => reasons.push(format!("无法完整记录目录内容：{error}")),
+            }
+        }
+
+        if !reasons.is_empty() {
+            folder_eligible = false;
+            for reason in reasons {
+                eligibility_reasons.push(format!("{}：{reason}", parent.display()));
+            }
+        }
+    }
+    if !folder_eligible && groups.len() > 1 {
+        eligibility_reasons.push("本批次统一按 PMX-only 范围执行，避免不同目录采用不同删除模式".to_owned());
+    }
+    eligibility_reasons.sort();
+    eligibility_reasons.dedup();
+
+    let delete_mode = if folder_eligible { "folder" } else { "pmxOnly" };
+    let mut warnings = Vec::<String>::new();
+    let mut packages = Vec::<Package>::new();
+    let mut affected_assets = Vec::<StoredAsset>::new();
+    let mut source_snapshots = Vec::<AssetOperationSourceSnapshot>::new();
+    let mut package_snapshots = Vec::<AssetOperationSourceSnapshot>::new();
+    let mut dependency_snapshots = Vec::<AssetOperationDependencySnapshot>::new();
+    let mut dependency_paths = HashSet::<String>::new();
+    let mut preserved_paths = HashSet::<String>::new();
+    let mut pmx_directories = Vec::<AssetOperationPmxDirectory>::new();
+
+    for group in groups.values() {
+        let parent = group.parent.as_ref().expect("group has a parent");
+        let pmx_paths = group.pmx_paths.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        pmx_directories.push(AssetOperationPmxDirectory {
+            path: parent.to_string_lossy().into_owned(),
+            pmx_paths,
+        });
+        if delete_mode == "folder" {
+            let package_assets = load_assets_under_package(library, parent)?;
+            let mut complete_assets = package_assets;
+            for asset in load_assets_with_primary_under_package(library, parent)? {
+                if complete_assets.iter().all(|existing| existing.id != asset.id) {
+                    complete_assets.push(asset);
+                }
+            }
+            if complete_assets.is_empty() {
+                warnings.push(format!("无法确认模型文件夹的索引资产：{}", parent.display()));
+            }
+            match package_entry_snapshots(parent) {
+                Ok(snapshots) => package_snapshots.extend(snapshots),
+                Err(error) => warnings.push(format!("无法完整记录模型文件夹内容：{error}")),
+            }
+            packages.push(Package {
+                source: parent.clone(),
+                target: None,
+                assets: complete_assets,
+            });
+        } else {
+            for path in group.selected_paths.values() {
+                let assets = load_assets_for_primary(library, path)?;
+                if assets.is_empty() {
+                    warnings.push(format!("找不到所选 PMX 的索引记录：{}", path.display()));
+                }
+                for sibling in &group.pmx_paths {
+                    if !same_path(sibling, path) {
+                        preserved_paths.insert(sibling.to_string_lossy().into_owned());
+                    }
+                }
+                packages.push(Package {
+                    source: path.clone(),
+                    target: None,
+                    assets,
+                });
+            }
+            preserved_paths.insert(parent.to_string_lossy().into_owned());
+            for asset in load_assets_under_package(library, parent)? {
+                if group.selected_paths.values().all(|path| {
+                    fs::canonicalize(&asset.primary_source)
+                        .ok()
+                        .is_none_or(|asset_path| !same_path(&asset_path, path))
+                }) {
+                    preserved_paths.insert(asset.primary_source);
+                }
+            }
+        }
+    }
+
+    for package in &packages {
+        for asset in &package.assets {
+            if !affected_assets.iter().any(|existing| existing.id == asset.id) {
+                affected_assets.push(asset.clone());
+            }
+            match source_file_snapshot(&asset.primary_source) {
+                Ok(snapshot) => match load_indexed_primary_version(library, &asset.id)? {
+                    Some((path, file_size, modified_ns))
+                        if same_path(Path::new(&path), Path::new(&snapshot.path))
+                            && snapshot.file_size.parse::<i64>().ok() == Some(file_size)
+                            && snapshot.modified_ns.parse::<i64>().ok() == Some(modified_ns) =>
+                    {
+                        source_snapshots.push(snapshot);
+                    }
+                    Some(_) => warnings.push(format!(
+                        "主文件自上次扫描后已变化，请重新扫描后再操作：{}",
+                        asset.primary_source
+                    )),
+                    None => warnings.push(format!(
+                        "索引中缺少主文件版本记录，请重新扫描后再操作：{}",
+                        asset.primary_source
+                    )),
+                },
+                Err(_) => warnings.push(format!(
+                    "主文件不存在或不可读取，请重新扫描：{}",
+                    asset.primary_source
+                )),
+            }
+
+            if let Some(dependencies) = load_parsed_dependencies(library, &asset.id)? {
+                if delete_mode == "folder" && may_have_file_dependencies(&asset.primary_source, &asset.asset_type) && dependencies.is_empty() {
+                    warnings.push(format!("无法确认资产文件依赖，请重新扫描后再操作：{}", asset.primary_source));
+                }
+                for dependency in dependencies {
+                    let role = dependency.role.as_deref().unwrap_or("unknown");
+                    let status = dependency.status.as_deref().unwrap_or("unknown");
+                    let path = dependency.path.as_deref();
+                    dependency_snapshots.push(dependency_file_snapshot(
+                        &asset.id,
+                        dependency.reference.as_deref(),
+                        role,
+                        path,
+                        status,
+                    ));
+                    if delete_mode == "folder" {
+                        if dependency.reference.is_none() || role == "unknown" {
+                            warnings.push(format!("无法确认资产依赖记录内容，请重新扫描后再操作：{}", asset.primary_source));
+                            continue;
+                        }
+                        if status == "missing" && role == "shared_toon_texture" && is_builtin_shared_toon(dependency.reference.as_deref()) {
+                            continue;
+                        }
+                        match (status, path) {
+                            ("resolved", Some(path)) => match fs::canonicalize(path) {
+                                Ok(canonical) if canonical.is_file() && path_is_within(&package.source, &canonical) => {
+                                    dependency_paths.insert(canonical.to_string_lossy().into_owned());
+                                }
+                                Ok(canonical) if canonical.is_file() => warnings.push(format!("存在资产文件夹外依赖，不能整目录回收：{}", canonical.display())),
+                                _ => warnings.push(format!("依赖文件缺失或不可读取，请重新扫描：{path}")),
+                            },
+                            ("missing", _) | ("external", _) | (_, _) => warnings.push(format!(
+                                "依赖状态不满足整目录回收要求：{}",
+                                path.or(dependency.reference.as_deref()).unwrap_or("未知路径")
+                            )),
+                        }
+                    }
+                }
+            } else if delete_mode == "folder" && may_have_file_dependencies(&asset.primary_source, &asset.asset_type) {
+                warnings.push(format!("无法确认资产文件依赖（缺少解析记录），请重新扫描后再操作：{}", asset.primary_source));
+            }
+
+            for dependency in load_asset_dependencies(library, &asset.id)? {
+                let dependency_text = dependency.to_string_lossy().into_owned();
+                dependency_snapshots.push(dependency_file_snapshot(
+                    &asset.id,
+                    None,
+                    "indexed",
+                    Some(&dependency_text),
+                    if dependency.exists() { "resolved" } else { "missing" },
+                ));
+                if delete_mode == "folder" {
+                    match fs::canonicalize(&dependency) {
+                        Ok(canonical) if path_is_within(&package.source, &canonical) => {
+                            dependency_paths.insert(canonical.to_string_lossy().into_owned());
+                        }
+                        Ok(canonical) => warnings.push(format!("索引依赖位于模型文件夹之外：{}", canonical.display())),
+                        Err(_) => warnings.push(format!("索引中的依赖文件已不存在：{}", dependency.display())),
+                    }
+                }
+            }
+            if delete_mode == "folder"
+                && let Some(card_path) = load_card_path(library, &asset.id)?
+                && !path_is_within(&package.source, Path::new(&card_path))
+                && Path::new(&card_path).exists()
+            {
+                warnings.push(format!("资源卡位于模型文件夹目录之外：{card_path}"));
+            }
+            if has_active_job(library, &asset.id)? {
+                warnings.push(format!("资产仍有后台任务运行，请等待任务完成后再操作：{}", asset.name));
+            }
+            if has_unresolved_operation(library, &asset.id)? {
+                warnings.push(format!("该资产有待人工核对的文件操作记录，请先恢复文件并重新扫描：{}", asset.name));
+            }
+        }
+    }
+
+    let affected_ids = affected_assets.iter().map(|asset| asset.id.clone()).collect::<HashSet<_>>();
+    append_reverse_dependency_warnings(library, &packages, &affected_ids, &mut warnings)?;
+    if !cfg!(windows) {
+        warnings.push("此平台没有启用回收站接口；为避免永久删除，不能执行删除".to_owned());
+    }
+    affected_assets.sort_by(|left, right| left.id.cmp(&right.id));
+    source_snapshots.sort();
+    source_snapshots.dedup();
+    package_snapshots.sort();
+    package_snapshots.dedup();
+    dependency_snapshots.sort();
+    dependency_snapshots.dedup();
+    let mut source_paths = packages.iter().map(|package| package.source.to_string_lossy().into_owned()).collect::<Vec<_>>();
+    source_paths.sort();
+    source_paths.dedup();
+    let mut dependency_paths = dependency_paths.into_iter().collect::<Vec<_>>();
+    dependency_paths.sort();
+    let mut preserved_paths = preserved_paths.into_iter().collect::<Vec<_>>();
+    preserved_paths.sort();
+    pmx_directories.sort();
+    warnings.sort();
+    warnings.dedup();
+    let delete_reason = (delete_mode == "pmxOnly").then(|| {
+        if eligibility_reasons.is_empty() {
+            "本批次按所选 PMX 文件范围执行。".to_owned()
+        } else {
+            format!("本次仅回收所选 PMX；不回收其所在文件夹。原因：{}。", eligibility_reasons.join("；"))
+        }
+    });
+    let view = AssetOperationPlan {
+        operation: OperationKind::DeleteModel.as_str().to_owned(),
+        asset_ids: requested_ids,
+        source_paths,
+        destination_paths: Vec::new(),
+        destination_parent: None,
+        new_name: None,
+        affected_assets: affected_assets.iter().map(|asset| AssetOperationAsset {
+            id: asset.id.clone(),
+            name: asset.name.clone(),
+            primary_source: asset.primary_source.clone(),
+        }).collect(),
+        dependency_paths,
+        source_snapshots,
+        package_snapshots,
+        dependency_snapshots,
+        delete_mode: Some(delete_mode.to_owned()),
+        delete_reason,
+        pmx_directories,
+        preserved_paths,
+        warnings: warnings.clone(),
+        can_execute: warnings.is_empty(),
+    };
+    Ok(PreparedPlan { view, kind: OperationKind::DeleteModel, packages, affected_assets })
+}
+
+fn enumerate_direct_pmx(parent: &Path) -> CoreResult<Vec<PathBuf>> {
+    let entries = fs::read_dir(parent).map_err(|error| {
+        CoreError::AssetOperation(format!("无法完整枚举模型目录 {}：{error}", parent.display()))
+    })?;
+    let mut pmx_paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CoreError::AssetOperation(format!("无法完整枚举模型目录 {}：{error}", parent.display()))
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("pmx")) {
+            pmx_paths.push(path);
+        }
+    }
+    Ok(pmx_paths)
+}
+
+fn find_other_supported_asset(parent: &Path, selected_paths: &HashSet<String>) -> CoreResult<Option<PathBuf>> {
+    for entry in walkdir::WalkDir::new(parent).follow_links(false).min_depth(1) {
+        let entry = entry.map_err(|error| CoreError::AssetOperation(format!("无法完整枚举目录内容：{error}")))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let supported_main_file = path.extension().and_then(|value| value.to_str()).is_some_and(|extension| {
+            ["pmx", "pmd", "vmd", "vpd"].iter().any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        });
+        if supported_main_file && !selected_paths.contains(&path_key(path)) {
+            return Ok(Some(path.to_path_buf()));
+        }
+    }
+    Ok(None)
+}
+
+fn load_assets_for_primary(library: &Library, primary: &Path) -> CoreResult<Vec<StoredAsset>> {
+    let primary_text = primary.to_string_lossy().into_owned();
+    let ids = {
+        let connection = library.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id FROM assets WHERE asset_type='model' AND retired_format=0 AND visibility='normal'
+             AND primary_source=?1 COLLATE NOCASE ORDER BY id",
+        )?;
+        statement.query_map([&primary_text], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut assets = Vec::new();
+    for id in ids {
+        let asset = load_asset(library, &id)?;
+        if fs::canonicalize(&asset.primary_source).is_ok_and(|path| same_path(&path, primary)) {
+            assets.push(asset);
+        }
+    }
+    Ok(assets)
+}
+
+fn load_assets_with_primary_under_package(library: &Library, package: &Path) -> CoreResult<Vec<StoredAsset>> {
+    let package_text = package.to_string_lossy().into_owned();
+    let prefix = format!("{}{}", package_text.trim_end_matches(['\\', '/']), std::path::MAIN_SEPARATOR);
+    let pattern = format!("{}%", escape_like(&prefix));
+    let connection = library.connection()?;
+    let mut statement = connection.prepare(
+        "SELECT a.id,a.name,a.primary_source,a.asset_directory,a.root_id,r.path,r.asset_type,a.retired_format
+         FROM assets a JOIN roots r ON r.id=a.root_id
+         WHERE a.primary_source=?1 COLLATE NOCASE
+            OR a.primary_source LIKE ?2 ESCAPE '!' COLLATE NOCASE
+         ORDER BY a.id",
+    )?;
+    let rows = statement.query_map(params![package_text, pattern], |row| {
+        Ok(StoredAsset {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            primary_source: row.get(2)?,
+            asset_directory: row.get(3)?,
+            root_id: row.get(4)?,
+            root_path: row.get(5)?,
+            asset_type: row.get(6)?,
+            retired_format: row.get(7)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return metadata.file_attributes() & 0x400 != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn path_reparse_component(path: &Path, root: &Path) -> CoreResult<Option<PathBuf>> {
+    let mut current = path.to_path_buf();
+    loop {
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            CoreError::AssetOperation(format!("无法检查模型路径 {}：{error}", current.display()))
+        })?;
+        if is_reparse_point(&metadata) {
+            return Ok(Some(current));
+        }
+        if same_path(&current, root) {
+            break;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn execute(
@@ -611,10 +1131,14 @@ pub(crate) fn execute(
         || prepared.view.source_snapshots != confirmed_plan.source_snapshots
         || prepared.view.package_snapshots != confirmed_plan.package_snapshots
         || prepared.view.dependency_snapshots != confirmed_plan.dependency_snapshots
+        || prepared.view.delete_mode != confirmed_plan.delete_mode
+        || prepared.view.delete_reason != confirmed_plan.delete_reason
+        || prepared.view.pmx_directories != confirmed_plan.pmx_directories
+        || prepared.view.preserved_paths != confirmed_plan.preserved_paths
         || prepared.view.warnings != confirmed_plan.warnings
     {
         return Err(CoreError::AssetOperation(
-            "资产包在确认后发生变化，请重新生成操作计划".to_owned(),
+            "资产或文件在确认后发生变化，请重新生成操作计划".to_owned(),
         ));
     }
 
@@ -650,13 +1174,20 @@ pub(crate) fn execute(
     let actions = make_actions(&prepared);
     let completed = match execute_actions(&actions) {
         Ok(completed) => completed,
-        Err((message, completed)) => {
-            let status = if prepared.kind == OperationKind::Recycle || !completed.is_empty() {
+        Err(failure) => {
+            let status = if matches!(prepared.kind, OperationKind::Recycle | OperationKind::DeleteModel) || !failure.completed.is_empty() {
                 "RecoveryNeeded"
             } else {
                 "Failed"
             };
-            finish_journal(library, &operation_id, status, json!({"message":message}))?;
+            let message = failure.message;
+            let result = json!({
+                "message": message.clone(),
+                "completedPaths": failure.completed.iter().map(file_action_path).collect::<Vec<_>>(),
+                "uncertainPaths": failure.uncertain_paths,
+                "notStartedPaths": failure.not_started_paths,
+            });
+            finish_journal(library, &operation_id, status, result)?;
             return Err(CoreError::AssetOperation(message));
         }
     };
@@ -664,15 +1195,22 @@ pub(crate) fn execute(
     let index_warnings = match apply_index_change(library, &prepared) {
         Ok(warnings) => warnings,
         Err(error) => {
-            if prepared.kind == OperationKind::Recycle {
+            if matches!(prepared.kind, OperationKind::Recycle | OperationKind::DeleteModel) {
                 let message = format!(
                     "文件已发送到回收站，但索引更新失败；请从操作日志查看源路径并恢复：{error}"
                 );
+                let result = json!({
+                    "message": message.clone(),
+                    "completedPaths": completed.iter().map(file_action_path).collect::<Vec<_>>(),
+                    "uncertainPaths": [],
+                    "notStartedPaths": [],
+                    "indexUpdateFailed": true,
+                });
                 finish_journal(
                     library,
                     &operation_id,
                     "RecoveryNeeded",
-                    json!({"message":message}),
+                    result,
                 )?;
                 return Err(CoreError::AssetOperation(message));
             }
@@ -693,6 +1231,8 @@ pub(crate) fn execute(
         OperationKind::Move => "资产包已移动".to_owned(),
         OperationKind::Rename => "资产包已重命名".to_owned(),
         OperationKind::Recycle => "资产包已发送到 Windows 回收站".to_owned(),
+        OperationKind::DeleteModel if prepared.view.delete_mode.as_deref() == Some("folder") => "模型文件夹已发送到 Windows 回收站".to_owned(),
+        OperationKind::DeleteModel => "所选 PMX 已发送到 Windows 回收站".to_owned(),
     };
     if !index_warnings.is_empty() {
         message.push_str("；索引更新警告：");
@@ -751,25 +1291,40 @@ fn make_actions(prepared: &PreparedPlan) -> Vec<FileAction> {
             OperationKind::Recycle => FileAction::Recycle {
                 source: package.source.clone(),
             },
+            OperationKind::DeleteModel => FileAction::Recycle {
+                source: package.source.clone(),
+            },
         })
         .collect()
 }
 
-fn execute_actions(actions: &[FileAction]) -> Result<Vec<FileAction>, (String, Vec<FileAction>)> {
+fn execute_actions(actions: &[FileAction]) -> Result<Vec<FileAction>, FileActionFailure> {
     let mut completed = Vec::new();
-    for action in actions {
+    for (index, action) in actions.iter().enumerate() {
         if let Err(error) = perform_file_action(action) {
-            if let FileAction::Move { source, target } = action
-                && !source.exists()
-                && target.exists()
-            {
+            let inferred_completed = match action {
+                FileAction::Move { source, target } => !source.exists() && target.exists(),
+                FileAction::Recycle { .. } => false,
+            };
+            if inferred_completed {
                 completed.push(action.clone());
             }
-            return Err((error, completed));
+            return Err(FileActionFailure {
+                message: error,
+                completed,
+                uncertain_paths: if inferred_completed { Vec::new() } else { vec![file_action_path(action)] },
+                not_started_paths: actions[index + 1..].iter().map(file_action_path).collect(),
+            });
         }
         completed.push(action.clone());
     }
     Ok(completed)
+}
+
+fn file_action_path(action: &FileAction) -> String {
+    match action {
+        FileAction::Move { source, .. } | FileAction::Recycle { source } => source.to_string_lossy().into_owned(),
+    }
 }
 
 fn rollback_moves(completed: &[FileAction]) -> Result<(), String> {
@@ -788,7 +1343,7 @@ fn rollback_moves(completed: &[FileAction]) -> Result<(), String> {
 fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<Vec<String>> {
     let mut connection = library.connection()?;
     let transaction = connection.transaction()?;
-    if prepared.kind == OperationKind::Recycle {
+    if matches!(prepared.kind, OperationKind::Recycle | OperationKind::DeleteModel) {
         for asset in &prepared.affected_assets {
             transaction.execute("DELETE FROM assets WHERE id=?1", [&asset.id])?;
         }
@@ -848,8 +1403,9 @@ fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<
                 let new_path = remap_path(&old_path, &package.source, target)?;
                 moved_path_map.insert(old_path.clone(), new_path.clone());
                 transaction.execute(
-                    "UPDATE asset_files SET path=?3 WHERE asset_id=?1 AND path=?2",
-                    params![asset.id, old_path, new_path],
+                    "UPDATE asset_files SET path=?3,path_key=?4 WHERE asset_id=?1 AND path=?2",
+                    params![asset.id, old_path, new_path,
+                        crate::scanner::scan_path_key(Path::new(&new_path))],
                 )?;
             }
             let card_path: Option<String> = transaction
@@ -896,9 +1452,6 @@ fn refresh_derived_indices(library: &Library) -> Vec<String> {
     let mut warnings = Vec::new();
     if let Err(error) = crate::relations::rebuild(library) {
         warnings.push(format!("关系建议刷新失败：{error}"));
-    }
-    if let Err(error) = crate::duplicates::rebuild(library) {
-        warnings.push(format!("重复项索引刷新失败：{error}"));
     }
     warnings
 }
@@ -1094,10 +1647,11 @@ pub(crate) fn list_journal(
 }
 
 fn load_asset(library: &Library, asset_id: &str) -> CoreResult<StoredAsset> {
+    library.ensure_asset_visible(asset_id)?;
     let connection = library.connection()?;
     connection
         .query_row(
-            "SELECT a.id,a.name,a.primary_source,a.asset_directory,a.root_id,r.path,r.asset_type
+            "SELECT a.id,a.name,a.primary_source,a.asset_directory,a.root_id,r.path,r.asset_type,a.retired_format
              FROM assets a JOIN roots r ON r.id=a.root_id WHERE a.id=?1",
             [asset_id],
             |row| {
@@ -1109,6 +1663,7 @@ fn load_asset(library: &Library, asset_id: &str) -> CoreResult<StoredAsset> {
                     root_id: row.get(4)?,
                     root_path: row.get(5)?,
                     asset_type: row.get(6)?,
+                retired_format: row.get(7)?,
                 })
             },
         )
@@ -1133,7 +1688,7 @@ fn load_assets_under_package(library: &Library, package: &Path) -> CoreResult<Ve
     let pattern = format!("{}%", escape_like(&prefix));
     let connection = library.connection()?;
     let mut statement = connection.prepare(
-        "SELECT a.id,a.name,a.primary_source,a.asset_directory,a.root_id,r.path,r.asset_type
+        "SELECT a.id,a.name,a.primary_source,a.asset_directory,a.root_id,r.path,r.asset_type,a.retired_format
          FROM assets a JOIN roots r ON r.id=a.root_id
          WHERE a.asset_directory=?1 COLLATE NOCASE OR a.asset_directory LIKE ?2 ESCAPE '!' COLLATE NOCASE
          ORDER BY a.id",
@@ -1147,6 +1702,7 @@ fn load_assets_under_package(library: &Library, package: &Path) -> CoreResult<Ve
             root_id: row.get(4)?,
             root_path: row.get(5)?,
             asset_type: row.get(6)?,
+            retired_format: row.get(7)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1224,7 +1780,7 @@ fn may_have_file_dependencies(primary_source: &str, asset_type: &str) -> bool {
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
-            ["pmx", "pmd", "x"]
+            ["pmx", "pmd"]
                 .iter()
                 .any(|supported| extension.eq_ignore_ascii_case(supported))
         })
@@ -1831,10 +2387,11 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO asset_files(asset_id,path,role,file_size,modified_ns) VALUES (?1,?2,'primary',?3,?4)",
+                "INSERT INTO asset_files(asset_id,path,path_key,role,file_size,modified_ns) VALUES (?1,?2,?3,'primary',?4,?5)",
                 params![
                     id,
                     primary.to_string_lossy(),
+                    crate::scanner::scan_path_key(&primary),
                     i64::try_from(metadata.len()).unwrap_or(i64::MAX),
                     file_modified_ns(&metadata)
                 ],
@@ -1844,10 +2401,11 @@ mod tests {
             let metadata = fs::metadata(path).unwrap();
             connection
                 .execute(
-                    "INSERT INTO asset_files(asset_id,path,role,file_size,modified_ns) VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT INTO asset_files(asset_id,path,path_key,role,file_size,modified_ns) VALUES (?1,?2,?3,?4,?5,?6)",
                     params![
                         id,
                         path,
+                        crate::scanner::scan_path_key(Path::new(path)),
                         role,
                         i64::try_from(metadata.len()).unwrap_or(i64::MAX),
                         file_modified_ns(&metadata)

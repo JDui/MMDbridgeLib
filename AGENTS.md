@@ -10,7 +10,7 @@
 ## 架构和平台
 
 - Windows 10/11 是主要平台；优先保证中文、日文、Unicode 和长路径处理。
-- 资产发现、解析、索引、关系、重复项、任务队列、缩略图和 MMDRCV 规则归 Rust `mmdbridge-core` 所有。Tauri、CLI、React/TypeScript 和 Agent Skill 复用 Core，不在各入口重复实现资产逻辑。
+- 资产发现、解析、索引、关系、任务队列、缩略图和 MMDRCV 规则归 Rust `mmdbridge-core` 所有。Core 保留文件身份指纹和任务队列去重，但不提供资产重复项检测或管理。Tauri、CLI、React/TypeScript 和 Agent Skill 复用 Core，不在各入口重复实现资产逻辑。
 - 保持本地优先，不引入 Python Runtime；UI 只负责显示 Core 返回的数据并提交用户操作。
 - 增加新依赖或重写已有能力前，先检查项目内实现和已有可复用方案。
 
@@ -27,7 +27,7 @@
 
 用户已经批准继续完成以下项目工作；在这些既定范围内不需要重复询问确认：
 
-- 无压缩二进制 `.x` 场景解析。
+- `.X` 格式退出支持，保留源文件与历史资料。
 - Parse、Render、Encode 阶段并发限制及设置界面。
 - 资产包 Move / Rename / Recycle Bin Delete、批量操作和 Operation Journal / 恢复流程。
 - 渲染器的 VMD 材质、UV、Impulse、Flip Morph，以及 Toon、Sphere Map、顶点色支持。

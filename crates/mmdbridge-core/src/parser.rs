@@ -1,11 +1,31 @@
 use std::path::Path;
 
-use mmd_anim_format::{
-    parse_accessory_manifest, parse_pmd_model, parse_pmx_model, parse_vmd_animation, parse_vpd_pose,
-};
+use mmd_anim_format::{parse_pmd_model, parse_pmx_model, parse_vmd_animation, parse_vpd_pose};
 use serde_json::json;
 
 use crate::types::{AssetType, ParsedCandidate, ParsedDependency, display_name};
+
+const CAMERA_CLASSIFICATION_VERSION: u8 = 2;
+const PMX_PARSER_REVISION: u32 = 1;
+const PMD_PARSER_REVISION: u32 = 1;
+const VMD_PARSER_REVISION: u32 = 2;
+const VPD_PARSER_REVISION: u32 = 1;
+
+pub(crate) fn revision_for_path(path: &Path) -> u32 {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pmx" => PMX_PARSER_REVISION,
+        "pmd" => PMD_PARSER_REVISION,
+        "vmd" => VMD_PARSER_REVISION,
+        "vpd" => VPD_PARSER_REVISION,
+        _ => 0,
+    }
+}
 
 pub(crate) fn parse_asset(
     asset_type: AssetType,
@@ -20,11 +40,6 @@ pub(crate) fn parse_asset(
     match asset_type {
         AssetType::Model => {
             let parsed = parse_pmx_model(bytes).map_err(|error| error.to_string())?;
-            let status = if parsed.diagnostics.is_empty() {
-                "Ready"
-            } else {
-                "NeedsReview"
-            };
             Ok(ParsedCandidate {
                 name: non_empty(&parsed.metadata.name, fallback_name),
                 metadata: json!({
@@ -35,7 +50,7 @@ pub(crate) fn parse_asset(
                     "joint_count": parsed.metadata.counts.joints, "english_name": parsed.metadata.english_name,
                     "parser_diagnostics": parsed.diagnostics,
                 }),
-                status: status.to_owned(),
+                status: "Ready".to_owned(),
                 dependencies: pmx_dependencies(&parsed.materials),
             })
         }
@@ -90,7 +105,12 @@ pub(crate) fn parse_asset(
                 && !has_property_animation
                 && !has_self_shadow_animation;
             let is_camera_only =
-                has_camera && !has_bone_motion && !has_morph_motion && !has_light && !has_ik;
+                has_camera
+                    && !has_bone_motion
+                    && !has_morph_motion
+                    && !has_light
+                    && parsed.property_frames.is_empty()
+                    && parsed.self_shadow_frames.is_empty();
             Ok(ParsedCandidate {
                 name: fallback_name,
                 metadata: json!({
@@ -99,6 +119,7 @@ pub(crate) fn parse_asset(
                     "has_bone_motion": has_bone_motion, "has_morph_motion": has_morph_motion,
                     "has_camera": has_camera, "has_light": has_light, "has_ik": has_ik,
                     "has_self_shadow": !parsed.self_shadow_frames.is_empty(), "is_camera_only": is_camera_only,
+                    "camera_classification_version": CAMERA_CLASSIFICATION_VERSION,
                     "is_pose": is_pose, "preview_frame": 0, "vmd_model_name": parsed.metadata.model_name,
                     "key_counts": parsed.metadata.counts,
                 }),
@@ -108,15 +129,10 @@ pub(crate) fn parse_asset(
         }
         AssetType::Motion if extension.eq_ignore_ascii_case("vpd") => {
             let parsed = parse_vpd_pose(bytes).map_err(|error| error.to_string())?;
-            let status = if parsed.diagnostics.is_empty() {
-                "Ready"
-            } else {
-                "NeedsReview"
-            };
             Ok(ParsedCandidate {
                 name: fallback_name,
                 metadata: json!({"file_type":"vpd", "is_pose":true, "bone_count":parsed.bone_count, "model_file":parsed.model_file, "parser_diagnostics":parsed.diagnostics}),
-                status: status.to_owned(),
+                status: "Ready".to_owned(),
                 dependencies: Vec::new(),
             })
         }
@@ -129,15 +145,10 @@ pub(crate) fn parse_asset(
                     .chunks_exact(3)
                     .map(|p| [p[0], p[1], p[2]]),
             );
-            let status = if parsed.diagnostics.is_empty() {
-                "Ready"
-            } else {
-                "NeedsReview"
-            };
             Ok(ParsedCandidate {
                 name: non_empty(&parsed.metadata.name, fallback_name),
                 metadata: json!({"file_type":"pmx", "polygon_count":parsed.metadata.counts.faces, "width":width, "depth":depth, "area":width*depth, "coordinate_unit":"MMD", "parser_diagnostics":parsed.diagnostics}),
-                status: status.to_owned(),
+                status: "Ready".to_owned(),
                 dependencies: pmx_dependencies(&parsed.materials),
             })
         }
@@ -150,11 +161,6 @@ pub(crate) fn parse_asset(
                     .iter()
                     .map(|vertex| vertex.position),
             );
-            let status = if parsed.diagnostics.is_empty() {
-                "Ready"
-            } else {
-                "NeedsReview"
-            };
             let mut dependencies = Vec::new();
             for material in &parsed.materials {
                 let references = material
@@ -180,40 +186,7 @@ pub(crate) fn parse_asset(
             Ok(ParsedCandidate {
                 name: non_empty(&parsed.metadata.name, fallback_name),
                 metadata: json!({"file_type":"pmd", "polygon_count":parsed.metadata.counts.faces, "width":width, "depth":depth, "area":width*depth, "coordinate_unit":"MMD", "bone_count":parsed.metadata.counts.bones, "parser_diagnostics":parsed.diagnostics}),
-                status: status.to_owned(),
-                dependencies,
-            })
-        }
-        AssetType::Scene if extension.eq_ignore_ascii_case("x") => {
-            let file_name = path.file_name().and_then(|name| name.to_str());
-            let parsed = if crate::x_binary::is_binary_x(bytes) {
-                crate::x_binary::parse_binary_x(bytes)?
-            } else {
-                parse_accessory_manifest(bytes, file_name).map_err(|error| error.to_string())?
-            };
-            let positions = parsed
-                .mesh_summaries
-                .iter()
-                .flat_map(|mesh| mesh.positions.iter().copied());
-            let (width, depth) = bounds_xz(positions);
-            let polygon_count: usize = parsed
-                .mesh_summaries
-                .iter()
-                .map(|mesh| mesh.face_count)
-                .sum();
-            let status = if !parsed.mesh_summaries.is_empty() {
-                "Ready"
-            } else {
-                "Unsupported"
-            };
-            let mut dependencies = Vec::new();
-            for reference in &parsed.texture_references {
-                push_dependency(&mut dependencies, reference, "texture");
-            }
-            Ok(ParsedCandidate {
-                name: fallback_name,
-                metadata: json!({"file_type":"x", "polygon_count":polygon_count, "width":width, "depth":depth, "area":width*depth, "coordinate_unit":"MMD", "text":parsed.text, "mesh_count":parsed.mesh_count, "material_count":parsed.material_count, "parser_diagnostics":parsed.diagnostics}),
-                status: status.to_owned(),
+                status: "Ready".to_owned(),
                 dependencies,
             })
         }

@@ -34,6 +34,8 @@ pub enum CoreError {
     JobNotFound(String),
     #[error("asset was not found: {0}")]
     AssetNotFound(String),
+    #[error("格式已不再支持：{0}")]
+    UnsupportedAssetFormat(String),
     #[error("invalid asset type: {0}")]
     InvalidAssetType(String),
     #[error("resource card error: {0}")]
@@ -71,6 +73,7 @@ impl CoreError {
                     | Self::ThumbnailCancelled
                     | Self::JobNotFound(_)
                     | Self::AssetNotFound(_)
+                    | Self::UnsupportedAssetFormat(_)
                     | Self::InvalidAssetType(_)
                     | Self::InvalidTag(_)
                     | Self::InvalidFilter(_)

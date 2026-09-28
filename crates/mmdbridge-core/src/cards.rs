@@ -3,10 +3,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -20,6 +21,7 @@ use crate::{
 
 const CARD_FORMAT: &str = "MMDRCV";
 const CARD_SCHEMA_VERSION: u32 = 1;
+const MANIFEST_REVISION: &str = concat!("card-", env!("CARGO_PKG_VERSION"), "-", "1");
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -251,6 +253,16 @@ fn push_identity_candidate(
 
 pub(crate) fn verify(library: &Library, asset_id: &str) -> CoreResult<CardValidation> {
     let context = load_context(library, asset_id)?;
+    let renderer_revision = expected_renderer_revision(library, context.asset_type)?;
+    verify_with_renderer_revision(library, asset_id, &renderer_revision)
+}
+
+pub(crate) fn verify_with_renderer_revision(
+    library: &Library,
+    asset_id: &str,
+    renderer_revision: &str,
+) -> CoreResult<CardValidation> {
+    let context = load_context(library, asset_id)?;
     let was_stale = library
         .connection()?
         .query_row(
@@ -392,18 +404,39 @@ pub(crate) fn verify(library: &Library, asset_id: &str) -> CoreResult<CardValida
         }
     };
 
+    let file_signature = std::fs::metadata(&card_path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| {
+            (
+                i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+                metadata_modified_ns(&metadata),
+            )
+        });
+    let stored_renderer_revision = manifest_renderer_revision(
+        manifest_json.as_deref(),
+        renderer_revision,
+    );
     let connection = library.connection()?;
     connection.execute(
-        "INSERT INTO cards(asset_id,card_path,status,manifest_json,last_checked_at)
-         VALUES (?1,?2,?3,?4,?5)
+        "INSERT INTO cards(asset_id,card_path,status,manifest_json,last_checked_at,file_size,modified_ns,manifest_revision,renderer_revision,has_thumbnail)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
          ON CONFLICT(asset_id) DO UPDATE SET card_path=excluded.card_path,status=excluded.status,
-           manifest_json=excluded.manifest_json,last_checked_at=excluded.last_checked_at",
+           manifest_json=excluded.manifest_json,last_checked_at=excluded.last_checked_at,
+           file_size=excluded.file_size,modified_ns=excluded.modified_ns,
+           manifest_revision=excluded.manifest_revision,renderer_revision=excluded.renderer_revision,
+           has_thumbnail=excluded.has_thumbnail",
         params![
             context.asset_id,
             card_path.to_string_lossy().into_owned(),
             status,
             manifest_json,
-            now
+            now,
+            file_signature.map(|signature| signature.0),
+            file_signature.map(|signature| signature.1),
+            MANIFEST_REVISION,
+            stored_renderer_revision,
+            i64::from(has_thumbnail),
         ],
     )?;
 
@@ -414,6 +447,95 @@ pub(crate) fn verify(library: &Library, asset_id: &str) -> CoreResult<CardValida
         has_thumbnail,
         message,
     })
+}
+
+pub(crate) fn verify_if_changed(
+    library: &Library,
+    asset_id: &str,
+    expected_renderer_revision: &str,
+) -> CoreResult<Option<CardValidation>> {
+    library.ensure_asset_visible(asset_id)?;
+    let cached: Option<(Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, bool)> =
+        library
+            .connection()?
+            .query_row(
+                "SELECT c.card_path,c.status,c.file_size,c.modified_ns,c.manifest_revision,c.renderer_revision,c.has_thumbnail
+                 FROM assets a LEFT JOIN cards c ON c.asset_id=a.id WHERE a.id=?1",
+                [asset_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+                    ))
+                },
+            )
+            .optional()?;
+    let Some((card_path, status, file_size, modified_ns, Some(manifest_revision), Some(renderer_revision), has_thumbnail)) = cached
+    else {
+        return Ok(None);
+    };
+    let Some(status) = status else { return Ok(None); };
+    if manifest_revision != MANIFEST_REVISION {
+        return Ok(None);
+    }
+    let signature_matches = if let Some(card_path) = card_path.as_deref() {
+        std::fs::metadata(PathBuf::from(card_path))
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .is_some_and(|metadata| {
+                file_size == Some(i64::try_from(metadata.len()).unwrap_or(i64::MAX))
+                    && modified_ns == Some(metadata_modified_ns(&metadata))
+            })
+    } else {
+        false
+    };
+    let missing_matches = card_path.as_deref().is_some_and(|path| {
+        std::fs::metadata(PathBuf::from(path)).is_err()
+            && status == "CardMissing"
+            && file_size.is_none()
+            && modified_ns.is_none()
+    });
+    let revision_matches = renderer_revision == expected_renderer_revision
+        || matches!(status.as_str(), "CardStale" | "CardBroken" | "CardMissing");
+    if !revision_matches || !(signature_matches || missing_matches) {
+        return Ok(None);
+    }
+    match status.as_str() {
+        "CardValid" | "CardStale" | "CardBroken" | "CardMissing" => {
+            Ok(Some(CardValidation {
+                asset_id: asset_id.to_owned(),
+                status,
+                card_path,
+                has_thumbnail,
+                message: None,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn manifest_renderer_revision(manifest_json: Option<&str>, expected: &str) -> String {
+    let Some(manifest) = manifest_json.and_then(|json| serde_json::from_str::<Value>(json).ok()) else {
+        return expected.to_owned();
+    };
+    let Some(thumbnail) = manifest.get("thumbnail").filter(|value| !value.is_null()) else {
+        return expected.to_owned();
+    };
+    let Some(report) = thumbnail.get("render_report") else {
+        return "unverified".to_owned();
+    };
+    match (
+        report.get("rendererVersion").and_then(Value::as_str),
+        report.get("previewSettingsVersion").and_then(Value::as_str),
+    ) {
+        (Some(renderer), Some(settings)) => format!("{renderer}:{settings}"),
+        _ => "unverified".to_owned(),
+    }
 }
 
 fn thumbnail_version_current(
@@ -481,6 +603,15 @@ pub(crate) fn create(
             .and_then(|card| card.manifest.thumbnail.as_ref())
             .and_then(|thumbnail| thumbnail.render_report.clone())
     });
+    let expected_renderer_revision = expected_renderer_revision(library, context.asset_type)?;
+    let renderer_revision = if preview_webp.is_some() {
+        render_report
+            .as_ref()
+            .map(|report| format!("{}:{}", report.renderer_version, report.preview_settings_version))
+            .unwrap_or_else(|| "unverified".to_owned())
+    } else {
+        expected_renderer_revision.clone()
+    };
     let now = Utc::now().to_rfc3339();
     let created_at = existing_created_at(&context).unwrap_or_else(|| now.clone());
     let relative_path = relative_source(&context);
@@ -523,6 +654,59 @@ pub(crate) fn create(
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
+    let _visibility_guard = match library.visibility_guard() {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    let mut connection = match library.connection() {
+        Ok(connection) => connection,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    let transaction = match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error.into());
+        }
+    };
+    let current_asset: Option<(bool, String, String)> = match transaction
+        .query_row(
+            "SELECT retired_format,visibility,fingerprint FROM assets WHERE id=?1",
+            [&context.asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+    {
+        Ok(asset) => asset,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error.into());
+        }
+    };
+    let Some((retired_format, visibility, current_fingerprint)) = current_asset else {
+        let _ = fs::remove_file(&temp_path);
+        return Err(CoreError::AssetNotFound(context.asset_id));
+    };
+    if retired_format {
+        let _ = fs::remove_file(&temp_path);
+        return Err(CoreError::UnsupportedAssetFormat("X".to_owned()));
+    }
+    if visibility != "normal" {
+        let _ = fs::remove_file(&temp_path);
+        return Err(CoreError::AssetNotFound(context.asset_id));
+    }
+    if current_fingerprint != context.fingerprint {
+        let _ = fs::remove_file(&temp_path);
+        return Err(CoreError::Card(
+            "源文件在资源卡准备期间发生变化，请先重新扫描".to_owned(),
+        ));
+    }
 
     let replacing = matches!(target_kind, TargetKind::Replace);
     if replacing && !card_owned_by(&target, &context.asset_id) {
@@ -540,19 +724,36 @@ pub(crate) fn create(
         )));
     }
 
-    let connection = library.connection()?;
-    connection.execute(
-        "INSERT INTO cards(asset_id,card_path,status,manifest_json,last_checked_at)
-         VALUES (?1,?2,'CardValid',?3,?4)
+    let file_signature = std::fs::metadata(&target)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| {
+            (
+                i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+                metadata_modified_ns(&metadata),
+            )
+        });
+    transaction.execute(
+        "INSERT INTO cards(asset_id,card_path,status,manifest_json,last_checked_at,file_size,modified_ns,manifest_revision,renderer_revision,has_thumbnail)
+         VALUES (?1,?2,'CardValid',?3,?4,?5,?6,?7,?8,?9)
          ON CONFLICT(asset_id) DO UPDATE SET card_path=excluded.card_path,status='CardValid',
-           manifest_json=excluded.manifest_json,last_checked_at=excluded.last_checked_at",
+           manifest_json=excluded.manifest_json,last_checked_at=excluded.last_checked_at,
+           file_size=excluded.file_size,modified_ns=excluded.modified_ns,
+           manifest_revision=excluded.manifest_revision,renderer_revision=excluded.renderer_revision,
+           has_thumbnail=excluded.has_thumbnail",
         params![
             context.asset_id,
             target.to_string_lossy().into_owned(),
             manifest_json,
-            now
+            now,
+            file_signature.map(|signature| signature.0),
+            file_signature.map(|signature| signature.1),
+            MANIFEST_REVISION,
+            renderer_revision,
+            i64::from(preview_webp.is_some()),
         ],
     )?;
+    transaction.commit()?;
 
     Ok(CardResult {
         asset_id: context.asset_id,
@@ -563,6 +764,32 @@ pub(crate) fn create(
             .is_none()
             .then(|| "资源卡已创建；尚无 preview.webp，缩略图待生成".to_owned()),
     })
+}
+
+pub(crate) fn expected_renderer_revision(
+    library: &Library,
+    asset_type: AssetType,
+) -> CoreResult<String> {
+    let settings = match asset_type {
+        AssetType::Model => crate::thumbnail::PREVIEW_SETTINGS_VERSION.to_owned(),
+        AssetType::Scene => crate::thumbnail::SCENE_PREVIEW_SETTINGS_VERSION.to_owned(),
+        AssetType::Motion => match library.motion_preview_model()? {
+            Some(path) => crate::thumbnail::motion_preview_settings_version(Path::new(&path))
+                .unwrap_or_else(|_| "unavailable".to_owned()),
+            None => "unavailable".to_owned(),
+        },
+    };
+    Ok(format!("{}:{settings}", crate::thumbnail::RENDERER_VERSION))
+}
+
+fn metadata_modified_ns(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0_i64, |duration| {
+            i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+        })
 }
 
 pub(crate) fn read_thumbnail(library: &Library, asset_id: &str) -> CoreResult<Option<Vec<u8>>> {
@@ -634,6 +861,7 @@ pub(crate) fn cached_thumbnail(
 }
 
 fn load_context(library: &Library, asset_id: &str) -> CoreResult<AssetContext> {
+    library.ensure_asset_visible(asset_id)?;
     let connection = library.connection()?;
     let row: Option<(
         String,

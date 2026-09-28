@@ -9,8 +9,8 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use image::{ImageReader, imageops::FilterType};
 use mmd_anim_format::{
-    AccessoryParsedManifest, PmdParsedModel, PmxParsedModel, VpdParsedPose, import_pmx_runtime,
-    parse_accessory_manifest, parse_pmd_model, parse_pmx_model, parse_vpd_pose,
+    PmdParsedModel, PmxParsedModel, VpdParsedPose, import_pmx_runtime, parse_pmd_model,
+    parse_pmx_model, parse_vpd_pose,
 };
 use mmd_anim_runtime::{BoneIndex, ClipSample, MorphIndex, RuntimeInstance};
 use serde::{Deserialize, Serialize};
@@ -199,19 +199,6 @@ pub(crate) fn render_file_with_progress(
             return Err(CoreError::ThumbnailCancelled);
         }
         render_input_from_pmd(&model)?
-    } else if extension.eq_ignore_ascii_case("x") {
-        let file_name = path.file_name().and_then(|name| name.to_str());
-        let manifest = if crate::x_binary::is_binary_x(&bytes) {
-            crate::x_binary::parse_binary_x(&bytes)
-                .map_err(|error| CoreError::ThumbnailRender(format!("X 场景解析失败：{error}")))?
-        } else {
-            parse_accessory_manifest(&bytes, file_name)
-                .map_err(|error| CoreError::ThumbnailRender(format!("X 场景解析失败：{error}")))?
-        };
-        if !progress("Parsing", 0.20) {
-            return Err(CoreError::ThumbnailCancelled);
-        }
-        render_input_from_x(&manifest)?
     } else {
         return Err(CoreError::ThumbnailRender(format!(
             "当前缩略图渲染器不支持 .{} 文件",
@@ -261,17 +248,7 @@ fn scene_view_input(path: &Path) -> CoreResult<RenderInput> {
             let model = parse_pmd_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?;
             render_input_from_pmd(&model)
         }
-        "x" => {
-            let manifest = if crate::x_binary::is_binary_x(&bytes) {
-                crate::x_binary::parse_binary_x(&bytes)
-                    .map_err(|error| CoreError::ModelPreview(error.to_string()))?
-            } else {
-                parse_accessory_manifest(&bytes, path.file_name().and_then(|name| name.to_str()))
-                    .map_err(|error| CoreError::ModelPreview(error.to_string()))?
-            };
-            render_input_from_x(&manifest)
-        }
-        _ => Err(CoreError::ModelPreview("3D 场景预览只支持 PMX、PMD 和 X".to_owned())),
+        _ => Err(CoreError::ModelPreview("3D 场景预览只支持 PMX 和 PMD".to_owned())),
     }
 }
 
@@ -850,197 +827,6 @@ fn render_input_from_pmd(model: &PmdParsedModel) -> CoreResult<RenderInput> {
     }
     if materials.is_empty() {
         diagnostics.push("MissingMaterial: using fallback material".to_owned());
-    }
-    Ok(RenderInput {
-        vertices,
-        uvs,
-        indices,
-        material_ranges,
-        materials,
-        camera: None,
-        scene_view: false,
-        framing_bounds: None,
-        diagnostics,
-    })
-}
-
-fn render_input_from_x(manifest: &AccessoryParsedManifest) -> CoreResult<RenderInput> {
-    if manifest.mesh_summaries.is_empty() {
-        return Err(CoreError::ThumbnailRender(
-            "UnsupportedX: .x 场景不包含可用网格".to_owned(),
-        ));
-    }
-    let mut vertices = Vec::new();
-    let mut uvs = Vec::new();
-    let mut indices = Vec::new();
-    let mut material_ranges = Vec::<MaterialRange>::new();
-    let mut diagnostics = manifest
-        .diagnostics
-        .iter()
-        .map(|diagnostic| format!("ParserDiagnostic:{}", diagnostic.code))
-        .collect::<Vec<_>>();
-    let mut materials = manifest
-        .materials
-        .iter()
-        .enumerate()
-        .map(|(index, material)| RenderMaterial {
-            name: material
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("Material {index}")),
-            texture_path: material
-                .texture_references
-                .first()
-                .cloned()
-                .unwrap_or_default(),
-            sphere_texture_path: String::new(),
-            toon_texture_path: String::new(),
-            shared_toon_index: None,
-            sphere_mode: 0,
-            diffuse: material
-                .face_color
-                .map(|color| color.map(finite_or_zero))
-                .unwrap_or([0.72, 0.76, 0.79, 1.0]),
-            ambient: material
-                .emissive_color
-                .map(|color| {
-                    [
-                        finite_or_zero(color[0]),
-                        finite_or_zero(color[1]),
-                        finite_or_zero(color[2]),
-                        1.0,
-                    ]
-                })
-                .unwrap_or([0.12, 0.12, 0.12, 1.0]),
-            specular: [0.0, 0.0, 0.0, 1.0],
-            texture_factor: [1.0; 4],
-            sphere_factor: [1.0; 4],
-            toon_factor: [1.0; 4],
-            toon_enabled: false,
-            vertex_color_mode: 1,
-        })
-        .collect::<Vec<_>>();
-    if materials.is_empty() {
-        diagnostics.push("MissingMaterial: using fallback material".to_owned());
-    }
-
-    for mesh in &manifest.mesh_summaries {
-        let mut color_by_vertex =
-            HashMap::<usize, [f32; 4]>::with_capacity(mesh.vertex_colors.len());
-        for color in &mesh.vertex_colors {
-            if let Some(vertex_color) = color_by_vertex.get_mut(&(color.vertex_index as usize)) {
-                *vertex_color = color.color.map(finite_or_zero);
-            } else {
-                color_by_vertex
-                    .insert(color.vertex_index as usize, color.color.map(finite_or_zero));
-            }
-        }
-        if !color_by_vertex.is_empty() {
-            let material_end = mesh
-                .material_start_index
-                .saturating_add(mesh.material_count)
-                .min(materials.len());
-            for material in materials
-                .iter_mut()
-                .take(material_end)
-                .skip(mesh.material_start_index.min(material_end))
-            {
-                material.vertex_color_mode = 1;
-            }
-        }
-        if mesh.texture_coordinates.len() != mesh.positions.len() {
-            diagnostics.push("MissingTextureCoordinates:X mesh UVs are incomplete".to_owned());
-        }
-        for (face_index, face) in mesh.face_indices.iter().enumerate() {
-            if face.len() < 3 {
-                diagnostics.push(format!("IgnoredDegenerateFace:{face_index}"));
-                continue;
-            }
-            let positions = face
-                .iter()
-                .map(|index| mesh.positions.get(*index as usize).copied())
-                .collect::<Option<Vec<_>>>();
-            let Some(positions) = positions else {
-                return Err(CoreError::ThumbnailRender(format!(
-                    "X 面 {face_index} 引用了范围外的顶点"
-                )));
-            };
-            let material_index = mesh
-                .material_indices
-                .get(face_index)
-                .copied()
-                .map(|index| mesh.material_start_index + index as usize)
-                .unwrap_or(0);
-            let range_start = indices.len();
-            for triangle_corner in 1..face.len() - 1 {
-                let corners = [0, triangle_corner, triangle_corner + 1];
-                let a = Vec3::from_array(positions[corners[0]]);
-                let b = Vec3::from_array(positions[corners[1]]);
-                let c = Vec3::from_array(positions[corners[2]]);
-                let fallback_normal = (b - a).cross(c - a).normalize_or_zero();
-                for corner in corners {
-                    let position_index = face[corner] as usize;
-                    let normal_index = mesh
-                        .normal_face_indices
-                        .get(face_index)
-                        .and_then(|normal_face| normal_face.get(corner))
-                        .copied()
-                        .map(|index| index as usize)
-                        .unwrap_or(position_index);
-                    let normal = mesh
-                        .normals
-                        .get(normal_index)
-                        .copied()
-                        .map(Vec3::from_array)
-                        .filter(|normal| normal.is_finite() && normal.length_squared() > 1.0e-12)
-                        .unwrap_or(fallback_normal);
-                    let position = Vec3::from_array(mesh.positions[position_index]);
-                    if !position.is_finite() {
-                        return Err(CoreError::ThumbnailRender(format!(
-                            "X 顶点 {position_index} 包含无效坐标"
-                        )));
-                    }
-                    vertices.push(SkinnedVertex {
-                        position,
-                        normal,
-                        color: color_by_vertex
-                            .get(&position_index)
-                            .copied()
-                            .unwrap_or([1.0; 4]),
-                    });
-                    uvs.push(
-                        mesh.texture_coordinates
-                            .get(position_index)
-                            .copied()
-                            .unwrap_or([0.0, 0.0]),
-                    );
-                    let index = u32::try_from(vertices.len() - 1).map_err(|_| {
-                        CoreError::ThumbnailRender("X 网格顶点数超出 32 位范围".to_owned())
-                    })?;
-                    indices.push(index);
-                }
-            }
-            let range_count = indices.len() - range_start;
-            if range_count > 0 {
-                if let Some(previous) = material_ranges.last_mut().filter(|previous| {
-                    previous.material_index == material_index
-                        && previous.start + previous.count == range_start
-                }) {
-                    previous.count += range_count;
-                } else {
-                    material_ranges.push(MaterialRange {
-                        start: range_start,
-                        count: range_count,
-                        material_index,
-                    });
-                }
-            }
-        }
-    }
-    if indices.is_empty() {
-        return Err(CoreError::ThumbnailRender(
-            "X 场景没有可渲染的三角面".to_owned(),
-        ));
     }
     Ok(RenderInput {
         vertices,

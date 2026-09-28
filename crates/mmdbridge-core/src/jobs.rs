@@ -162,6 +162,7 @@ pub(crate) fn retry_job(library: &Library, job_id: &str) -> CoreResult<Value> {
     let Some((_asset_id, priority, status)) = job else {
         return Err(CoreError::JobNotFound(job_id.to_owned()));
     };
+    library.ensure_asset_visible(&_asset_id)?;
     if crate::operations::is_asset_operation_active(library, &_asset_id)? {
         return Err(CoreError::ThumbnailQueue(
             "该资产正在执行文件操作，暂时不能重试缩略图任务".to_owned(),
@@ -297,7 +298,7 @@ fn run_task(task: ThumbnailTask) {
             .is_some_and(|extension| asset.asset_type.supports_thumbnail_extension(extension))
         {
             return Err(CoreError::ThumbnailRender(
-                "当前队列渲染器支持 PMX 模型/场景、PMD 和文本 X 场景，以及配置了 Motion Preview Model 的 VMD/VPD 动作".to_owned(),
+                "当前队列渲染器支持 PMX 模型/场景、PMD 场景，以及配置了 Motion Preview Model 的 VMD/VPD 动作".to_owned(),
             ));
         }
         library.create_card_with_thumbnail_progress(&asset_id, &mut |status, progress| {

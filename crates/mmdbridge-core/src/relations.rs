@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use strsim::normalized_levenshtein;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::{
-    CoreResult, Library,
+    CoreError, CoreResult, Library,
     types::{AssetRelation, RelationRefreshReport},
 };
 
@@ -168,11 +168,13 @@ pub(crate) fn list(
 ) -> CoreResult<Vec<AssetRelation>> {
     let connection = library.connection()?;
     let mut statement = connection.prepare(
-        "SELECT id,relation_type,source_asset,target_asset,confidence,reason_json,confirmed
-         FROM relations
-         WHERE (?1 IS NULL OR source_asset=?1 OR target_asset=?1)
-           AND (?2 IS NULL OR relation_type=?2)
-         ORDER BY confirmed DESC,confidence DESC,relation_type,source_asset,target_asset
+        "SELECT r.id,r.relation_type,r.source_asset,r.target_asset,r.confidence,r.reason_json,r.confirmed,
+                source.primary_source,target.primary_source
+         FROM relations r JOIN assets source ON source.id=r.source_asset
+         JOIN assets target ON target.id=r.target_asset
+         WHERE (?1 IS NULL OR r.source_asset=?1 OR r.target_asset=?1)
+           AND (?2 IS NULL OR r.relation_type=?2)
+         ORDER BY r.confirmed DESC,r.confidence DESC,r.relation_type,r.source_asset,r.target_asset
          LIMIT ?3",
     )?;
     let rows = statement.query_map(
@@ -183,13 +185,19 @@ pub(crate) fn list(
         ],
         |row| {
             let reason_json: String = row.get(5)?;
+            let mut reason = serde_json::from_str::<Value>(&reason_json)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            reason.insert("source_path".to_owned(), json!(row.get::<_, String>(7)?));
+            reason.insert("target_path".to_owned(), json!(row.get::<_, String>(8)?));
             Ok(AssetRelation {
                 id: row.get(0)?,
                 relation_type: row.get(1)?,
                 source_asset: row.get(2)?,
                 target_asset: row.get(3)?,
                 confidence: row.get(4)?,
-                reason: serde_json::from_str(&reason_json).unwrap_or(Value::Null),
+                reason: Value::Object(reason),
                 confirmed: row.get::<_, i64>(6)? != 0,
             })
         },
@@ -198,17 +206,61 @@ pub(crate) fn list(
 }
 
 pub(crate) fn confirm(library: &Library, relation_id: &str) -> CoreResult<bool> {
-    let connection = library.connection()?;
-    Ok(connection.execute(
+    let mut connection = library.connection()?;
+    let transaction = connection.transaction()?;
+    let relation: Option<(String, String, String, bool, bool, bool)> = transaction
+        .query_row(
+            "SELECT r.relation_type,r.source_asset,r.target_asset,
+                    COALESCE(json_extract(target_metadata.value_json,'$.has_camera'),0)=1,
+                    COALESCE(json_extract(source_metadata.value_json,'$.has_bone_motion'),0)=1
+                      OR COALESCE(json_extract(source_metadata.value_json,'$.has_morph_motion'),0)=1,
+                    target.retired_format=0 AND instr(target.statuses_json,'MissingSource')=0
+             FROM relations r
+             JOIN assets source ON source.id=r.source_asset
+             JOIN assets target ON target.id=r.target_asset
+             LEFT JOIN metadata source_metadata ON source_metadata.asset_id=source.id AND source_metadata.key='parsed'
+             LEFT JOIN metadata target_metadata ON target_metadata.asset_id=target.id AND target_metadata.key='parsed'
+             WHERE r.id=?1",
+            [relation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((relation_type, source_id, _target_id, target_has_camera, source_has_motion, target_available)) = relation else {
+        return Ok(false);
+    };
+    if relation_type == CAMERA_RELATION {
+        if !target_has_camera || !source_has_motion || !target_available {
+            return Err(CoreError::AssetOperation(
+                "配套 Camera 关系已失效，请先重新扫描并刷新关系建议".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE relations SET confirmed=0
+             WHERE relation_type=?1 AND source_asset=?2 AND id!=?3",
+            params![CAMERA_RELATION, source_id, relation_id],
+        )?;
+    }
+    let changed = transaction.execute(
         "UPDATE relations SET confirmed=1 WHERE id=?1",
         [relation_id],
-    )? > 0)
+    )? > 0;
+    transaction.commit()?;
+    Ok(changed)
 }
 
 fn load_motion_assets(library: &Library) -> CoreResult<Vec<MotionAsset>> {
     let connection = library.connection()?;
     let mut statement = connection.prepare(
-        "SELECT a.id,a.root_id,a.primary_source,a.asset_directory,m.value_json
+        "SELECT a.id,a.root_id,a.primary_source,a.asset_directory,m.value_json,a.visibility
          FROM assets a LEFT JOIN metadata m ON m.asset_id=a.id AND m.key='parsed'
          WHERE a.asset_type='motion' AND instr(a.statuses_json,'MissingSource')=0
          ORDER BY a.root_id,a.primary_source COLLATE NOCASE",
@@ -216,6 +268,7 @@ fn load_motion_assets(library: &Library) -> CoreResult<Vec<MotionAsset>> {
     let rows = statement.query_map([], |row| {
         let source: String = row.get(2)?;
         let metadata_json: Option<String> = row.get(4)?;
+        let visibility: String = row.get(5)?;
         let metadata = metadata_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
@@ -232,10 +285,7 @@ fn load_motion_assets(library: &Library) -> CoreResult<Vec<MotionAsset>> {
                 .get("has_morph_motion")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-        let camera_only = metadata
-            .get("is_camera_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let camera_only = visibility == "auxiliary";
         let parsed = metadata.is_object()
             && metadata.get("error").is_none()
             && metadata.get("file_type").is_some();
@@ -540,26 +590,6 @@ fn version_info(stem: &str) -> VersionInfo {
         label,
         tokens: versions,
     }
-}
-
-pub(crate) fn asset_name_key(value: &str) -> String {
-    compact_name(&version_info(value).core_name)
-}
-
-pub(crate) fn asset_name_similarity(left: &str, right: &str) -> f64 {
-    let left_key = asset_name_key(left);
-    let right_key = asset_name_key(right);
-    if left_key.is_empty() || right_key.is_empty() {
-        return 0.0;
-    }
-    if left_key == right_key {
-        return 1.0;
-    }
-    let edit_similarity = normalized_levenshtein(&left_key, &right_key);
-    let left_terms = remove_channel_words(left);
-    let right_terms = remove_channel_words(right);
-    let token_similarity = token_overlap(&left_terms, &right_terms);
-    (0.82 * edit_similarity + 0.18 * token_similarity).clamp(0.0, 1.0)
 }
 
 fn is_version_word(word: &str) -> bool {

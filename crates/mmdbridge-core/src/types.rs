@@ -38,7 +38,6 @@ impl AssetType {
             Self::Scene => {
                 extension.eq_ignore_ascii_case("pmx")
                     || extension.eq_ignore_ascii_case("pmd")
-                    || extension.eq_ignore_ascii_case("x")
             }
         }
     }
@@ -52,7 +51,6 @@ impl AssetType {
             Self::Scene => {
                 extension.eq_ignore_ascii_case("pmx")
                     || extension.eq_ignore_ascii_case("pmd")
-                    || extension.eq_ignore_ascii_case("x")
             }
         }
     }
@@ -100,8 +98,41 @@ pub struct AssetCursor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetPage {
-    pub items: Vec<Asset>,
+    pub items: Vec<AssetListItem>,
     pub next_cursor: Option<AssetCursor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetDirectory {
+    pub path: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryPage {
+    pub path: String,
+    pub visible_count: i64,
+    pub child_directories: Vec<AssetDirectory>,
+    pub adjusted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetListItem {
+    pub id: String,
+    pub asset_type: AssetType,
+    pub root_id: String,
+    pub name: String,
+    pub primary_source: String,
+    pub asset_directory: String,
+    pub metadata: Value,
+    pub statuses: Vec<String>,
+    pub card_status: String,
+    pub has_thumbnail: bool,
+    pub is_favorite: bool,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,28 +174,6 @@ pub struct RelationRefreshReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AssetDuplicate {
-    pub id: String,
-    pub asset_a: String,
-    pub asset_a_name: String,
-    pub asset_a_path: String,
-    pub asset_b: String,
-    pub asset_b_name: String,
-    pub asset_b_path: String,
-    pub similarity: f64,
-    pub reason: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DuplicateRefreshReport {
-    pub exact_duplicate_groups: usize,
-    pub duplicate_pairs: usize,
-    pub possible_duplicate_pairs: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum FilterExpr {
     And {
@@ -192,6 +201,7 @@ pub enum FilterField {
     Tag,
     Favorite,
     CardStatus,
+    // Keep this variant so persisted filters from older schemas can be loaded and disabled safely.
     DuplicateStatus,
     RelationStatus,
     RecentlyAdded,
@@ -278,11 +288,39 @@ pub struct ScanState {
     pub status: String,
     pub queue_order: i64,
     pub full_check: bool,
+    pub scope: String,
     pub progress: f64,
     pub files_seen: usize,
     pub files_processed: usize,
     pub error: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanChangeKind {
+    File,
+    Subtree,
+    Removed,
+    Root,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanChange {
+    pub path: String,
+    pub kind: ScanChangeKind,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingScanChange {
+    pub path: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanWork {
+    pub generation: i64,
+    pub full_check: bool,
+    pub changes: Vec<PendingScanChange>,
 }
 
 #[derive(Debug)]

@@ -7,8 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mmdbridge_core::Library;
-use notify::{RecursiveMode, Watcher};
+use mmdbridge_core::{Library, ScanChange, ScanChangeKind};
+use notify::{RecursiveMode, Watcher, event::{EventKind, ModifyKind}};
 use tauri::{AppHandle, Emitter};
 
 const EVENT_DEBOUNCE: Duration = Duration::from_millis(900);
@@ -19,6 +19,11 @@ struct WatchedRoot {
     path: PathBuf,
     path_key: String,
     recursive: bool,
+}
+
+struct PendingRootChanges {
+    changed_at: Instant,
+    changes: Vec<ScanChange>,
 }
 
 pub fn start(app: AppHandle, library: Library) -> io::Result<()> {
@@ -42,20 +47,65 @@ fn watch_loop(
 ) {
     let mut watched = HashMap::<String, WatchedRoot>::new();
     let mut reported_watch_errors = HashSet::<String>::new();
-    let mut pending_roots = HashMap::<String, Instant>::new();
+    let mut queued_initial_scans = HashSet::<String>::new();
+    let mut reported_startup_scan_errors = HashSet::<String>::new();
+    let mut reported_change_scan_errors = HashSet::<String>::new();
+    let mut pending_roots = HashMap::<String, PendingRootChanges>::new();
     let mut last_root_sync = Instant::now() - ROOT_SYNC_INTERVAL;
 
     loop {
         match receiver.recv_timeout(EVENT_POLL_INTERVAL) {
             Ok(Ok(event)) => {
-                if event_relevant(&event) {
+                if !matches!(&event.kind, EventKind::Access(_)) {
                     let now = Instant::now();
-                    for root_id in roots_for_event(&event, &watched) {
-                        pending_roots.insert(root_id, now);
+                    let fallback = event.paths.is_empty()
+                        || matches!(&event.kind, EventKind::Any | EventKind::Other)
+                        || matches!(&event.kind, EventKind::Modify(ModifyKind::Name(_)));
+                    let affected_roots = if fallback {
+                        if event.paths.is_empty() { watched.keys().cloned().collect() }
+                        else { roots_for_event(&event, &watched) }
+                    } else {
+                        roots_for_event(&event, &watched)
+                    };
+                    for root_id in affected_roots {
+                        let changes = if fallback {
+                            vec![ScanChange { path: String::new(), kind: ScanChangeKind::Root }]
+                        } else {
+                            event.paths.iter().filter(|path| !is_mmdrcv_sidecar(path)).map(|path| {
+                                let kind = if matches!(&event.kind, EventKind::Remove(_)) {
+                                    ScanChangeKind::Removed
+                                } else if path.is_dir() {
+                                    ScanChangeKind::Subtree
+                                } else {
+                                    ScanChangeKind::File
+                                };
+                                ScanChange { path: path.to_string_lossy().into_owned(), kind }
+                            }).collect()
+                        };
+                        if !changes.is_empty() {
+                            let pending = pending_roots.entry(root_id).or_insert_with(|| PendingRootChanges {
+                                changed_at: now,
+                                changes: Vec::new(),
+                            });
+                            pending.changed_at = now;
+                            if changes.iter().any(|change| change.kind == ScanChangeKind::Root) {
+                                pending.changes.clear();
+                            }
+                            pending.changes.extend(changes);
+                        }
                     }
                 }
             }
-            Ok(Err(error)) => eprintln!("MMDbridgeLib 文件监视事件失败：{error}"),
+            Ok(Err(error)) => {
+                eprintln!("MMDbridgeLib 文件监视事件失败：{error}");
+                let now = Instant::now();
+                for root_id in watched.keys() {
+                    pending_roots.insert(root_id.clone(), PendingRootChanges {
+                        changed_at: now,
+                        changes: vec![ScanChange { path: String::new(), kind: ScanChangeKind::Root }],
+                    });
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -67,6 +117,8 @@ fn watch_loop(
                 &mut watcher,
                 &mut watched,
                 &mut reported_watch_errors,
+                &mut queued_initial_scans,
+                &mut reported_startup_scan_errors,
             ) {
                 Ok(()) => {
                     pending_roots.retain(|root_id, _| watched.contains_key(root_id));
@@ -79,16 +131,32 @@ fn watch_loop(
         let now = Instant::now();
         let ready = pending_roots
             .iter()
-            .filter_map(|(root_id, changed_at)| {
-                (now.duration_since(*changed_at) >= EVENT_DEBOUNCE).then(|| root_id.clone())
+            .filter_map(|(root_id, pending)| {
+                (now.duration_since(pending.changed_at) >= EVENT_DEBOUNCE).then(|| root_id.clone())
             })
             .collect::<Vec<_>>();
         for root_id in ready {
-            pending_roots.remove(&root_id);
-            match library.enqueue_scan(&root_id) {
-                Ok(_) => {}
+            let Some(pending) = pending_roots.remove(&root_id) else { continue; };
+            match library.enqueue_scan_changes(&root_id, &pending.changes) {
+                Ok(_) => { reported_change_scan_errors.remove(&root_id); }
                 Err(error) => {
-                    if !matches!(&error, mmdbridge_core::CoreError::RootDisabled(_)) {
+                    if matches!(
+                        &error,
+                        mmdbridge_core::CoreError::RootDisabled(_)
+                            | mmdbridge_core::CoreError::RootNotFound(_)
+                    ) {
+                        reported_change_scan_errors.remove(&root_id);
+                    } else {
+                        pending_roots.insert(root_id.clone(), PendingRootChanges {
+                            changed_at: Instant::now(),
+                            changes: pending.changes,
+                        });
+                    }
+                    if !matches!(
+                        &error,
+                        mmdbridge_core::CoreError::RootDisabled(_)
+                            | mmdbridge_core::CoreError::RootNotFound(_)
+                    ) && reported_change_scan_errors.insert(root_id.clone()) {
                         eprintln!("MMDbridgeLib 自动扫描失败：{error}");
                         let _ = app.emit(
                             "library-watch-error",
@@ -107,7 +175,10 @@ fn sync_roots(
     watcher: &mut notify::RecommendedWatcher,
     watched: &mut HashMap<String, WatchedRoot>,
     reported_errors: &mut HashSet<String>,
+    queued_initial_scans: &mut HashSet<String>,
+    reported_startup_scan_errors: &mut HashSet<String>,
 ) -> Result<(), String> {
+    library.resume_scan_jobs().map_err(|error| error.to_string())?;
     let roots = library.list_roots().map_err(|error| error.to_string())?;
     let desired = roots
         .into_iter()
@@ -135,19 +206,33 @@ fn sync_roots(
             }
         }
         reported_errors.remove(&root_id);
+        queued_initial_scans.remove(&root_id);
+        reported_startup_scan_errors.remove(&root_id);
     }
 
     for (root_id, root) in desired {
-        if watched.contains_key(&root_id) {
+        if watched.contains_key(&root_id) && Path::new(&root.path).is_dir() {
+            if !queued_initial_scans.contains(&root_id) {
+                match library.enqueue_scan(&root_id) {
+                    Ok(_) => {
+                        queued_initial_scans.insert(root_id.clone());
+                        reported_startup_scan_errors.remove(&root_id);
+                    }
+                    Err(error) if reported_startup_scan_errors.insert(root_id.clone()) => {
+                        eprintln!("MMDbridgeLib 启动发现排队失败（{root_id}）：{error}");
+                    }
+                    Err(_) => {}
+                }
+            }
             continue;
         }
+        if let Some(current) = watched.remove(&root_id) {
+            let _ = watcher.unwatch(&current.path);
+        }
         let path = PathBuf::from(&root.path);
-        let recursive_mode = if root.scan_recursive {
-            RecursiveMode::Recursive
-        } else {
-            RecursiveMode::NonRecursive
-        };
-        match watcher.watch(&path, recursive_mode) {
+        // Watch dependencies in nested folders too; Core still limits which primary files
+        // a non-recursive Root may discover.
+        match watcher.watch(&path, RecursiveMode::Recursive) {
             Ok(()) => {
                 watched.insert(
                     root_id.clone(),
@@ -157,7 +242,20 @@ fn sync_roots(
                         recursive: root.scan_recursive,
                     },
                 );
-                reported_errors.remove(&root_id);
+                let recovered = reported_errors.remove(&root_id);
+                if recovered { queued_initial_scans.remove(&root_id); }
+                if !queued_initial_scans.contains(&root_id) {
+                    match library.enqueue_scan(&root_id) {
+                        Ok(_) => {
+                            queued_initial_scans.insert(root_id.clone());
+                            reported_startup_scan_errors.remove(&root_id);
+                        }
+                        Err(error) if reported_startup_scan_errors.insert(root_id.clone()) => {
+                            eprintln!("MMDbridgeLib 启动发现排队失败（{root_id}）：{error}");
+                        }
+                        Err(_) => {}
+                    }
+                }
             }
             Err(error) => {
                 if reported_errors.insert(root_id.clone()) {
@@ -165,6 +263,18 @@ fn sync_roots(
                         "library-watch-error",
                         serde_json::json!({"rootId": root_id, "message": error.to_string()}),
                     );
+                }
+                if !queued_initial_scans.contains(&root_id) {
+                    match library.enqueue_scan(&root_id) {
+                        Ok(_) => {
+                            queued_initial_scans.insert(root_id.clone());
+                            reported_startup_scan_errors.remove(&root_id);
+                        }
+                        Err(scan_error) if reported_startup_scan_errors.insert(root_id.clone()) => {
+                            eprintln!("MMDbridgeLib 监视失败后的完整发现排队失败（{root_id}）：{scan_error}");
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -187,26 +297,6 @@ fn roots_for_event(
             })
         })
         .collect()
-}
-
-fn event_relevant(event: &notify::Event) -> bool {
-    event
-        .paths
-        .iter()
-        .any(|path| !is_mmdrcv_sidecar(path) && is_indexable_change(path))
-}
-
-fn is_indexable_change(path: &Path) -> bool {
-    if path.is_dir() || path.extension().is_none() {
-        return true;
-    }
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            ["pmx", "pmd", "vmd", "vpd", "x"]
-                .iter()
-                .any(|supported| extension.eq_ignore_ascii_case(supported))
-        })
 }
 
 fn is_mmdrcv_sidecar(path: &Path) -> bool {

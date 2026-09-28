@@ -210,6 +210,34 @@ fn compile_rule(
     values: &mut Vec<SqlValue>,
     next_parameter: &mut usize,
 ) -> CoreResult<String> {
+    if matches!(field, FilterField::NeedsReview) {
+        return Err(CoreError::InvalidFilter(
+            "needsReview is retired; recreate this saved filter without the removed condition"
+                .to_owned(),
+        ));
+    }
+    if matches!(field, FilterField::DuplicateStatus) {
+        return Err(CoreError::InvalidFilter(
+            "duplicateStatus is retired; recreate this saved filter without the removed condition"
+                .to_owned(),
+        ));
+    }
+    if matches!(field, FilterField::CameraOnly) {
+        return Err(CoreError::InvalidFilter(
+            "cameraOnly is retired; pure Camera files are hidden from asset collections"
+                .to_owned(),
+        ));
+    }
+    if matches!(field, FilterField::FileType)
+        && value.as_str().is_some_and(|value| {
+            value.trim().trim_start_matches('.').eq_ignore_ascii_case("x")
+        })
+    {
+        return Err(CoreError::InvalidFilter(
+            "fileType X is retired; recreate this saved filter without the removed condition"
+                .to_owned(),
+        ));
+    }
     if matches!(field, FilterField::Tag) {
         return compile_tag_rule(operator, value, values, next_parameter);
     }
@@ -330,20 +358,15 @@ fn field_sql(field: &FilterField) -> (String, ValueKind) {
             ValueKind::Boolean,
         ),
         FilterField::CardStatus => ("COALESCE(c.status,'CardMissing')".to_owned(), ValueKind::Text),
-        FilterField::DuplicateStatus => (
-            "EXISTS(SELECT 1 FROM duplicates d WHERE d.asset_a=a.id OR d.asset_b=a.id)".to_owned(),
-            ValueKind::Boolean,
-        ),
+        FilterField::DuplicateStatus | FilterField::CameraOnly | FilterField::NeedsReview => {
+            unreachable!("retired filter fields are rejected above")
+        }
         FilterField::RelationStatus => (
             "EXISTS(SELECT 1 FROM relations rel WHERE rel.source_asset=a.id OR rel.target_asset=a.id)".to_owned(),
             ValueKind::Boolean,
         ),
         FilterField::RecentlyAdded => ("a.created_at".to_owned(), ValueKind::Date),
         FilterField::RecentlyModified => ("a.updated_at".to_owned(), ValueKind::Date),
-        FilterField::NeedsReview => (
-            "instr(a.statuses_json,'NeedsReview') > 0".to_owned(),
-            ValueKind::Boolean,
-        ),
         FilterField::PolygonCount => ("json_extract(m.value_json,'$.polygon_count')".to_owned(), ValueKind::Number),
         FilterField::BoneCount => ("json_extract(m.value_json,'$.bone_count')".to_owned(), ValueKind::Number),
         FilterField::HasThumbnail => (
@@ -359,7 +382,6 @@ fn field_sql(field: &FilterField) -> (String, ValueKind) {
         FilterField::HasBoneMotion => (metadata_bool("has_bone_motion"), ValueKind::Boolean),
         FilterField::HasMorphMotion => (metadata_bool("has_morph_motion"), ValueKind::Boolean),
         FilterField::HasCamera => (metadata_bool("has_camera"), ValueKind::Boolean),
-        FilterField::CameraOnly => (metadata_bool("is_camera_only"), ValueKind::Boolean),
         FilterField::Pose => (metadata_bool("is_pose"), ValueKind::Boolean),
         FilterField::HasPairedCamera => (
             "EXISTS(SELECT 1 FROM relations rel WHERE rel.relation_type='MotionCameraPair' AND (rel.source_asset=a.id OR rel.target_asset=a.id))".to_owned(),
