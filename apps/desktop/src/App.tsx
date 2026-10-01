@@ -731,9 +731,14 @@ export default function App() {
     setSelected(null);
   }
 
+  function setFolderBrowserCollapse(progress: number) {
+    libraryScrollParent?.style.setProperty("--folder-collapse", String(progress));
+    setFolderBrowserCompact(progress >= 1);
+  }
+
   function enterFolderView(asset?: Asset) {
     pendingScrollRestore.current = null;
-    setFolderBrowserCompact((libraryScrollParent?.scrollTop ?? 0) > 160);
+    setFolderBrowserCollapse(Math.min(1, Math.max(0, (libraryScrollParent?.scrollTop ?? 0) / 240)));
     if (viewMode === "assets") {
       const snapshot: AssetViewState = {
         activeType, activeMotionFormat, activeRoot, activeDirectory, activeSavedFilterId,
@@ -1539,8 +1544,9 @@ export default function App() {
           <ActionIcon variant="subtle" size="sm" className="avatar" aria-label="设置" title="设置" onClick={() => void openSettings()}>⚙</ActionIcon>
         </header>
 
-        <div className="library-content" ref={setLibraryScrollParent} onScroll={(event) => {
+        <div className={`library-content${viewMode === "folders" ? " browsing-folders" : ""}`} ref={setLibraryScrollParent} onScroll={(event) => {
           const scroller = event.currentTarget;
+          if (viewMode === "folders") setFolderBrowserCollapse(Math.min(1, Math.max(0, scroller.scrollTop / 240)));
           if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 900) void loadNextAssetPage();
         }}>
           <div className="page-heading">
@@ -1576,7 +1582,7 @@ export default function App() {
                   {(activeDirectory ?? folderRoot.path).slice(folderRoot.path.length).split(/[\\/]/).filter(Boolean).map((part, index, all) => <Button key={`${part}-${index}`} onClick={() => { setActiveDirectory(`${folderRoot.path.replace(/[\\/]+$/, "")}\\${all.slice(0, index + 1).join("\\")}`); setSelected(null); }}>› {part}</Button>)}
                 </> : <strong>全部根目录</strong>}
               </div>
-              <div className="folder-view-actions"><Button className="folder-return-assets" aria-expanded={!folderBrowserCompact} onClick={() => setFolderBrowserCompact((compact) => !compact)}>{folderBrowserCompact ? "展开目录" : "收起目录"}</Button>
+              <div className="folder-view-actions"><Button className="folder-return-assets" aria-expanded={!folderBrowserCompact} onClick={() => setFolderBrowserCollapse(folderBrowserCompact ? 0 : 1)}>{folderBrowserCompact ? "展开目录" : "收起目录"}</Button>
                 {folderRoot && <span className="folder-visible-count">{indexedTotal.toLocaleString()} 项</span>}
                 <Checkbox className="recursive-scope-toggle" checked={recursiveScope} onChange={(event) => setRecursiveScope(event.target.checked)} label={<>包含子目录</>} />
                 <Button className="folder-return-assets" onClick={returnToAssetView}>返回资产</Button>
