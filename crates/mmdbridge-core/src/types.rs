@@ -209,6 +209,7 @@ pub enum FilterField {
     NeedsReview,
     PolygonCount,
     BoneCount,
+    SkeletonClass,
     HasThumbnail,
     HasCard,
     FrameCount,

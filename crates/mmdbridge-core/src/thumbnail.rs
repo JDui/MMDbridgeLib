@@ -1,15 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, mpsc},
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    time::{Duration, SystemTime},
 };
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use image::{ImageReader, imageops::FilterType};
 use mmd_anim_format::{
-    PmdParsedModel, PmxParsedModel, VpdParsedPose, import_pmx_runtime, parse_pmd_model,
+    PmdParsedModel, PmxParsedModel, VpdParsedPose, parse_pmd_model,
     parse_pmx_model, parse_vpd_pose,
 };
 use mmd_anim_runtime::{BoneIndex, ClipSample, MorphIndex, RuntimeInstance};
@@ -17,20 +17,63 @@ use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 
 use crate::thumbnail_concurrency::{self, ThumbnailStage};
+use crate::pmx_runtime::import_pmx_runtime_compatible;
 use crate::{CoreError, CoreResult};
 
 const WIDTH: u32 = 1024;
 const HEIGHT: u32 = 1024;
 const QUALITY: f32 = 50.0;
-pub(crate) const RENDERER_VERSION: &str = "0.5.0";
-pub(crate) const PREVIEW_SETTINGS_VERSION: &str = "front-minus-z-posed-frame-soft-matcap-v6";
-pub(crate) const SCENE_PREVIEW_SETTINGS_VERSION: &str = "scene-center-165cm-wide-camera-soft-matcap-v2";
+pub(crate) const RENDERER_VERSION: &str = "0.5.2";
+pub(crate) const PREVIEW_SETTINGS_VERSION: &str = "front-minus-z-down5-min-bounds-soft-matcap-v8";
+pub(crate) const SCENE_PREVIEW_SETTINGS_VERSION: &str = "scene-center-165cm-down5-wide-camera-soft-matcap-v4";
 const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TEXTURE_DIMENSION: u32 = 4096;
 const MAX_TEXTURE_DECODE_DIMENSION: u32 = 8192;
 const MAX_TEXTURE_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 
 static RENDERER: OnceLock<Result<GpuRenderer, String>> = OnceLock::new();
+
+struct PreviewTextureReferences {
+    size: u64,
+    modified: SystemTime,
+    paths: HashSet<String>,
+}
+static PREVIEW_TEXTURE_REFERENCES: OnceLock<Mutex<HashMap<PathBuf, PreviewTextureReferences>>> = OnceLock::new();
+
+pub(crate) fn remember_preview_textures(path: &Path, metadata: &std::fs::Metadata, paths: impl Iterator<Item = String>) {
+    let Ok(modified) = metadata.modified() else { return; };
+    let paths: HashSet<_> = paths.collect();
+    // Bound the cache to four small reference lists; never retain whole meshes/images.
+    if paths.len() > 4096 || paths.iter().map(String::len).sum::<usize>() > 1024 * 1024 { return; }
+    if let Ok(mut cache) = PREVIEW_TEXTURE_REFERENCES.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        if cache.len() >= 4 && !cache.contains_key(path) { cache.clear(); }
+        cache.insert(path.to_owned(), PreviewTextureReferences { size: metadata.len(), modified, paths });
+    }
+}
+
+pub(crate) fn check_preview_texture(path: &Path, texture_path: &str) -> CoreResult<()> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > MAX_SOURCE_BYTES { return Err(CoreError::ModelPreview("模型超过 512 MiB 预览上限".to_owned())); }
+    let cached = PREVIEW_TEXTURE_REFERENCES.get_or_init(|| Mutex::new(HashMap::new())).lock()
+        .map_err(|_| CoreError::LockPoisoned)?.get(path)
+        .filter(|entry| entry.size == metadata.len() && metadata.modified().ok() == Some(entry.modified))
+        .map(|entry| entry.paths.contains(texture_path));
+    let referenced = if let Some(referenced) = cached { referenced } else {
+        let paths: Vec<String> = if path.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("pmx")) {
+            let bytes = std::fs::read(path)?;
+            parse_pmx_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?
+                .materials.into_iter().map(|material| material.texture_path).collect()
+        } else {
+            scene_view_input(path)?.materials.into_iter().map(|material| material.texture_path).collect()
+        };
+        let referenced = paths.iter().any(|value| value == texture_path);
+        remember_preview_textures(path, &metadata, paths.into_iter());
+        referenced
+    };
+    if !referenced { return Err(CoreError::ModelPreview("贴图未被模型材质引用".to_owned())); }
+    Ok(())
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -148,6 +191,12 @@ struct RenderInput {
     diagnostics: Vec<String>,
 }
 
+struct RenderTargets {
+    target: wgpu::Texture,
+    depth: wgpu::Texture,
+    readback: wgpu::Buffer,
+}
+
 struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -157,6 +206,7 @@ struct GpuRenderer {
     material_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     toon_sampler: wgpu::Sampler,
+    targets: Mutex<Vec<RenderTargets>>,
 }
 
 pub(crate) fn render_file(path: &Path) -> CoreResult<GeneratedThumbnail> {
@@ -253,7 +303,9 @@ fn scene_view_input(path: &Path) -> CoreResult<RenderInput> {
 }
 
 pub(crate) fn scene_preview_file(path: &Path) -> CoreResult<Vec<u8>> {
+    let metadata = std::fs::metadata(path)?;
     let input = scene_view_input(path)?;
+    remember_preview_textures(path, &metadata, input.materials.iter().map(|material| material.texture_path.clone()));
     let vertex_count = input.vertices.len();
     let group_count = input.material_ranges.len();
     let texture_paths = input.material_ranges.iter().map(|group| {
@@ -294,10 +346,7 @@ pub(crate) fn scene_preview_file(path: &Path) -> CoreResult<Vec<u8>> {
 }
 
 pub(crate) fn scene_preview_texture_file(path: &Path, texture_path: &str) -> CoreResult<Option<(Vec<u8>, u8)>> {
-    let input = scene_view_input(path)?;
-    if !input.materials.iter().any(|material| material.texture_path == texture_path) {
-        return Err(CoreError::ModelPreview("贴图未被该场景引用".to_owned()));
-    }
+    check_preview_texture(path, texture_path)?;
     preview_texture_png(path, texture_path)
 }
 
@@ -396,7 +445,7 @@ pub(crate) fn render_vmd_motion_file_with_progress(
     let mut animation = vmd.import_result().clone();
     let model = parse_pmx_model(&model_bytes)
         .map_err(|error| CoreError::ThumbnailRender(format!("PMX 解析失败：{error}")))?;
-    let imported = import_pmx_runtime(&model_bytes)
+    let (imported, _) = import_pmx_runtime_compatible(&model_bytes)
         .map_err(|error| CoreError::ThumbnailRender(format!("PMX 骨架解析失败：{error}")))?;
     if imported.model.bone_count() != model.skeleton.bones.len() {
         return Err(CoreError::ThumbnailRender(format!(
@@ -456,10 +505,12 @@ pub(crate) fn render_vmd_motion_file_with_progress(
     animation
         .morph_keyframes
         .retain(|(_, frame, _)| *frame <= preview_frame);
-    let clip = mmd_anim_format::vmd::build_clip_from_import(
-        animation,
-        &|name| imported.bone_name_to_index.get(name).copied(),
-        &|name| imported.morph_name_to_index.get(name).copied(),
+    let clip = mmd_anim_format::vmd::build_pair_clip(
+        &animation,
+        &imported.bone_name_to_index,
+        &imported.morph_name_to_index,
+        &imported.ik_solver_bone_name_to_index,
+        imported.model.ik_solvers().len(),
     );
     let sample = clip.sample_at(preview_frame as f32);
     if !progress("Parsing", 0.20) {
@@ -875,8 +926,20 @@ fn skin_vertices(
         ));
     }
 
-    let imported = import_pmx_runtime(bytes)
+    let (imported, corrections) = import_pmx_runtime_compatible(bytes)
         .map_err(|error| CoreError::ThumbnailRender(format!("PMX 骨架解析失败：{error}")))?;
+    if corrections.zero_rotations > 0 {
+        diagnostics.push(format!("ZeroBoneMorphQuaternionAsIdentity:{}", corrections.zero_rotations));
+    }
+    if corrections.negative_group_references > 0 {
+        diagnostics.push(format!("IgnoredNegativeGroupMorphReference:{}", corrections.negative_group_references));
+    }
+    if corrections.self_group_references > 0 {
+        diagnostics.push(format!("IgnoredSelfGroupMorphReference:{}", corrections.self_group_references));
+    }
+    if corrections.self_bone_parents > 0 {
+        diagnostics.push(format!("SelfBoneParentAsRoot:{}", corrections.self_bone_parents));
+    }
     let mut runtime = RuntimeInstance::new(Arc::new(imported.model));
     runtime.evaluate_rest_pose();
     if let Some(vpd_pose) = vpd_pose {
@@ -1714,7 +1777,52 @@ impl GpuRenderer {
             material_layout,
             sampler,
             toon_sampler,
+            targets: Mutex::new(Vec::new()),
         })
+    }
+
+    // Reuse only unmapped, completed targets; concurrent renders take distinct slots.
+    fn create_targets(&self) -> RenderTargets {
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MMDbridge 1024 thumbnail target"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MMDbridge thumbnail depth target"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+
+        let unpadded_bytes_per_row = WIDTH * 4;
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(alignment) * alignment;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MMDbridge thumbnail readback"),
+            size: padded_bytes_per_row as u64 * HEIGHT as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        RenderTargets { target, depth, readback }
     }
 
     fn render(
@@ -1741,13 +1849,29 @@ impl GpuRenderer {
                 "网格顶点、UV 或索引数据不完整".to_owned(),
             ));
         }
-        let (minimum, maximum) = bounds(&source_vertices)?;
+        // Frame in camera space so the slight downward view also fits depth-heavy meshes.
+        let tilt = Quat::from_rotation_x(-5.0f32.to_radians());
+        let (minimum, maximum) = bounds(source_vertices.iter().map(|vertex| tilt * vertex.position))?;
+        let framing_bounds = framing_bounds.map(|(minimum, maximum)| {
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            for x in [minimum.x, maximum.x] {
+                for y in [minimum.y, maximum.y] {
+                    for z in [minimum.z, maximum.z] {
+                        let point = tilt * Vec3::new(x, y, z);
+                        lo = lo.min(point);
+                        hi = hi.max(point);
+                    }
+                }
+            }
+            (lo, hi)
+        });
         let mesh_half_extent = ((maximum.x - minimum.x)
             .max(maximum.y - minimum.y) * 0.5).max(0.001) / 0.92;
         let bone_half_extent = framing_bounds.map(|(bone_min, bone_max)| {
             ((bone_max.x - bone_min.x).max(bone_max.y - bone_min.y) * 0.5).max(0.001) / 0.82
         });
-        let (center, half_extent) = if bone_half_extent.is_some_and(|extent| extent >= mesh_half_extent) {
+        let (center, half_extent) = if bone_half_extent.is_some_and(|extent| extent < mesh_half_extent) {
             let (bone_min, bone_max) = framing_bounds.expect("bone extent requires bounds");
             diagnostics.push("CharacterBoneFraming".to_owned());
             ((bone_min + bone_max) * 0.5, bone_half_extent.unwrap())
@@ -1757,7 +1881,7 @@ impl GpuRenderer {
         };
         let depth_range = (maximum.z - minimum.z).max(0.001);
         let camera_view_projection = if scene_view {
-            diagnostics.push("SceneWideCamera:165cm:90deg".to_owned());
+            diagnostics.push("SceneWideCamera:165cm:90deg:Down5deg".to_owned());
             Some(scene_camera_view_projection(&source_vertices))
         } else {
             camera.and_then(|camera| {
@@ -1780,13 +1904,14 @@ impl GpuRenderer {
         }
         let mut gpu_vertices = Vec::with_capacity(source_vertices.len());
         for (index, vertex) in source_vertices.iter().enumerate() {
-            let depth = (vertex.position.z - minimum.z) / depth_range;
+            let projected = tilt * vertex.position;
+            let depth = (projected.z - minimum.z) / depth_range;
             let position = if let Some(view_projection) = camera_view_projection {
                 (view_projection * vertex.position.extend(1.0)).to_array()
             } else {
                 [
-                    (center.x - vertex.position.x) / half_extent,
-                    (vertex.position.y - center.y) / half_extent,
+                    (center.x - projected.x) / half_extent,
+                    (projected.y - center.y) / half_extent,
                     0.002 + depth.clamp(0.0, 1.0) * 0.996,
                     1.0,
                 ]
@@ -1832,46 +1957,15 @@ impl GpuRenderer {
             &texture_alpha,
             &mut diagnostics,
         )?;
-        let target = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MMDbridge 1024 thumbnail target"),
-            size: wgpu::Extent3d {
-                width: WIDTH,
-                height: HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let targets = self.targets.lock().map_err(|_| CoreError::LockPoisoned)?.pop();
+        let targets = targets.unwrap_or_else(|| self.create_targets());
+        let target = &targets.target;
+        let depth = &targets.depth;
+        let readback = &targets.readback;
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MMDbridge thumbnail depth target"),
-            size: wgpu::Extent3d {
-                width: WIDTH,
-                height: HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-
         let unpadded_bytes_per_row = WIDTH * 4;
-        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(alignment) * alignment;
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MMDbridge thumbnail readback"),
-            size: padded_bytes_per_row as u64 * HEIGHT as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
         let mut encoder = self
             .device
@@ -1977,7 +2071,9 @@ impl GpuRenderer {
         }
         drop(mapped);
         readback.unmap();
-        drop((texture_resources, target, depth));
+        drop(texture_resources);
+        // Failed readbacks are dropped instead of returning them to the pool.
+        self.targets.lock().map_err(|_| CoreError::LockPoisoned)?.push(targets);
 
         drop(render_permit);
         let _encode_permit =
@@ -2003,11 +2099,11 @@ impl GpuRenderer {
                 },
                 adapter: self.adapter_name.clone(),
                 front_axis: if scene_view {
-                    "scene center -Z, eye 165cm (+Y up)".to_owned()
+                    "scene center -Z, eye 165cm, down 5deg (+Y up)".to_owned()
                 } else if camera_view_projection.is_some() {
                     "VMD camera track (+Y up)".to_owned()
                 } else {
-                    "-Z (+Y up)".to_owned()
+                    "-Z, down 5deg (+Y up)".to_owned()
                 },
                 width: WIDTH,
                 height: HEIGHT,
@@ -2421,17 +2517,17 @@ fn build_draw_groups(
     Ok(groups)
 }
 
-fn bounds(vertices: &[SkinnedVertex]) -> CoreResult<(Vec3, Vec3)> {
+fn bounds(vertices: impl Iterator<Item = Vec3>) -> CoreResult<(Vec3, Vec3)> {
     let mut minimum = Vec3::splat(f32::INFINITY);
     let mut maximum = Vec3::splat(f32::NEG_INFINITY);
     for vertex in vertices {
-        if !vertex.position.is_finite() {
+        if !vertex.is_finite() {
             return Err(CoreError::ThumbnailRender(
                 "骨骼蒙皮后包含非有限顶点坐标".to_owned(),
             ));
         }
-        minimum = minimum.min(vertex.position);
-        maximum = maximum.max(vertex.position);
+        minimum = minimum.min(vertex);
+        maximum = maximum.max(vertex);
     }
     if !minimum.is_finite() || !maximum.is_finite() {
         return Err(CoreError::ThumbnailRender("模型边界框无效".to_owned()));
@@ -2485,7 +2581,7 @@ fn scene_camera_view_projection(vertices: &[SkinnedVertex]) -> Mat4 {
         .mul_add(1.25, 0.0)
         .min(100_000.0);
     Mat4::perspective_rh(90.0f32.to_radians(), WIDTH as f32 / HEIGHT as f32, 0.1, far)
-        * Mat4::look_at_rh(eye, eye - Vec3::Z, Vec3::Y)
+        * Mat4::look_at_rh(eye, eye + Vec3::new(0.0, -5.0f32.to_radians().sin(), -5.0f32.to_radians().cos()), Vec3::Y)
 }
 
 fn vmd_camera_view_projection(
@@ -2641,7 +2737,16 @@ fn load_texture(path: &Path, max_dimension: u32) -> Result<(TextureData, bool), 
     if metadata.len() > MAX_TEXTURE_SOURCE_BYTES {
         return Err("纹理文件超过 128 MiB 解码上限".to_owned());
     }
-    let mut reader = ImageReader::open(path).map_err(|error| format!("无法打开纹理：{error}"))?;
+    let mut reader = ImageReader::open(path).map_err(|error| format!("无法打开纹理：{error}"))?
+        .with_guessed_format().map_err(|error| format!("无法识别纹理：{error}"))?;
+    // BMP sphere maps use .sph/.spa; legacy PMX paths may have trailing spaces.
+    // TGA has no reliable magic signature, so retain a trimmed extension fallback.
+    if reader.format().is_none() {
+        if let Some(format) = path.extension().and_then(|extension| extension.to_str())
+            .and_then(|extension| image::ImageFormat::from_extension(extension.trim_end())) {
+            reader.set_format(format);
+        }
+    }
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_TEXTURE_DECODE_DIMENSION);
     limits.max_image_height = Some(MAX_TEXTURE_DECODE_DIMENSION);
@@ -2792,10 +2897,14 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @l
     let half_vector = normalize(light_direction + vec3<f32>(0.0, 0.0, 1.0));
     let specular_strength = pow(max(dot(normal, half_vector), 0.0), max(material.specular.a, 1.0));
     color += material.specular.rgb * specular_strength * diffuse_light;
-    // A restrained view-facing matcap fill keeps dark diffuse materials legible in small cards.
+    // Analytic matcap: broad light/shadow lobes and a soft rim, without another texture.
+    // Keep the model's diffuse, toon and sphere maps visible under the shading.
     let matcap_normal = normalize(normal + vec3<f32>(0.0, 0.0, 0.35));
-    let matcap_light = pow(max(dot(matcap_normal, normalize(vec3<f32>(-0.32, 0.55, 0.78))), 0.0), 3.0);
-    color += vec3<f32>(0.075, 0.09, 0.105) * matcap_light;
+    let matcap_light = pow(max(dot(matcap_normal, normalize(vec3<f32>(-0.32, 0.55, 0.78))), 0.0), 2.0);
+    let matcap_shadow = max(dot(matcap_normal, normalize(vec3<f32>(0.45, -0.55, 0.4))), 0.0);
+    let matcap_rim = pow(1.0 - abs(matcap_normal.z), 3.0);
+    color *= 0.88 + 0.20 * matcap_light - 0.12 * matcap_shadow;
+    color += vec3<f32>(0.09, 0.105, 0.12) * matcap_light + vec3<f32>(0.025, 0.035, 0.045) * matcap_rim;
     return vec4<f32>(color, texel.a * material.texture_factor.a * material.diffuse.a * vertex_alpha);
 }
 "#;

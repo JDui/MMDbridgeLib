@@ -5,10 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0e141b" />
     <title>MMDbridgeLib</title>
-    <style>html, body { background: #0e141b; color-scheme: dark; }</style>
+    <!-- Tauri assigns this style a per-document nonce during packaging. -->
+    <style id="library-style-nonce">html, body { background: #0e141b; color-scheme: dark; } .startup-fallback { min-height: 95vh; display: grid; place-content: center; text-align: center; font-family: sans-serif; color: #c4ddd6; }</style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root"><div class="startup-fallback"><h1>MMDbridgeLib</h1><p>正在启动资产库…</p></div></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

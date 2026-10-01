@@ -1,0 +1,86 @@
+/* Product layout and asset artwork stay local; Mantine owns control styling. */
+.app-shell { display: block; overflow: clip; }
+/* Decorative glow must not create a hidden scroll range during modal autofocus. */
+.app-shell::before { inset: -20% 0 auto; }
+.app-shell > .mantine-AppShell-navbar,
+.app-shell > .mantine-AppShell-aside { position: fixed; height: 100vh; }
+.app-shell > .mantine-AppShell-main {
+  position: relative;
+  z-index: 1;
+  height: 100vh;
+  min-height: 0;
+  padding: 0;
+  margin-left: var(--app-shell-navbar-offset);
+  margin-right: var(--app-shell-aside-offset);
+}
+/* These scroll panes must overflow vertically instead of shrinking their children. */
+.sidebar > *, .inspector > * { flex-shrink: 0; }
+.inspector-actions { grid-template-columns: minmax(0, 1fr); }
+.tag-chip-name { min-width: 0; overflow-wrap: anywhere; }
+.tag-chip .mantine-ActionIcon-root { flex-shrink: 0; }
+.asset-card-subline .mantine-Badge-root { flex-shrink: 0; }
+.asset-markers {
+  position: absolute; top: 8px; left: 8px; right: 8px; z-index: 3;
+  display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 4px;
+  pointer-events: none;
+}
+.asset-markers > span { position: static; max-width: 100%; overflow-wrap: anywhere; }
+.asset-card.bulk-selectable .asset-markers { right: 33px; }
+.library-type-tabs { align-items: center; gap: 4px; flex-wrap: wrap; padding-bottom: 7px; }
+.library-type-tabs .mantine-Tabs-tabLabel > span { margin-left: 5px; color: var(--text-3); font-size: 10px; }
+.library-type-tabs .tabs-spacer { flex: 1; }
+.tag-filter-select { flex: 1 1 280px; max-width: 540px; min-width: 200px; }
+.quick-filters > .mantine-NativeSelect-root { width: 150px; }
+.card-size-control .mantine-Slider-root { width: 100px; flex: 0 0 100px; }
+.search-box > .mantine-TextInput-root { flex: 1; min-width: 0; }
+.search-box .mantine-TextInput-input { border: 0; background: transparent; }
+.search-box > .mantine-ActionIcon-root { flex: 0 0 auto; }
+.topbar .avatar { display: inline-flex; }
+.view-controls { flex-wrap: wrap; }
+.filter-rule-row { flex-wrap: wrap; }
+.filter-rule-row > .mantine-NativeSelect-root:first-child { width: 155px; }
+.filter-rule-row > .mantine-NativeSelect-root:nth-child(2) { width: 112px; }
+.filter-rule-row > .mantine-TextInput-root,
+.filter-rule-row > .mantine-NativeSelect-root:nth-child(3) { flex: 1 1 150px; min-width: 115px; }
+.filter-builder-name > .mantine-TextInput-root { width: min(320px, 70%); }
+.filter-group-op > .mantine-NativeSelect-root { min-width: 155px; }
+.filter-builder-footer { flex-wrap: wrap; }
+.filter-not.mantine-Checkbox-root,
+.recursive-scope-toggle.mantine-Checkbox-root { display: block; }
+.library-modal { border: 1px solid var(--line-3); }
+.library-modal-title > div { display: flex; flex-direction: column; gap: 5px; }
+.library-modal-title span { font-size: 10px; color: var(--text-3); letter-spacing: .12em; }
+.library-modal-title strong { font-size: 17px; color: var(--text); }
+.library-modal .mantine-Modal-body {
+  width: auto;
+  max-height: none;
+  overflow: visible;
+  padding: 0 var(--mantine-spacing-md) var(--mantine-spacing-md);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  animation: none;
+}
+.add-root-path-row > .mantine-TextInput-root { flex: 1; min-width: 0; }
+.concurrency-controls > .mantine-NativeSelect-root { width: 100px; }
+.concurrency-controls > .mantine-TextInput-root { width: 70px; }
+.viewer-modal-content[data-modal-content] { padding: 0; overflow: hidden; max-width: calc(100vw - 40px); max-height: calc(100dvh - 40px); }
+.viewer-modal-content .mantine-Modal-body { width: 100%; max-width: 100%; border: 0; box-shadow: none; animation: none; }
+.mv-view-options > .mantine-Checkbox-root { margin: 8px 0; }
+.mv-view-options .mantine-Checkbox-label { color: var(--text-2); font-size: 11px; }
+.mv-slider .mantine-Slider-root { margin-top: 9px; }
+.motion-viewer-timeline > .mantine-Slider-root { flex: 1; min-width: 80px; }
+.motion-viewer-timeline > .mantine-NativeSelect-root { width: 112px; flex: 0 0 112px; }
+.model-viewer-header .mantine-Button-label { font-size: 11px; }
+.mv-select-label .mantine-NativeSelect-root { margin-top: 6px; }
+@media (max-width: 1100px) { .motion-viewer-timeline { flex-wrap: wrap; } }
+@media (max-width: 1250px) {
+  .topbar { display: grid; grid-template-columns: minmax(140px, 1fr) repeat(3, max-content) 29px; }
+  .topbar .breadcrumbs { grid-column: 1 / -1; max-width: 100%; }
+  .topbar .search-box { width: 100%; max-width: none; margin-left: 0; }
+  .page-heading { flex-direction: column; align-items: flex-start; gap: 12px; margin-bottom: 18px; }
+  .page-heading > div:first-child { width: 100%; min-width: 0; }
+  .page-heading h1 { overflow-wrap: anywhere; }
+  .view-controls { width: 100%; row-gap: 10px; }
+}

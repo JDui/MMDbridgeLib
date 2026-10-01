@@ -1,11 +1,12 @@
 use std::{path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock}, time::SystemTime};
 
-use mmd_anim_format::{import_pmx_runtime, vmd::{self, VmdParsedCameraFrame}};
+use mmd_anim_format::vmd::{self, VmdParsedCameraFrame};
 use mmd_anim_runtime::{AnimationClip, RuntimeInstance};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
 use crate::{AssetType, CoreError, CoreResult, Library};
+use crate::pmx_runtime::import_pmx_runtime_compatible;
 
 const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 static SESSION: OnceLock<Mutex<Option<MotionViewSession>>> = OnceLock::new();
@@ -68,12 +69,14 @@ fn create_session(motion_path: PathBuf, model_path: PathBuf, paired_path: Option
         .chain(own_camera.iter().map(|frame| frame.frame))
         .chain(paired_camera.iter().map(|frame| frame.frame))
         .max().unwrap_or(0);
-    let imported = import_pmx_runtime(&read_limited(&model_path)?)
+    let (imported, _) = import_pmx_runtime_compatible(&read_limited(&model_path)?)
         .map_err(|error| CoreError::ModelPreview(format!("PMX 骨架解析失败：{error}")))?;
-    let clip = vmd::build_clip_from_import(
-        animation,
-        &|name| imported.bone_name_to_index.get(name).copied(),
-        &|name| imported.morph_name_to_index.get(name).copied(),
+    let clip = vmd::build_pair_clip(
+        &animation,
+        &imported.bone_name_to_index,
+        &imported.morph_name_to_index,
+        &imported.ik_solver_bone_name_to_index,
+        imported.model.ik_solvers().len(),
     );
     let mut runtime = RuntimeInstance::new(Arc::new(imported.model));
     runtime.evaluate_rest_pose();

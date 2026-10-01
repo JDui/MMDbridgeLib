@@ -92,7 +92,9 @@ pub(crate) fn enqueue(library: &Library, root_id: &str, full_check: bool) -> Cor
                              THEN scan_state.progress ELSE 0 END,
                error_json=NULL,
                updated_at=excluded.updated_at,files_seen=0,files_processed=0,
-               queue_order=excluded.queue_order,full_check=MAX(scan_state.full_check,excluded.full_check),
+               queue_order=excluded.queue_order,
+               full_check=CASE WHEN scan_state.status IN ('Completed','Failed','Cancelled')
+                               THEN excluded.full_check ELSE MAX(scan_state.full_check,excluded.full_check) END,
                dirty_generation=scan_state.dirty_generation+1",
             params![root_id, now, queue_order, i64::from(full_check)],
         )?;
@@ -453,6 +455,32 @@ mod tests {
     use crate::AssetType;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    #[test]
+    fn ordinary_rescan_clears_previous_terminal_full_check() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-scan-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let library = Library::in_memory().unwrap();
+        let root = library.add_root(AssetType::Model, directory.to_str().unwrap(), None).unwrap();
+        for status in ["Completed", "Failed", "Cancelled"] {
+            library.connection().unwrap().execute(
+                "INSERT INTO scan_state(root_id,status,full_check,updated_at) VALUES (?1,?2,1,?3)
+                 ON CONFLICT(root_id) DO UPDATE SET status=excluded.status,full_check=1",
+                params![root.id, status, Utc::now().to_rfc3339()],
+            ).unwrap();
+            assert!(!library.enqueue_scan(&root.id).unwrap().full_check);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let state = library.list_scan_states().unwrap().into_iter().next().unwrap();
+                assert!(!state.full_check);
+                if state.status == "Completed" { break; }
+                assert_ne!(state.status, "Failed", "scan failed: {:?}", state.error);
+                assert!(Instant::now() < deadline, "rescan did not finish");
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn queued_empty_root_reports_completion() {

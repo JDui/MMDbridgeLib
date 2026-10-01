@@ -28,6 +28,21 @@ pub struct Library {
     visibility_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LibraryOpenProgress {
+    pub step: u8,
+    pub phase: String,
+    pub detail: String,
+    pub completed: Option<usize>,
+    pub total: Option<usize>,
+}
+
+impl LibraryOpenProgress {
+    fn stage(step: u8, phase: &str, detail: impl Into<String>) -> Self {
+        Self { step, phase: phase.to_owned(), detail: detail.into(), completed: None, total: None }
+    }
+}
+
 impl Library {
     pub(crate) fn visibility_guard(&self) -> CoreResult<MutexGuard<'_, ()>> {
         self.visibility_lock
@@ -47,12 +62,23 @@ impl Library {
     }
 
     pub fn open(path: impl AsRef<Path>) -> CoreResult<Self> {
+        Self::open_with_progress(path, &mut |_| {})
+    }
+
+    pub fn open_with_progress(
+        path: impl AsRef<Path>,
+        progress: &mut impl FnMut(LibraryOpenProgress),
+    ) -> CoreResult<Self> {
+        progress(LibraryOpenProgress::stage(1, "打开本地数据库", path.as_ref().display().to_string()));
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        progress(LibraryOpenProgress::stage(2, "准备数据库读写", "启用外键、WAL 日志；若其他程序占用写入锁，最多等待 5 秒"));
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        progress(LibraryOpenProgress::stage(3, "检查数据库容量", "读取页数并配置数据库与日志大小限制"));
         let page_size: i64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
         let max_pages = (Self::DATABASE_LIMIT_BYTES as i64) / page_size;
         let current_pages: i64 = connection.pragma_query_value(None, "page_count", |row| row.get(0))?;
@@ -69,8 +95,12 @@ impl Library {
             scan_lock: Arc::new(Mutex::new(())),
             visibility_lock: Arc::new(Mutex::new(())),
         };
-        library.initialize_schema()?;
+        progress(LibraryOpenProgress::stage(4, "检查与升级数据库结构", "读取已有数据库版本"));
+        library.initialize_schema_with_progress(progress)?;
+        progress(LibraryOpenProgress::stage(5, "读取缩略图设置", "读取解析、渲染、编码并发设置"));
         library.thumbnail_concurrency()?;
+        progress(LibraryOpenProgress::stage(6, "检查旧版缩略图", "读取渲染版本；此阶段不扫描模型目录或生成缩略图"));
+        library.mark_outdated_thumbnails_with_progress(progress)?;
         Ok(library)
     }
 
@@ -124,12 +154,21 @@ impl Library {
     }
 
     fn initialize_schema(&self) -> CoreResult<()> {
+        self.initialize_schema_with_progress(&mut |_| {})
+    }
+
+    fn initialize_schema_with_progress(&self, progress: &mut impl FnMut(LibraryOpenProgress)) -> CoreResult<()> {
         let connection = self
             .connection
             .lock()
             .map_err(|_| CoreError::LockPoisoned)?;
         let schema_version: i64 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if schema_version == 15 {
+            progress(LibraryOpenProgress::stage(4, "检查与升级数据库结构", "数据库版本 15，结构已是最新，无需升级"));
+            return Ok(());
+        }
+        progress(LibraryOpenProgress::stage(4, "检查与升级数据库结构", format!("当前版本 {schema_version}，准备基础表与目录计数")));
         connection.execute_batch(
             "BEGIN;
              CREATE TABLE IF NOT EXISTS roots (
@@ -308,6 +347,7 @@ impl Library {
             connection.execute("ALTER TABLE scan_state ADD COLUMN full_check INTEGER NOT NULL DEFAULT 0", [])?;
         }
         if schema_version < 11 {
+            progress(LibraryOpenProgress::stage(4, "升级数据库：停用 X 格式", "保留源文件，更新可见性与目录计数"));
             let asset_columns = connection
                 .prepare("PRAGMA table_info(assets)")?
                 .query_map([], |row| row.get::<_, String>(1))?
@@ -377,6 +417,7 @@ impl Library {
             connection.execute_batch(&migration)?;
         }
         if schema_version < 12 {
+            progress(LibraryOpenProgress::stage(4, "升级数据库：相机分类", "更新纯镜头资产的可见性与目录计数"));
             let asset_columns = connection
                 .prepare("PRAGMA table_info(assets)")?
                 .query_map([], |row| row.get::<_, String>(1))?
@@ -483,6 +524,7 @@ impl Library {
             connection.execute_batch(&migration)?;
         }
         if schema_version < 13 {
+            progress(LibraryOpenProgress::stage(4, "升级数据库：缩略图缓存", "补齐缓存版本、大小与修改时间字段"));
             let card_columns = connection
                 .prepare("PRAGMA table_info(cards)")?
                 .query_map([], |row| row.get::<_, String>(1))?
@@ -507,6 +549,7 @@ impl Library {
             connection.execute_batch(&migration)?;
         }
         if schema_version < 14 {
+            progress(LibraryOpenProgress::stage(4, "升级数据库：增量索引", "补齐文件路径索引与扫描恢复字段"));
             let scan_columns = connection
                 .prepare("PRAGMA table_info(scan_state)")?
                 .query_map([], |row| row.get::<_, String>(1))?
@@ -557,11 +600,16 @@ impl Library {
             };
             if !files.is_empty() {
                 let transaction = connection.unchecked_transaction()?;
-                for (id, path) in files {
+                let total = files.len();
+                for (index, (id, path)) in files.into_iter().enumerate() {
                     transaction.execute(
                         "UPDATE asset_files SET path_key=?2 WHERE id=?1",
                         params![id, scanner::scan_path_key(Path::new(&path))],
                     )?;
+                    if index % 100 == 0 || index + 1 == total {
+                        progress(LibraryOpenProgress { step: 4, phase: "升级数据库：文件路径索引".to_owned(),
+                            detail: "规范化已有文件路径，不读取源模型内容".to_owned(), completed: Some(index + 1), total: Some(total) });
+                    }
                 }
                 transaction.commit()?;
             }
@@ -580,6 +628,7 @@ impl Library {
             )?;
         }
         if schema_version < 15 {
+            progress(LibraryOpenProgress::stage(4, "升级数据库：资产状态", "清理旧版复核标记，保留解析失败状态"));
             connection.execute_batch(
                 "BEGIN;
                  UPDATE assets SET statuses_json = CASE
@@ -598,6 +647,122 @@ impl Library {
             )?;
         }
         Ok(())
+    }
+
+    pub fn mark_outdated_thumbnails(&self) -> CoreResult<usize> {
+        self.mark_outdated_thumbnails_with_progress(&mut |_| {})
+    }
+
+    fn mark_outdated_thumbnails_with_progress(&self, progress: &mut impl FnMut(LibraryOpenProgress)) -> CoreResult<usize> {
+        let revisions = [AssetType::Model, AssetType::Motion, AssetType::Scene]
+            .into_iter().map(|kind| Ok((kind, crate::cards::expected_renderer_revision(self, kind)?)))
+            .collect::<CoreResult<Vec<_>>>()?;
+        let mut connection = self.connection()?;
+        let total = connection.query_row("SELECT COUNT(*) FROM cards", [], |row| row.get::<_, i64>(0))? as usize;
+        let mut outdated = Vec::new();
+        progress(LibraryOpenProgress { step: 6, phase: "检查缩略图版本".to_owned(), detail: "只读取缓存版本，不重新渲染".to_owned(), completed: Some(0), total: Some(total) });
+        {
+            // One streaming pass, instead of three scans over large card manifests.
+            let mut statement = connection.prepare(
+                "SELECT c.asset_id,c.status,c.renderer_revision,a.asset_type,a.retired_format,a.visibility
+                 FROM cards c JOIN assets a ON a.id=c.asset_id")?;
+            let mut rows = statement.query([])?;
+            let mut checked = 0;
+            while let Some(row) = rows.next()? {
+                let status: String = row.get(1)?;
+                let revision: Option<String> = row.get(2)?;
+                let kind: String = row.get(3)?;
+                let retired: bool = row.get(4)?;
+                let visibility: String = row.get(5)?;
+                if status == "CardValid" && !retired && visibility == "normal" {
+                    if let Some((_, expected)) = revisions.iter().find(|(asset_type, _)| asset_type.as_str() == kind) {
+                        if revision.as_deref() != Some(expected.as_str()) {
+                            outdated.push((row.get::<_, String>(0)?, expected.clone()));
+                        }
+                    }
+                }
+                checked += 1;
+                if checked == 1 || checked % 100 == 0 || checked == total {
+                    progress(LibraryOpenProgress { step: 6, phase: "检查缩略图版本".to_owned(),
+                        detail: format!("已发现 {} 张旧版缩略图；不会自动重生成", outdated.len()), completed: Some(checked), total: Some(total) });
+                }
+            }
+        }
+        let mut changed = 0;
+        let total = outdated.len();
+        progress(LibraryOpenProgress { step: 6, phase: "标记旧版缩略图".to_owned(), detail: "只更新数据库状态，保留源素材与预览文件".to_owned(), completed: Some(0), total: Some(total) });
+        for (batch_index, batch) in outdated.chunks(100).enumerate() {
+            let transaction = connection.transaction()?;
+            for (asset_id, revision) in batch {
+                changed += transaction.execute(
+                    "UPDATE cards SET status='CardStale' WHERE asset_id=?1 AND status='CardValid'
+                     AND (renderer_revision IS NULL OR renderer_revision<>?2)
+                     AND EXISTS(SELECT 1 FROM assets WHERE id=?1 AND retired_format=0 AND visibility='normal')",
+                    params![asset_id, revision],
+                )?;
+            }
+            transaction.commit()?;
+            progress(LibraryOpenProgress { step: 6, phase: "标记旧版缩略图".to_owned(),
+                detail: format!("已标记 {changed} 张；进入 Library 后可在设置中一键重生成"),
+                completed: Some(((batch_index + 1) * 100).min(total)), total: Some(total) });
+        }
+        Ok(changed)
+    }
+
+    pub fn list_asset_page_with_filters(
+        &self, asset_type: Option<AssetType>, query: Option<&str>, root_id: Option<&str>,
+        favorite_only: bool, cursor: Option<&AssetCursor>, limit: usize, motion_format: Option<&str>,
+        directory_path: Option<&str>, recursive_scope: bool, filter_id: Option<&str>, expression: Option<FilterExpr>,
+    ) -> CoreResult<AssetPage> {
+        let mut children = Vec::new();
+        if let Some(id) = filter_id {
+            let json: Option<String> = self.connection()?.query_row(
+                "SELECT expression_json FROM saved_filters WHERE id=?1", [id], |row| row.get(0),
+            ).optional()?;
+            children.push(serde_json::from_str(&json.ok_or_else(|| CoreError::InvalidFilter(format!("saved filter was not found: {id}")))?)?);
+        }
+        if let Some(expression) = expression { children.push(expression); }
+        let expression = (!children.is_empty()).then_some(FilterExpr::And { children });
+        scanner::list_asset_page_filtered(self, asset_type, query, root_id, favorite_only, cursor,
+            limit, motion_format, directory_path, recursive_scope, expression.as_ref())
+    }
+
+    pub fn list_tag_names(&self) -> CoreResult<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT t.name FROM tags t JOIN asset_tags at ON at.tag_id=t.id
+             JOIN assets a ON a.id=at.asset_id WHERE a.retired_format=0 AND a.visibility='normal'
+             ORDER BY t.name COLLATE NOCASE")?;
+        statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn regenerate_thumbnail(&self, asset_id: &str) -> CoreResult<serde_json::Value> {
+        self.ensure_asset_visible(asset_id)?;
+        self.connection()?.execute("UPDATE cards SET status='CardStale' WHERE asset_id=?1", [asset_id])?;
+        self.enqueue_thumbnail(asset_id, 10)
+    }
+
+    pub fn regenerate_all_thumbnails(&self) -> CoreResult<serde_json::Value> {
+        let motion_ready = self.motion_preview_model()?.is_some();
+        let mut cursor = None;
+        let (mut queued, mut skipped, mut failed) = (0, 0, 0);
+        loop {
+            let page = self.list_asset_page(None, None, None, false, cursor.as_ref(), 500, None, None, true)?;
+            for asset in page.items {
+                if asset.statuses.iter().any(|status| matches!(status.as_str(), "ParseFailed" | "MissingSource" | "Unsupported"))
+                    || (asset.asset_type == AssetType::Motion && !motion_ready) {
+                    skipped += 1;
+                    continue;
+                }
+                match self.regenerate_thumbnail(&asset.id) {
+                    Ok(_) => queued += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() { break; }
+        }
+        Ok(serde_json::json!({"queued": queued, "skipped": skipped, "failed": failed}))
     }
 
     pub fn asset_counts(&self) -> CoreResult<serde_json::Value> {
@@ -1219,6 +1384,7 @@ impl Library {
         let bytes = std::fs::read(path)?;
         let parsed =
             parse_pmx_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?;
+        crate::thumbnail::remember_preview_textures(path, &metadata, parsed.materials.iter().map(|material| material.texture_path.clone()));
         let geometry = parsed.geometry;
         let vertex_count = geometry.positions.len() / 3;
         if geometry.positions.len() != vertex_count * 3
@@ -1386,15 +1552,7 @@ impl Library {
             || texture_path.len() > 4096 {
             return Err(CoreError::ModelPreview("invalid model or texture path".to_owned()));
         }
-        let model_bytes = std::fs::read(model_path)?;
-        if model_bytes.len() > 512 * 1024 * 1024 {
-            return Err(CoreError::ModelPreview("PMX file exceeds the 512 MiB preview limit".to_owned()));
-        }
-        let parsed = parse_pmx_model(&model_bytes)
-            .map_err(|error| CoreError::ModelPreview(error.to_string()))?;
-        if !parsed.materials.iter().any(|material| material.texture_path == texture_path) {
-            return Err(CoreError::ModelPreview("texture is not referenced by this PMX".to_owned()));
-        }
+        crate::thumbnail::check_preview_texture(model_path, texture_path)?;
         crate::thumbnail::preview_texture_png(model_path, texture_path)
     }
 
@@ -1793,6 +1951,16 @@ impl Library {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_asset_tag_overrides(&self, asset_id: &str) -> CoreResult<Vec<String>> {
+        self.ensure_asset_visible(asset_id)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT normalized_name FROM asset_tag_overrides WHERE asset_id=?1 ORDER BY normalized_name",
+        )?;
+        statement.query_map([asset_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     fn ensure_active_asset_in_transaction(
@@ -2221,6 +2389,77 @@ impl Library {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn library_browse_filters_and_thumbnail_revision() {
+        let library = Library::in_memory().unwrap();
+        let current_revision = crate::cards::expected_renderer_revision(&library, AssetType::Model).unwrap();
+        {
+            let connection = library.connection().unwrap();
+            connection.execute_batch(
+                "INSERT INTO roots(id,asset_type,path,path_key,display_name,created_at)
+                 VALUES ('r','model','C:/models','c:/models','Models','now');
+                 INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,created_at,updated_at,last_seen_at)
+                 VALUES ('a','r','model','A','C:/models/a.pmx','C:/models','now','now','now'),
+                        ('b','r','model','B','C:/models/b.pmx','C:/models','now','now','now'),
+                        ('c','r','model','C','C:/models/sub/c.pmx','C:/models/sub','now','now','now');
+                 INSERT INTO metadata(asset_id,key,value_json) VALUES
+                   ('a','parsed','{\"skeleton_class\":\"nonstandard\"}'),
+                   ('b','parsed','{\"skeleton_class\":\"standard\"}'),
+                   ('c','parsed','{\"skeleton_class\":\"nonstandard\"}');
+                 INSERT INTO tags(id,name,created_at) VALUES ('t1','blue','now'),('t2','dress','now');
+                 INSERT INTO asset_tags(asset_id,tag_id,source) VALUES
+                   ('a','t1','user'),('b','t1','user'),('b','t2','user'),('c','t1','user');
+                 INSERT INTO cards(asset_id,card_path,status,last_checked_at,renderer_revision,has_thumbnail)
+                   VALUES ('a','unused-a','CardValid','now','old',1);"
+            ).unwrap();
+            connection.execute("INSERT INTO cards(asset_id,card_path,status,last_checked_at,renderer_revision,has_thumbnail)
+                VALUES ('b','unused-b','CardValid','now',?1,1)", [current_revision]).unwrap();
+        }
+        let rule = |field, value: &str| FilterExpr::Rule { field, operator: crate::FilterOperator::Eq, value: serde_json::json!(value) };
+        let expression = FilterExpr::And { children: vec![rule(crate::FilterField::Tag, "blue"), rule(crate::FilterField::SkeletonClass, "nonstandard")] };
+        let first = library.list_asset_page_with_filters(Some(AssetType::Model), None, Some("r"), false, None, 1, None, None, true, None, Some(expression.clone())).unwrap();
+        assert_eq!(first.items[0].id, "a");
+        assert_eq!(first.items[0].metadata["skeleton_class"], "nonstandard");
+        let second = library.list_asset_page_with_filters(Some(AssetType::Model), None, Some("r"), false, first.next_cursor.as_ref(), 1, None, None, true, None, Some(expression.clone())).unwrap();
+        assert_eq!(second.items[0].id, "c");
+        assert!(second.next_cursor.is_none());
+        let saved = library.save_filter(None, "Dress", rule(crate::FilterField::Tag, "dress")).unwrap();
+        let filtered = library.list_asset_page_with_filters(None, None, None, false, None, 10, None, None, true, Some(&saved.id), Some(expression.clone())).unwrap();
+        assert!(filtered.items.is_empty());
+        let scoped = library.list_asset_page_with_filters(None, None, None, false, None, 10, None, Some("C:/models"), false, None, Some(expression)).unwrap();
+        assert_eq!(scoped.items.len(), 1);
+        let multi = FilterExpr::And { children: vec![rule(crate::FilterField::Tag, "blue"), rule(crate::FilterField::Tag, "dress")] };
+        let filtered = library.list_asset_page_with_filters(None, None, None, false, None, 10, None, None, true, None, Some(multi)).unwrap();
+        assert_eq!(filtered.items[0].id, "b");
+        assert_eq!(library.list_tag_names().unwrap(), ["blue", "dress"]);
+        let mut progress = Vec::new();
+        assert_eq!(library.mark_outdated_thumbnails_with_progress(&mut |item| progress.push(item)).unwrap(), 1);
+        assert!(progress.iter().any(|item| item.phase == "检查缩略图版本" && item.completed == Some(2) && item.total == Some(2)));
+        assert!(progress.iter().any(|item| item.phase == "标记旧版缩略图" && item.completed == Some(1) && item.total == Some(1)));
+        assert_eq!(library.mark_outdated_thumbnails().unwrap(), 0);
+        assert_eq!(library.inspect_asset("a").unwrap().card_status, "CardStale");
+        assert_eq!(library.inspect_asset("b").unwrap().card_status, "CardValid");
+    }
+
+    #[test]
+    #[ignore = "requires a disposable database copy at MMDBRIDGE_STARTUP_PROBE_DB"]
+    fn copied_database_startup_progress() {
+        let path = PathBuf::from(std::env::var_os("MMDBRIDGE_STARTUP_PROBE_DB").unwrap());
+        let started = std::time::Instant::now();
+        let mut steps = HashSet::new();
+        let mut checked_all = false;
+        let library = Library::open_with_progress(&path, &mut |progress| {
+            steps.insert(progress.step);
+            if progress.phase == "检查缩略图版本" && progress.completed == progress.total && progress.total.is_some() { checked_all = true; }
+            println!("{}ms {}/6 {} {:?}/{:?}: {}", started.elapsed().as_millis(), progress.step,
+                progress.phase, progress.completed, progress.total, progress.detail);
+        }).unwrap();
+        assert_eq!(steps.len(), 6);
+        assert!(checked_all);
+        assert!(!library.list_asset_page(None, None, None, false, None, 1, None, None, true).unwrap().items.is_empty());
+        println!("ready in {}ms", started.elapsed().as_millis());
+    }
 
     #[test]
     fn removes_legacy_review_markers_without_losing_failure_status() {

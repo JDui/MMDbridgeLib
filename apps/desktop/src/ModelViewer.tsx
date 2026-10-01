@@ -1,8 +1,10 @@
+import { ActionIcon, Button, Checkbox, NativeSelect, Slider, UnstyledButton, Modal } from "@mantine/core";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "./vendor/three.module.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
 import { toUiError } from "./uiError";
+import { loadViewerTextures, setMaterialAlpha, setMaterialCentre, sortTransparentMaterials } from "./viewerRendering";
 import "./model-viewer.css";
 
 type ViewerAsset = { id?: string; name: string; primarySource: string; assetType?: "model" | "scene" };
@@ -54,6 +56,7 @@ type ModelObjects = {
   pointColors: Float32Array;
   selectedPoint: any | null;
   doubleClick: (event: MouseEvent) => void;
+  colorKey?: string;
 };
 
 const WEIGHT_TYPES: WeightType[] = [
@@ -66,7 +69,7 @@ const WEIGHT_TYPES: WeightType[] = [
 const WARNING_COLOR = 0xf5a524;
 const NEUTRAL_COLOR = 0xc9ced6;
 
-export function parsePreview(buffer: ArrayBuffer): ParsedModel {
+export function parsePreview(buffer: ArrayBuffer, analyzeWeights = true): ParsedModel {
   if (buffer.byteLength < 24) throw new Error("模型预览数据不完整。");
   const view = new DataView(buffer);
   if (view.getUint8(0) !== 77 || view.getUint8(1) !== 77 || view.getUint8(2) !== 68 || view.getUint8(3) !== 86) {
@@ -123,7 +126,7 @@ export function parsePreview(buffer: ArrayBuffer): ParsedModel {
   }
   if (offset !== buffer.byteLength) throw new Error("模型预览数据包含无法识别的尾部内容。");
   if (!vertexCount || !indexCount) throw new Error("PMX 中没有可显示的三角网格。");
-  return { vertexCount, indices, vertices, groups, bones, stats: analyzeModel(vertices, vertexCount, bones) };
+  return { vertexCount, indices, vertices, groups, bones, stats: analyzeModel(vertices, analyzeWeights ? vertexCount : 0, bones) };
 }
 
 function analyzeModel(vertices: Float32Array, vertexCount: number, bones: BoneInfo[]): ViewerStats {
@@ -241,20 +244,22 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
     let renderer: any;
     let controls: any;
     let resizeObserver: ResizeObserver | null = null;
+    let disposeFlyControls = () => {};
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+      renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, logarithmicDepthBuffer: asset.assetType === "scene" });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
       renderer.setClearColor(0x10191f, 1);
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       element.appendChild(renderer.domElement);
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 4000);
+      sortTransparentMaterials(renderer, () => camera);
       camera.position.set(0, 10, -28);
       controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
       controls.dampingFactor = 0.08;
       controls.rotateSpeed = 0.85;
-      controls.zoomSpeed = 0.075;
+      controls.zoomSpeed = 0.45;
       controls.zoomToCursor = true;
       scene.add(new THREE.AmbientLight(0xffffff, 1.5));
       const keyLight = new THREE.DirectionalLight(0xffffff, 1.5);
@@ -279,7 +284,73 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       resizeObserver = new ResizeObserver(resize);
       resizeObserver.observe(element);
       resize();
+      const isScene = asset.assetType === "scene";
+      let flySpeed = 10;
+      const pressed = new Set<string>();
+      let dragPointer: number | null = null;
+      let lastX = 0, lastY = 0;
+      let yaw = 0, pitch = -5 * Math.PI / 180;
+      const orient = () => camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
+      if (isScene) {
+        controls.enabled = false;
+        renderer.domElement.tabIndex = 0;
+        const keyDown = (event: KeyboardEvent) => {
+          if (event.target instanceof HTMLElement && (event.target.matches("input,select,textarea,button") || event.target.isContentEditable)) return;
+          if (!["KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE"].includes(event.code)) return;
+          event.preventDefault(); pressed.add(event.code);
+        };
+        const keyUp = (event: KeyboardEvent) => { pressed.delete(event.code); };
+        const clear = () => { pressed.clear(); dragPointer = null; };
+        const down = (event: PointerEvent) => {
+          if (event.button !== 0 && event.button !== 2) return;
+          event.preventDefault(); renderer.domElement.focus({ preventScroll: true });
+          renderer.domElement.setPointerCapture(event.pointerId);
+          dragPointer = event.pointerId; lastX = event.clientX; lastY = event.clientY;
+        };
+        const move = (event: PointerEvent) => {
+          if (dragPointer !== event.pointerId) return;
+          yaw -= (event.clientX - lastX) * 0.003;
+          pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, pitch - (event.clientY - lastY) * 0.003));
+          lastX = event.clientX; lastY = event.clientY; orient();
+        };
+        const up = () => { dragPointer = null; };
+        const context = (event: Event) => event.preventDefault();
+        const wheel = (event: WheelEvent) => {
+          event.preventDefault();
+          const pixels = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? element.clientHeight : 1);
+          camera.fov = Math.max(20, Math.min(110, camera.fov * Math.exp(Math.max(-500, Math.min(500, pixels)) * 0.0015)));
+          camera.updateProjectionMatrix();
+        };
+        window.addEventListener("keydown", keyDown); window.addEventListener("keyup", keyUp); window.addEventListener("blur", clear);
+        renderer.domElement.addEventListener("pointerdown", down); renderer.domElement.addEventListener("pointermove", move);
+        renderer.domElement.addEventListener("pointerup", up); renderer.domElement.addEventListener("pointercancel", up); renderer.domElement.addEventListener("lostpointercapture", up);
+        renderer.domElement.addEventListener("contextmenu", context);
+        renderer.domElement.addEventListener("wheel", wheel, { passive: false });
+        disposeFlyControls = () => {
+          clear(); window.removeEventListener("keydown", keyDown); window.removeEventListener("keyup", keyUp); window.removeEventListener("blur", clear);
+          renderer.domElement.removeEventListener("pointerdown", down); renderer.domElement.removeEventListener("pointermove", move);
+          renderer.domElement.removeEventListener("pointerup", up); renderer.domElement.removeEventListener("pointercancel", up); renderer.domElement.removeEventListener("lostpointercapture", up);
+          renderer.domElement.removeEventListener("contextmenu", context);
+          renderer.domElement.removeEventListener("wheel", wheel);
+        };
+      }
       const frame = (geometry: any) => {
+        if (isScene) {
+          geometry.computeBoundingSphere();
+          camera.position.set(0, 165 / 8, 0);
+          yaw = 0; pitch = -5 * Math.PI / 180; orient();
+          camera.fov = 90; camera.near = 0.1;
+          const positions = geometry.attributes.position;
+          let far = 250;
+          for (let i = 0; i < positions.count; i++) {
+            const distance = Math.hypot(positions.getX(i), positions.getY(i) - 165 / 8, positions.getZ(i));
+            if (Number.isFinite(distance)) far = Math.max(far, distance);
+          }
+          camera.far = Math.min(far * 1.25, 100000); camera.updateProjectionMatrix();
+          flySpeed = Math.max(2, Math.min(100, geometry.boundingSphere.radius * 0.08));
+          grid.position.set(0, 0, 0); grid.scale.setScalar(Math.max(geometry.boundingSphere.radius / 30, 1));
+          return;
+        }
         geometry.computeBoundingSphere();
         const sphere = geometry.boundingSphere;
         const radius = Math.max(sphere.radius, 0.001);
@@ -289,7 +360,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
         camera.position.set(sphere.center.x, sphere.center.y + radius * 0.12, sphere.center.z - homeDistance);
         controls.minDistance = Math.max(radius * 0.35, 0.01);
         controls.maxDistance = radius * 4.5;
-        camera.near = Math.max(radius * 0.002, 0.001);
+        camera.near = Math.max(radius * 0.01, 0.001);
         camera.far = controls.maxDistance + radius * 4;
         camera.updateProjectionMatrix();
         controls.update();
@@ -298,8 +369,17 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       };
       const sceneHandles: SceneHandles = { renderer, scene, camera, controls, modelRoot, grid, resizeObserver, frame };
       handles.current = sceneHandles;
+      let previousTime = performance.now();
+      const movement = new THREE.Vector3();
       renderer.setAnimationLoop(() => {
-        controls.update();
+        const now = performance.now();
+        const delta = Math.min((now - previousTime) / 1000, 0.05); previousTime = now;
+        if (isScene) {
+          movement.set(Number(pressed.has("KeyD")) - Number(pressed.has("KeyA")), 0, Number(pressed.has("KeyS")) - Number(pressed.has("KeyW")));
+          movement.applyQuaternion(camera.quaternion);
+          movement.y += Number(pressed.has("KeyE")) - Number(pressed.has("KeyQ"));
+          if (movement.lengthSq()) camera.position.addScaledVector(movement.normalize(), flySpeed * delta);
+        } else controls.update();
         renderer.render(scene, camera);
       });
     } catch (reason) {
@@ -309,6 +389,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
     return () => {
       if (objects.current) disposeModelObjects(objects.current, handles.current);
       objects.current = null;
+      disposeFlyControls();
       resizeObserver?.disconnect();
       if (renderer) {
         renderer.setAnimationLoop(null);
@@ -318,7 +399,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       controls?.dispose();
       handles.current = null;
     };
-  }, []);
+  }, [asset.assetType]);
 
   useEffect(() => {
     let active = true;
@@ -439,13 +520,15 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
         boneLines.renderOrder = 998;
         scene.modelRoot.add(boneLines);
 
-        const wireGeometry = new THREE.WireframeGeometry(geometry);
+        // The expensive edge deduplication is only needed when wireframe is enabled.
+        const wireGeometry = new THREE.BufferGeometry();
         const wireframe = new THREE.LineSegments(wireGeometry, new THREE.LineBasicMaterial({
           color: 0x85979e,
           transparent: true,
           opacity: 0.12,
         }));
         wireframe.visible = false;
+        wireframe.material.depthWrite = false;
         wireframe.frustumCulled = false;
         scene.modelRoot.add(wireframe);
 
@@ -480,17 +563,17 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
         scene.frame(geometry);
         setModel(parsed);
         setLoading(false);
-        const texturePaths = [...new Set(parsed.groups.map((group) => group.texturePath).filter(Boolean))];
+        parsed.groups.forEach((group, index) => setMaterialCentre(materials[index], geometry, group.start, group.count));
+        const texturePaths = parsed.groups.map((group) => group.texturePath);
         void (async () => {
           const loader = new THREE.TextureLoader();
-          for (const texturePath of texturePaths) {
-            if (!active) break;
+          await loadViewerTextures(texturePaths, () => active, async (texturePath) => {
             try {
               const bytes = await invoke<ArrayBuffer>(asset.assetType === "scene" ? "scene_preview_texture" : "model_preview_texture_file",
                 asset.assetType === "scene" ? { assetId: asset.id, texturePath } : { modelPath: asset.primarySource, texturePath });
-              if (!active || bytes.byteLength <= 1) continue;
+              if (!active || bytes.byteLength <= 1) return;
               const alphaMode = new Uint8Array(bytes)[0];
-              const url = URL.createObjectURL(new Blob([bytes.slice(1)], { type: "image/png" }));
+              const url = URL.createObjectURL(new Blob([new Uint8Array(bytes, 1)], { type: "image/png" }));
               try {
                 const texture = await loader.loadAsync(url);
                 texture.colorSpace = THREE.SRGBColorSpace;
@@ -504,7 +587,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
                 } else texture.dispose();
               } finally { URL.revokeObjectURL(url); }
             } catch (reason) { console.warn("模型贴图无法读取", texturePath, reason); }
-          }
+          });
         })();
       })
       .catch((reason: unknown) => {
@@ -524,36 +607,40 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
     const current = objects.current;
     if (!current) return;
     const { data, mesh, pointCloud, sdefCenters, bonePoints, boneLines, warningPoints, wireframe, materials } = current;
-    for (let index = 0; index < data.vertexCount; index += 1) {
-      const base = index * 26;
-      const modeCode = Math.max(0, Math.min(4, Math.round(data.vertices[base + 16])));
-      let rgb: [number, number, number];
-      if (mode === "materials" || mode === "texture") {
-        const color = new THREE.Color(WEIGHT_TYPES[modeCode].color);
-        rgb = [color.r, color.g, color.b];
-      } else if (mode === "anomaly" || (mode === "bone" && selectedBone < 0)) {
-        rgb = new THREE.Color(NEUTRAL_COLOR).toArray();
-      } else if (mode === "bone") {
-        let weight = 0;
-        for (let slot = 0; slot < 4; slot += 1) {
-          if (Math.round(data.vertices[base + 8 + slot]) === selectedBone) weight += data.vertices[base + 12 + slot];
+    const colorKey = `${mode}:${selectedBone}:${[...visibleTypes].sort().join(",")}`;
+    if (current.colorKey !== colorKey) {
+      const typeColors = WEIGHT_TYPES.map((type) => new THREE.Color(type.color).toArray());
+      const neutral = new THREE.Color(NEUTRAL_COLOR).toArray();
+      for (let index = 0; index < data.vertexCount; index += 1) {
+        const base = index * 26;
+        const modeCode = Math.max(0, Math.min(4, Math.round(data.vertices[base + 16])));
+        let rgb: [number, number, number];
+        if (mode === "materials" || mode === "texture") {
+          rgb = typeColors[modeCode];
+        } else if (mode === "anomaly" || (mode === "bone" && selectedBone < 0)) {
+          rgb = neutral;
+        } else if (mode === "bone") {
+          let weight = 0;
+          for (let slot = 0; slot < 4; slot += 1) {
+            if (Math.round(data.vertices[base + 8 + slot]) === selectedBone) weight += data.vertices[base + 12 + slot];
+          }
+          const offset = index * 3;
+          setHeatColor(current.vertexColors, offset, weight);
+          current.pointColors[offset] = current.vertexColors[offset];
+          current.pointColors[offset + 1] = current.vertexColors[offset + 1];
+          current.pointColors[offset + 2] = current.vertexColors[offset + 2];
+          continue;
+        } else {
+          rgb = visibleTypes.has(modeCode) ? typeColors[modeCode] : neutral;
         }
         const offset = index * 3;
-        setHeatColor(current.vertexColors, offset, weight);
-        current.pointColors[offset] = current.vertexColors[offset];
-        current.pointColors[offset + 1] = current.vertexColors[offset + 1];
-        current.pointColors[offset + 2] = current.vertexColors[offset + 2];
-        continue;
-      } else {
-        const color = new THREE.Color(visibleTypes.has(modeCode) ? WEIGHT_TYPES[modeCode].color : NEUTRAL_COLOR);
-        rgb = [color.r, color.g, color.b];
+        current.vertexColors[offset] = rgb[0]; current.vertexColors[offset + 1] = rgb[1]; current.vertexColors[offset + 2] = rgb[2];
+        current.pointColors[offset] = rgb[0]; current.pointColors[offset + 1] = rgb[1]; current.pointColors[offset + 2] = rgb[2];
       }
-      const offset = index * 3;
-      current.vertexColors[offset] = rgb[0]; current.vertexColors[offset + 1] = rgb[1]; current.vertexColors[offset + 2] = rgb[2];
-      current.pointColors[offset] = rgb[0]; current.pointColors[offset + 1] = rgb[1]; current.pointColors[offset + 2] = rgb[2];
+      mesh.geometry.getAttribute("color").needsUpdate = true;
+      pointCloud.geometry.getAttribute("color").needsUpdate = true;
+      current.colorKey = colorKey;
     }
-    mesh.geometry.getAttribute("color").needsUpdate = true;
-    pointCloud.geometry.getAttribute("color").needsUpdate = true;
     const pointMode = showPoints;
     mesh.visible = !pointMode || showShadedMesh;
     pointCloud.visible = pointMode;
@@ -564,6 +651,10 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
     sdefCenters.visible = showSdefCenters && visibleTypes.has(3) && mode !== "anomaly";
     bonePoints.visible = showBones;
     boneLines.visible = showBones;
+    if (showWireframe && !wireframe.geometry.getAttribute("position")) {
+      wireframe.geometry.dispose();
+      wireframe.geometry = new THREE.WireframeGeometry(mesh.geometry);
+    }
     wireframe.visible = showWireframe;
     for (let index = 0; index < materials.length; index += 1) {
       const material = materials[index];
@@ -581,13 +672,10 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       const textureRecord = mode === "texture" ? current.textures.get(group?.texturePath) : undefined;
       const texture = textureRecord?.texture ?? null;
       if (material.map !== texture) { material.map = texture; material.needsUpdate = true; }
-      const transparent = (mode === "texture" || mode === "materials") &&
-        ((group?.color[3] ?? 1) < 0.999 || (mode === "texture" && textureRecord?.alphaMode === 2));
-      if (material.transparent !== transparent) { material.transparent = transparent; material.needsUpdate = true; }
-      material.depthWrite = !transparent;
-      const alphaTest = textureRecord?.alphaMode === 1 ? 0.5 : 0;
-      if (material.alphaTest !== alphaTest) { material.alphaTest = alphaTest; material.needsUpdate = true; }
-      material.opacity = (mode === "texture" || mode === "materials") ? group?.color[3] ?? 1 : 1;
+      setMaterialAlpha(material, (mode === "texture" || mode === "materials") ? group?.color[3] ?? 1 : 1, textureRecord?.alphaMode ?? 0);
+      material.polygonOffset = showWireframe;
+      material.polygonOffsetFactor = 1;
+      material.polygonOffsetUnits = 1;
     }
     if (selectedVertex !== null && selectedVertex >= 0 && selectedVertex < data.vertexCount) {
       const offset = selectedVertex * 26;
@@ -610,11 +698,6 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
     }
   }, [mode, texturesLoaded, visibleTypes, selectedBone, selectedVertex, showPoints, showShadedMesh, showBones, showWireframe, showSdefCenters, pointSize, model]);
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
 
   const selectedVertexDetails = model && selectedVertex !== null ? (() => {
     const base = selectedVertex * 26;
@@ -676,34 +759,31 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
     anomaly: "高亮权重和偏离 1、零半径 SDEF 和无效多骨骼绑定。",
   };
 
-  return <div className="model-viewer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className={`model-viewer-window ${asset.assetType === "scene" ? "scene-viewer" : ""}`} role="dialog" aria-modal="true" aria-label={`${asset.name} 3D 查看器`}>
-      <header className="model-viewer-header">
+  return <Modal.Root opened onClose={onClose} withinPortal={false} centered xOffset={20} yOffset={20} size={1120} zIndex={250} padding={0} transitionProps={{ duration: 150 }}><Modal.Overlay backgroundOpacity={0.72} blur={6} /><Modal.Content className="viewer-modal-content" aria-label={`${asset.name} 3D 查看器`}><Modal.Body p={0} className={`model-viewer-window ${asset.assetType === "scene" ? "scene-viewer" : ""}`}><header className="model-viewer-header">
         <div><span className="model-viewer-eyebrow">{asset.assetType === "scene" ? "SCENE 3D VIEWER" : "PMX MODEL & WEIGHT INSPECTOR"}</span><h2 title={asset.name}>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div>
-        <div className="model-viewer-header-actions"><button disabled={!model} title="导出当前视角 PNG" onClick={exportPng}>导出截图</button><button className="model-viewer-close" aria-label="关闭 3D 预览" onClick={onClose}>×</button></div>
-      </header>
-      <div className="model-viewer-content">
+        <div className="model-viewer-header-actions"><Button disabled={!model} title="导出当前视角 PNG" onClick={exportPng}>导出截图</Button><ActionIcon variant="subtle" size="sm" className="model-viewer-close" aria-label="关闭 3D 预览" onClick={onClose}>×</ActionIcon></div>
+      </header><div className="model-viewer-content">
         <aside className="model-viewer-sidebar">
           <div className="model-viewer-sidebar-scroll">
             <section className="mv-section">
               <h3>查看模式</h3>
               <div className="mv-mode-grid">
-                {([ ["texture", "材质贴图"], ["types", "权重类型"], ["materials", "材质颜色"], ["bone", "骨骼权重"], ["anomaly", "异常顶点"] ] as Array<[ViewerMode, string]>).map(([value, label]) => <button key={value} className={mode === value ? "active" : ""} onClick={() => setMode(value)}>{label}</button>)}
+                {([ ["texture", "材质贴图"], ["types", "权重类型"], ["materials", "材质颜色"], ["bone", "骨骼权重"], ["anomaly", "异常顶点"] ] as Array<[ViewerMode, string]>).map(([value, label]) => <Button key={value} variant={mode === value ? "filled" : "light"} aria-pressed={mode === value} onClick={() => setMode(value)}>{label}</Button>)}
               </div>
               <p className="mv-hint">{modeHelp[mode]}</p>
               {mode === "texture" && model && <p className="mv-hint">已加载贴图 {texturesLoaded} / {new Set(model.groups.map((group) => group.texturePath).filter(Boolean)).size}</p>}
-              {mode === "bone" && <label className="mv-select-label">目标骨骼<select value={selectedBone} onChange={(event) => setSelectedBone(Number(event.target.value))} disabled={!model?.bones.length}>{model?.bones.map((bone, index) => <option value={index} key={`${index}-${bone.name}`}>{bone.name} ({index})</option>)}</select></label>}
+              {mode === "bone" && <label className="mv-select-label">目标骨骼<NativeSelect value={selectedBone} onChange={(event) => setSelectedBone(Number(event.target.value))} disabled={!model?.bones.length}>{model?.bones.map((bone, index) => <option value={index} key={`${index}-${bone.name}`}>{bone.name} ({index})</option>)}</NativeSelect></label>}
             </section>
             <section className="mv-section">
               <h3>权重类型 <span>点击图例切换高亮</span></h3>
               <div className="mv-weight-shortcuts" role="group" aria-label="快速筛选权重类型">
-                <button disabled={!model?.stats.counts[3]} onClick={() => showOnlyWeightType(3)}>只看 SDEF</button>
-                <button disabled={!model?.stats.counts[4]} onClick={() => showOnlyWeightType(4)}>只看 QDEF</button>
-                <button disabled={visibleTypes.size === WEIGHT_TYPES.length} onClick={showAllWeightTypes}>全部类型</button>
+                <Button disabled={!model?.stats.counts[3]} onClick={() => showOnlyWeightType(3)}>只看 SDEF</Button>
+                <Button disabled={!model?.stats.counts[4]} onClick={() => showOnlyWeightType(4)}>只看 QDEF</Button>
+                <Button disabled={visibleTypes.size === WEIGHT_TYPES.length} onClick={showAllWeightTypes}>全部类型</Button>
               </div>
-              <div className="mv-weight-legend">{WEIGHT_TYPES.map((type) => <button key={type.code} className={!visibleTypes.has(type.code) ? "muted" : ""} onClick={() => toggleWeightType(type.code)} title={type.description}>
+              <div className="mv-weight-legend">{WEIGHT_TYPES.map((type) => <UnstyledButton key={type.code} className={!visibleTypes.has(type.code) ? "muted" : ""} onClick={() => toggleWeightType(type.code)} title={type.description}>
                 <i style={{ backgroundColor: `#${type.color.toString(16).padStart(6, "0")}` }} /><span>{type.label}</span><b>{(model?.stats.counts[type.code] ?? 0).toLocaleString()}</b>
-              </button>)}</div>
+              </UnstyledButton>)}</div>
             </section>
             {model && <section className="mv-section">
               <h3>模型统计</h3>
@@ -720,23 +800,23 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
             </section>}
             {model && model.stats.sdefByBone.length > 0 && <section className="mv-section">
               <h3>SDEF 热点骨骼</h3>
-              <div className="mv-bone-hotlist">{model.stats.sdefByBone.map((bone) => <button key={bone.index} onClick={() => { setMode("bone"); setSelectedBone(bone.index); }} title="查看该骨骼的权重热图"><span>{bone.name}</span><i><b style={{ width: `${Math.max(4, bone.count * 100 / model.stats.sdefByBone[0].count)}%` }} /></i><strong>{bone.count.toLocaleString()}</strong></button>)}</div>
+              <div className="mv-bone-hotlist">{model.stats.sdefByBone.map((bone) => <UnstyledButton key={bone.index} onClick={() => { setMode("bone"); setSelectedBone(bone.index); }} title="查看该骨骼的权重热图"><span>{bone.name}</span><i><b style={{ width: `${Math.max(4, bone.count * 100 / model.stats.sdefByBone[0].count)}%` }} /></i><strong>{bone.count.toLocaleString()}</strong></UnstyledButton>)}</div>
             </section>}
             {model && model.stats.qdefByBone.length > 0 && <section className="mv-section">
               <h3>QDEF 主影响骨骼 <span>按顶点主权重统计</span></h3>
-              <div className="mv-bone-hotlist">{model.stats.qdefByBone.map((bone) => <button key={bone.index} onClick={() => { setMode("bone"); setSelectedBone(bone.index); }} title="查看该骨骼的权重热图，包含 QDEF 顶点"><span>{bone.name}</span><i><b style={{ width: `${Math.max(4, bone.count * 100 / model.stats.qdefByBone[0].count)}%` }} /></i><strong>{bone.count.toLocaleString()}</strong></button>)}</div>
+              <div className="mv-bone-hotlist">{model.stats.qdefByBone.map((bone) => <UnstyledButton key={bone.index} onClick={() => { setMode("bone"); setSelectedBone(bone.index); }} title="查看该骨骼的权重热图，包含 QDEF 顶点"><span>{bone.name}</span><i><b style={{ width: `${Math.max(4, bone.count * 100 / model.stats.qdefByBone[0].count)}%` }} /></i><strong>{bone.count.toLocaleString()}</strong></UnstyledButton>)}</div>
             </section>}
             <section className="mv-section mv-view-options">
               <h3>显示选项</h3>
-              <label><input type="checkbox" checked={showPoints} onChange={(event) => setShowPoints(event.target.checked)} /> 顶点点云叠加</label>
-              {showPoints && <label className="mv-indent"><input type="checkbox" checked={showShadedMesh} onChange={(event) => setShowShadedMesh(event.target.checked)} /> 保留素模底色</label>}
-              <label><input type="checkbox" checked={showBones} onChange={(event) => setShowBones(event.target.checked)} /> 显示骨骼与连线</label>
-              <label><input type="checkbox" checked={showWireframe} onChange={(event) => setShowWireframe(event.target.checked)} /> 线框叠加</label>
-              <label><input type="checkbox" checked={showSdefCenters} onChange={(event) => setShowSdefCenters(event.target.checked)} /> 显示 SDEF 球心 C</label>
-              <label className="mv-slider">点云尺寸 <b>{pointSize.toFixed(1)}</b><input type="range" min="1" max="8" step="0.5" value={pointSize} onChange={(event) => setPointSize(Number(event.target.value))} /></label>
+              <Checkbox  checked={showPoints} onChange={(event) => setShowPoints(event.target.checked)} label={<>顶点点云叠加</>} />
+              {showPoints && <Checkbox className="mv-indent" checked={showShadedMesh} onChange={(event) => setShowShadedMesh(event.target.checked)} label={<>保留素模底色</>} />}
+              <Checkbox  checked={showBones} onChange={(event) => setShowBones(event.target.checked)} label={<>显示骨骼与连线</>} />
+              <Checkbox  checked={showWireframe} onChange={(event) => setShowWireframe(event.target.checked)} label={<>线框叠加</>} />
+              <Checkbox  checked={showSdefCenters} onChange={(event) => setShowSdefCenters(event.target.checked)} label={<>显示 SDEF 球心 C</>} />
+              <div className="mv-slider">点云尺寸 <b>{pointSize.toFixed(1)}</b><Slider thumbLabel="点云尺寸" min={1} max={8} step={0.5} value={pointSize} onChange={(value) => setPointSize(value)} /></div>
             </section>
             {selectedVertexDetails && selectedVertex !== null && <section className="mv-section mv-vertex-info">
-              <h3>顶点 {selectedVertex.toLocaleString()} <button onClick={() => setSelectedVertex(null)} aria-label="清除选中顶点">×</button></h3>
+              <h3>顶点 {selectedVertex.toLocaleString()} <Button onClick={() => setSelectedVertex(null)} aria-label="清除选中顶点">×</Button></h3>
               <div className="mv-stat"><span>权重类型</span><b>{selectedVertexDetails.mode}</b></div>
               {selectedVertexDetails.influences.map((item, index) => <div className="mv-stat" key={`${item.bone}-${index}`}><span>{item.bone}</span><b>{item.weight.toFixed(5)}</b></div>)}
               {selectedVertexDetails.mode === "SDEF" && <div className="mv-sdef-params"><b>C</b> {selectedVertexDetails.center.map((value) => value.toFixed(4)).join(", ")}<br /><b>R0</b> {selectedVertexDetails.r0.map((value) => value.toFixed(4)).join(", ")}<br /><b>R1</b> {selectedVertexDetails.r1.map((value) => value.toFixed(4)).join(", ")}</div>}
@@ -747,12 +827,9 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
           <div className="model-viewer-canvas" ref={host} />
           {loading && <div className="model-viewer-message">正在由 Rust Core 解析 3D 网格…</div>}
           {error && <div className="model-viewer-message model-viewer-error">模型无法预览：{error}</div>}
-          {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls"><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span><button onClick={resetCamera}>重置视角</button></div></>}
+          {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls">{asset.assetType === "scene" ? <><span>WASD 移动</span><span>Q 降 / E 升</span><span>左键 / 右键拖动朝向</span><span>滚轮调整 FOV</span></> : <><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span></>}<Button onClick={resetCamera}>重置视角</Button></div></>}
         </main>
-      </div>
-      <footer className="model-viewer-footer">{asset.assetType === "scene" ? "场景以源文件的世界坐标和材质显示。" : "已解析 PMX 权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer>
-    </section>
-  </div>;
+      </div><footer className="model-viewer-footer">{asset.assetType === "scene" ? "场景以源文件的世界坐标和材质显示。" : "已解析 PMX 权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer></Modal.Body></Modal.Content></Modal.Root>;
 }
 
 function disposeModelObjects(objects: ModelObjects, handles: SceneHandles | null) {

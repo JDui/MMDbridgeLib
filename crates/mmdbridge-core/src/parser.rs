@@ -6,7 +6,7 @@ use serde_json::json;
 use crate::types::{AssetType, ParsedCandidate, ParsedDependency, display_name};
 
 const CAMERA_CLASSIFICATION_VERSION: u8 = 2;
-const PMX_PARSER_REVISION: u32 = 1;
+const PMX_PARSER_REVISION: u32 = 2;
 const PMD_PARSER_REVISION: u32 = 1;
 const VMD_PARSER_REVISION: u32 = 2;
 const VPD_PARSER_REVISION: u32 = 1;
@@ -49,6 +49,7 @@ pub(crate) fn parse_asset(
                     "morph_count": parsed.metadata.counts.morphs, "rigid_body_count": parsed.metadata.counts.rigid_bodies,
                     "joint_count": parsed.metadata.counts.joints, "english_name": parsed.metadata.english_name,
                     "parser_diagnostics": parsed.diagnostics,
+                    "skeleton_class": if is_standard_mmd_skeleton(&parsed) { "standard" } else { "nonstandard" },
                 }),
                 status: "Ready".to_owned(),
                 dependencies: pmx_dependencies(&parsed.materials),
@@ -238,11 +239,65 @@ fn dependency(reference: &str, role: &str) -> ParsedDependency {
     }
 }
 
+// Extra twist/IK bones are allowed; body anchors must form connected MMD chains.
+fn is_standard_mmd_skeleton(model: &mmd_anim_format::PmxParsedModel) -> bool {
+    let bones = &model.skeleton.bones;
+    let find = |aliases: &[&str]| bones.iter().position(|bone| {
+        [&bone.name, &bone.english_name].iter().any(|name| {
+            let normalized = name.to_lowercase().replace([' ', '_', '-'], "");
+            aliases.contains(&normalized.as_str())
+        })
+    });
+    let chains: &[&[&[&str]]] = &[
+        &[&["センター", "center"], &["上半身", "upperbody"], &["頭", "head"]],
+        &[&["上半身", "upperbody"], &["左腕", "leftarm", "arml"], &["左ひじ", "左肘", "leftelbow", "elbowl"], &["左手首", "leftwrist", "wristl"]],
+        &[&["上半身", "upperbody"], &["右腕", "rightarm", "armr"], &["右ひじ", "右肘", "rightelbow", "elbowr"], &["右手首", "rightwrist", "wristr"]],
+        &[&["センター", "center"], &["下半身", "lowerbody"], &["左足", "leftleg", "legl"], &["左ひざ", "左膝", "leftknee", "kneel"], &["左足首", "leftankle", "anklel"]],
+        &[&["センター", "center"], &["下半身", "lowerbody"], &["右足", "rightleg", "legr"], &["右ひざ", "右膝", "rightknee", "kneer"], &["右足首", "rightankle", "ankler"]],
+    ];
+    chains.iter().all(|chain| {
+        let Some(indices) = chain.iter().map(|names| find(names)).collect::<Option<Vec<_>>>() else { return false; };
+        indices.windows(2).all(|pair| {
+            let mut child = pair[1];
+            for _ in 0..bones.len() {
+                let Ok(parent) = usize::try_from(bones[child].parent_index) else { return false; };
+                if parent >= bones.len() || parent == child { return false; }
+                if parent == pair[0] { return true; }
+                child = parent;
+            }
+            false
+        })
+    })
+}
+
 fn non_empty(value: &str, fallback: String) -> String {
     if value.trim().is_empty() {
         fallback
     } else {
         value.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod preview_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "read-only PMX probe: requires MMDBRIDGE_PROBE_SOURCE and MMDBRIDGE_PROBE_OUTPUT"]
+    fn readonly_model_thumbnail() {
+        let path = std::path::PathBuf::from(std::env::var_os("MMDBRIDGE_PROBE_SOURCE").unwrap());
+        let output = std::path::PathBuf::from(std::env::var_os("MMDBRIDGE_PROBE_OUTPUT").unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        let model = parse_pmx_model(&bytes).unwrap();
+        let candidate = parse_asset(AssetType::Model, &path, &bytes).unwrap();
+        println!("classification: {}", candidate.metadata["skeleton_class"]);
+        let mut invalid = model.clone();
+        invalid.skeleton.bones.clear();
+        assert!(!is_standard_mmd_skeleton(&invalid));
+        let library = crate::Library::in_memory().unwrap();
+        let preview = library.render_thumbnail_file(&path).unwrap();
+        println!("{}", serde_json::to_string_pretty(&preview.report).unwrap());
+        std::fs::write(output, preview.preview_webp).unwrap();
     }
 }
 

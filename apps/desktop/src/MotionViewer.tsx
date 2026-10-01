@@ -1,9 +1,11 @@
+import { ActionIcon, Button, NativeSelect, Slider, Modal } from "@mantine/core";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "./vendor/three.module.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
 import { parsePreview } from "./ModelViewer";
 import { toUiError } from "./uiError";
+import { loadViewerTextures, setMaterialAlpha, setMaterialCentre, sortTransparentMaterials } from "./viewerRendering";
 import "./motion-viewer.css";
 
 type MotionAsset = { id: string; name: string; primarySource: string; metadata: Record<string, unknown> };
@@ -13,8 +15,6 @@ type MotionFrame = { frame: number; maxFrame: number; modelPath: string; boneMat
 type CameraMode = "orbit" | "own" | "paired";
 
 export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; onClose: () => void }) {
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
   const host = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<{ renderer: any; scene: any; camera: any; ortho: any; controls: any; mesh: any;
     bones: any[]; textures: any[]; resizeObserver: ResizeObserver } | null>(null);
@@ -108,9 +108,13 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(42, 1, 0.01, 100000);
     const ortho = new THREE.OrthographicCamera(-20, 20, 20, -20, 0.01, 100000);
+    sortTransparentMaterials(renderer, () => {
+      const state = cameraModeRef.current === "own" ? lastCamera.current?.ownCamera : cameraModeRef.current === "paired" ? lastCamera.current?.pairedCamera : null;
+      return state && !state.perspective ? ortho : camera;
+    });
     camera.position.set(0, 10, -28);
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true; controls.dampingFactor = 0.08; controls.zoomSpeed = 0.075;
+    controls.enableDamping = true; controls.dampingFactor = 0.08; controls.zoomSpeed = 0.45;
     scene.add(new THREE.AmbientLight(0xffffff, 1.5));
     const key = new THREE.DirectionalLight(0xffffff, 1.6); key.position.set(-14, 26, -20); scene.add(key);
     const fill = new THREE.DirectionalLight(0xffffff, 0.65); fill.position.set(18, 8, 16); scene.add(fill);
@@ -147,7 +151,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
         const initial = await invoke<MotionFrame>("motion_preview_frame", { assetId: asset.id, frame: 0 });
         const buffer = await invoke<ArrayBuffer>("model_preview_file", { path: initial.modelPath });
         if (disposed) return;
-        const parsed = parsePreview(buffer);
+        const parsed = parsePreview(buffer, false);
         const geometry = new THREE.BufferGeometry();
         const interleaved = new THREE.InterleavedBuffer(parsed.vertices, 26);
         geometry.setAttribute("position", new THREE.InterleavedBufferAttribute(interleaved, 3, 0));
@@ -168,8 +172,11 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
         const groups = parsed.groups.length ? parsed.groups : [{ start: 0, count: parsed.indices.length, color: [0.72, 0.76, 0.79, 1] as [number,number,number,number], texturePath: "" }];
         const materials = groups.map((group, index) => {
           geometry.addGroup(group.start, group.count, index);
-          return new THREE.MeshStandardMaterial({ color: new THREE.Color().setRGB(group.color[0], group.color[1], group.color[2]),
+          const material = new THREE.MeshStandardMaterial({ color: new THREE.Color().setRGB(group.color[0], group.color[1], group.color[2]),
             side: THREE.DoubleSide, roughness: 0.72, transparent: group.color[3] < 0.999, opacity: group.color[3] });
+          setMaterialAlpha(material, group.color[3]);
+          setMaterialCentre(material, geometry, group.start, group.count);
+          return material;
         });
         const mesh = new THREE.SkinnedMesh(geometry, materials.length === 1 ? materials[0] : materials);
         mesh.frustumCulled = false;
@@ -192,8 +199,10 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
         const radius = Math.max(sphere.radius, 0.01);
         controls.target.copy(sphere.center);
         camera.position.set(sphere.center.x, sphere.center.y + radius * 0.12, sphere.center.z - radius / Math.sin(camera.fov * Math.PI / 360));
-        camera.near = Math.max(0.01, radius * 0.002);
-        camera.far = Math.max(1000, radius * 10);
+        camera.near = Math.max(0.001, radius * 0.01);
+        camera.far = Math.max(10, radius * 12);
+        controls.minDistance = radius * 0.35;
+        controls.maxDistance = radius * 10;
         camera.updateProjectionMatrix();
         controls.update();
         grid.position.y = sphere.center.y - radius;
@@ -201,35 +210,31 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
         applyFrame(initial);
         setLoading(false);
         const loader = new THREE.TextureLoader();
-        for (let index = 0; index < groups.length; index++) {
-          const texturePath = groups[index].texturePath;
-          if (!texturePath || disposed) continue;
+        await loadViewerTextures(groups.map((group) => group.texturePath), () => !disposed, async (texturePath) => {
           try {
             const bytes = await invoke<ArrayBuffer>("model_preview_texture_file", { modelPath: initial.modelPath, texturePath });
-            if (disposed || bytes.byteLength <= 1) continue;
+            if (disposed || bytes.byteLength <= 1) return;
             const alphaMode = new Uint8Array(bytes)[0];
-            const url = URL.createObjectURL(new Blob([bytes.slice(1)], { type: "image/png" }));
+            const url = URL.createObjectURL(new Blob([new Uint8Array(bytes, 1)], { type: "image/png" }));
             try {
               const texture = await loader.loadAsync(url);
               texture.colorSpace = THREE.SRGBColorSpace; texture.flipY = false;
               texture.wrapS = THREE.RepeatWrapping; texture.wrapT = THREE.RepeatWrapping;
-              if (disposed) { texture.dispose(); continue; }
+              if (disposed) { texture.dispose(); return; }
               active.textures.push(texture);
-              materials[index].map = texture;
-              materials[index].alphaTest = alphaMode === 1 ? 0.5 : 0;
-              materials[index].transparent = alphaMode === 2 || groups[index].color[3] < 0.999;
-              materials[index].depthWrite = !materials[index].transparent;
-              materials[index].needsUpdate = true;
+              groups.forEach((group, index) => {
+                if (group.texturePath !== texturePath) return;
+                materials[index].map = texture;
+                setMaterialAlpha(materials[index], group.color[3], alphaMode);
+                materials[index].needsUpdate = true;
+              });
             } finally { URL.revokeObjectURL(url); }
           } catch (reason) { console.warn("动作预览贴图加载失败", texturePath, reason); }
-        }
+        });
       } catch (reason) { if (!disposed) { setError(toUiError(reason)); setLoading(false); } }
     })();
-    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onCloseRef.current(); };
-    window.addEventListener("keydown", onKey);
     return () => {
       disposed = true; playingRef.current = false;
-      window.removeEventListener("keydown", onKey);
       renderer.setAnimationLoop(null);
       resizeObserver.disconnect();
       controls.dispose();
@@ -261,21 +266,14 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
     } else if (lastCamera.current) applyCamera(lastCamera.current);
   }
 
-  return <div className="model-viewer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className="motion-viewer-window" role="dialog" aria-modal="true" aria-label={`${asset.name} VMD 3D 预览`}>
-      <header className="model-viewer-header"><div><span className="model-viewer-eyebrow">VMD MOTION VIEWER</span><h2>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div><button className="model-viewer-close" aria-label="关闭动作预览" onClick={onClose}>×</button></header>
-      <div className="motion-viewer-stage" ref={host}>
+  return <Modal.Root opened onClose={onClose} withinPortal={false} centered xOffset={20} yOffset={20} size={1240} zIndex={250} padding={0} transitionProps={{ duration: 150 }}><Modal.Overlay backgroundOpacity={0.72} blur={6} /><Modal.Content className="viewer-modal-content" aria-label={`${asset.name} VMD 3D 预览`}><Modal.Body p={0} className={"motion-viewer-window"}><header className="model-viewer-header"><div><span className="model-viewer-eyebrow">VMD MOTION VIEWER</span><h2>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div><ActionIcon variant="subtle" size="sm" className="model-viewer-close" aria-label="关闭动作预览" onClick={onClose}>×</ActionIcon></header><div className="motion-viewer-stage" ref={host}>
         {loading && <div className="model-viewer-message">正在加载预览模型和 VMD 轨道…</div>}
         {error && <div className="model-viewer-message model-viewer-error">{error}</div>}
-      </div>
-      <footer className="motion-viewer-timeline">
-        <button disabled={loading || !!error} onClick={() => { playingRef.current = !playingRef.current; setPlaying(playingRef.current); lastTick.current = 0; }}>{playing ? "暂停" : "播放"}</button>
-        <input aria-label="VMD 时间轴" type="range" min={0} max={Math.max(1, maxFrame)} step={1} value={frame} disabled={loading || !!error} onChange={(event) => { playingRef.current = false; setPlaying(false); void requestFrame(Number(event.target.value)); }} />
+      </div><footer className="motion-viewer-timeline">
+        <Button disabled={loading || !!error} onClick={() => { playingRef.current = !playingRef.current; setPlaying(playingRef.current); lastTick.current = 0; }}>{playing ? "暂停" : "播放"}</Button>
+        <Slider thumbLabel="VMD 时间轴"  min={0} max={Math.max(1, maxFrame)} step={1} value={frame} disabled={loading || !!error} onChange={(value) => { playingRef.current = false; setPlaying(false); void requestFrame(value); }} />
         <span>{frame} / {maxFrame} 帧</span>
-        <select aria-label="播放速度" value={speed} onChange={(event) => { const next = Number(event.target.value); speedRef.current = next; setSpeed(next); }}><option value={0.5}>0.5×</option><option value={1}>1×</option><option value={2}>2×</option></select>
-        <select aria-label="镜头视角" value={cameraMode} onChange={(event) => changeCamera(event.target.value as CameraMode)}><option value="orbit">自由视角</option>{hasOwnCamera && <option value="own">VMD 镜头</option>}{hasPairedCamera && <option value="paired">配套镜头</option>}</select>
-      </footer>
-      <div className="motion-viewer-note">骨骼与 IK 连续播放；SDEF/QDEF 在实时查看中使用线性蒙皮近似，顶点与材质 Morph 尚未实时显示。</div>
-    </section>
-  </div>;
+        <NativeSelect aria-label="播放速度" value={speed} onChange={(event) => { const next = Number(event.target.value); speedRef.current = next; setSpeed(next); }}><option value={0.5}>0.5×</option><option value={1}>1×</option><option value={2}>2×</option></NativeSelect>
+        <NativeSelect aria-label="镜头视角" value={cameraMode} onChange={(event) => changeCamera(event.target.value as CameraMode)}><option value="orbit">自由视角</option>{hasOwnCamera && <option value="own">VMD 镜头</option>}{hasPairedCamera && <option value="paired">配套镜头</option>}</NativeSelect>
+      </footer><div className="motion-viewer-note">骨骼与 IK 连续播放；SDEF/QDEF 在实时查看中使用线性蒙皮近似，顶点与材质 Morph 尚未实时显示。</div></Modal.Body></Modal.Content></Modal.Root>;
 }

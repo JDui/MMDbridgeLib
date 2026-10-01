@@ -1,6 +1,6 @@
 .motion-viewer-window {
-  width: min(1100px, calc(100vw - 48px));
-  height: min(760px, calc(100vh - 48px));
+  width: min(1240px, calc(100vw - 40px));
+  height: min(820px, calc(100dvh - 40px));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -20,15 +20,6 @@
   border-top: 1px solid #314852;
   color: #bfd0d1;
   font-size: 12px;
-}
-.motion-viewer-timeline input[type="range"] { flex: 1; min-width: 80px; accent-color: #65cbae; }
-.motion-viewer-timeline button, .motion-viewer-timeline select {
-  min-height: 30px;
-  padding: 4px 9px;
-  border: 1px solid #405c62;
-  border-radius: 5px;
-  background: #1b3036;
-  color: #d4e5e3;
 }
 .motion-viewer-timeline span { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .motion-viewer-note { padding: 0 16px 11px; color: #8ba6a8; font-size: 10px; }

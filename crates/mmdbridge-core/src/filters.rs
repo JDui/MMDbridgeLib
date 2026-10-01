@@ -147,8 +147,12 @@ pub(crate) fn apply_page(
 }
 
 fn compile(expression: &FilterExpr) -> CoreResult<(String, Vec<SqlValue>)> {
+    compile_after(expression, 2)
+}
+
+pub(crate) fn compile_after(expression: &FilterExpr, first_parameter: usize) -> CoreResult<(String, Vec<SqlValue>)> {
     let mut values = Vec::new();
-    let mut next_parameter = 2usize; // ?1 is reserved for the optional free-text query.
+    let mut next_parameter = first_parameter;
     let mut node_count = 0usize;
     let sql = compile_node(
         expression,
@@ -369,6 +373,7 @@ fn field_sql(field: &FilterField) -> (String, ValueKind) {
         FilterField::RecentlyModified => ("a.updated_at".to_owned(), ValueKind::Date),
         FilterField::PolygonCount => ("json_extract(m.value_json,'$.polygon_count')".to_owned(), ValueKind::Number),
         FilterField::BoneCount => ("json_extract(m.value_json,'$.bone_count')".to_owned(), ValueKind::Number),
+        FilterField::SkeletonClass => ("COALESCE(json_extract(m.value_json,'$.skeleton_class'),'unknown')".to_owned(), ValueKind::Text),
         FilterField::HasThumbnail => (
             "COALESCE(c.status,'CardMissing') IN ('CardValid','CardStale') AND json_extract(c.manifest_json,'$.thumbnail.file') IS NOT NULL".to_owned(),
             ValueKind::Boolean,

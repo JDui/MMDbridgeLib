@@ -549,15 +549,27 @@ pub(crate) fn list_asset_page(
     directory_path: Option<&str>,
     recursive_scope: bool,
 ) -> CoreResult<AssetPage> {
+    list_asset_page_filtered(library, asset_type, query, root_id, favorite_only, cursor,
+        limit, motion_format, directory_path, recursive_scope, None)
+}
+
+pub(crate) fn list_asset_page_filtered(
+    library: &Library, asset_type: Option<AssetType>, query: Option<&str>, root_id: Option<&str>,
+    favorite_only: bool, cursor: Option<&AssetCursor>, limit: usize, motion_format: Option<&str>,
+    directory_path: Option<&str>, recursive_scope: bool, expression: Option<&crate::FilterExpr>,
+) -> CoreResult<AssetPage> {
+    let (extra_predicate, extra_values) = expression
+        .map(|expression| crate::filters::compile_after(expression, 8))
+        .transpose()?.unwrap_or_else(|| ("1".to_owned(), Vec::new()));
     let type_text = asset_type.map(|asset_type| asset_type.as_str().to_owned());
     list_asset_page_with_predicate(
         library,
         query,
         root_id,
         limit,
-        "(?2 IS NULL OR a.asset_type=?2) AND (?3=0 OR EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id))
+        &format!("(?2 IS NULL OR a.asset_type=?2) AND (?3=0 OR EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id))
          AND (?4 IS NULL OR (a.asset_type='motion' AND lower(a.primary_source) LIKE ('%.' || ?4)))
-         AND (?5 IS NULL OR a.asset_directory=?5 COLLATE NOCASE OR (?6=1 AND (substr(a.asset_directory,1,length(?7)+1)=(?7 || char(92)) COLLATE NOCASE OR substr(a.asset_directory,1,length(?7)+1)=(?7 || '/') COLLATE NOCASE)))",
+         AND (?5 IS NULL OR a.asset_directory=?5 COLLATE NOCASE OR (?6=1 AND (substr(a.asset_directory,1,length(?7)+1)=(?7 || char(92)) COLLATE NOCASE OR substr(a.asset_directory,1,length(?7)+1)=(?7 || '/') COLLATE NOCASE))) AND ({extra_predicate})"),
         vec![
             type_text.map(SqlValue::Text).unwrap_or(SqlValue::Null),
             SqlValue::Integer(if favorite_only { 1 } else { 0 }),
@@ -565,7 +577,7 @@ pub(crate) fn list_asset_page(
             directory_path.map(|value| SqlValue::Text(value.to_owned())).unwrap_or(SqlValue::Null),
             SqlValue::Integer(i64::from(recursive_scope)),
             directory_path.map(|value| SqlValue::Text(value.trim_end_matches(['\\', '/']).to_owned())).unwrap_or(SqlValue::Null),
-        ],
+        ].into_iter().chain(extra_values).collect(),
         cursor,
     )
 }
@@ -637,7 +649,8 @@ pub(crate) fn list_asset_page_with_predicate(
                  WHERE r.relation_type='MotionCameraPair' AND r.source_asset=a.id
                    AND camera.retired_format=0 AND instr(camera.statuses_json,'MissingSource')=0
                    AND json_extract(CASE WHEN json_valid(camera_metadata.value_json) THEN camera_metadata.value_json ELSE '{{}}' END,'$.has_camera')=1
-                 ORDER BY r.confirmed DESC,r.confidence DESC LIMIT 1)
+                 ORDER BY r.confirmed DESC,r.confidence DESC LIMIT 1),
+                CASE WHEN json_valid(m.value_json) THEN json_extract(m.value_json,'$.skeleton_class') END
          FROM assets a LEFT JOIN metadata m ON m.asset_id=a.id AND m.key='parsed' LEFT JOIN cards c ON c.asset_id=a.id
          WHERE a.retired_format=0 AND a.visibility='normal' AND {ASSET_SEARCH_PREDICATE}
            AND ({predicate})
@@ -800,6 +813,9 @@ fn asset_list_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetLi
     }
     if let Some(paired_camera) = row.get::<_, Option<String>>(13)? {
         metadata.insert("paired_camera_path".to_owned(), Value::String(paired_camera));
+    }
+    if let Some(class) = row.get::<_, Option<String>>(14)? {
+        metadata.insert("skeleton_class".to_owned(), Value::String(class));
     }
     Ok(AssetListItem {
         id: row.get(0)?,

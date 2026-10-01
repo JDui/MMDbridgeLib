@@ -6,6 +6,7 @@ mod jobs;
 mod motion_view;
 mod operations;
 mod parser;
+mod pmx_runtime;
 mod relations;
 mod scanner;
 mod scan_queue;
@@ -14,7 +15,7 @@ mod thumbnail_concurrency;
 mod thumbnail_physics;
 mod types;
 
-pub use database::Library;
+pub use database::{Library, LibraryOpenProgress};
 pub use error::{CoreError, CoreResult};
 pub use operations::{
     AssetOperationAsset, AssetOperationDependencySnapshot, AssetOperationJournalEntry,

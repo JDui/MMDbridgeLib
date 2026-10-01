@@ -31,6 +31,11 @@ enum Command {
         #[arg(long)]
         full_check: bool,
     },
+    /// Read persisted scan progress without enqueueing or resuming work.
+    ScanStatus {
+        #[arg(long)]
+        root: Option<String>,
+    },
     Assets {
         #[command(subcommand)]
         command: AssetCommand,
@@ -144,8 +149,14 @@ enum CardCommand {
 
 #[derive(Debug, Subcommand)]
 enum TagCommand {
+    AuditBatch {
+        #[arg(long = "asset-id", required = true, num_args = 1..=100)]
+        asset_ids: Vec<String>,
+    },
     List {
         asset_id: String,
+        #[arg(long)]
+        include_overrides: bool,
     },
     Add {
         asset_id: String,
@@ -229,6 +240,7 @@ enum FilterCommand {
 #[derive(Debug, Subcommand)]
 enum JobCommand {
     List,
+    Summary,
     Cancel { job_id: String },
     Retry { job_id: String },
 }
@@ -341,6 +353,14 @@ fn run() -> Result<serde_json::Value, CoreError> {
         Command::Roots {
             command: RootCommand::Remove { root_id },
         } => Ok(json!({"removed":library.remove_root(&root_id)?})),
+        Command::ScanStatus { root } => {
+            let states = library.list_scan_states()?;
+            match root {
+                Some(root) => Ok(json!(states.into_iter().find(|state| state.root_id == root)
+                    .ok_or_else(|| CoreError::RootNotFound(root))?)),
+                None => Ok(json!(states)),
+            }
+        }
         Command::Scan { root, queued: _, full_check } => {
             let current = library.list_scan_states()?.into_iter()
                 .find(|state| state.root_id == root);
@@ -478,8 +498,29 @@ fn run() -> Result<serde_json::Value, CoreError> {
             command: CardCommand::Verify { asset_id },
         } => Ok(json!(library.verify_card(&asset_id)?)),
         Command::Tags {
-            command: TagCommand::List { asset_id },
-        } => Ok(json!(library.list_asset_tags(&asset_id)?)),
+            command: TagCommand::AuditBatch { asset_ids },
+        } => {
+            let mut records = Vec::with_capacity(asset_ids.len());
+            for asset_id in asset_ids {
+                records.push(json!({
+                    "assetId": asset_id,
+                    "card": library.verify_card(&asset_id)?,
+                    "tags": library.list_asset_tags(&asset_id)?,
+                    "suppressedTags": library.list_asset_tag_overrides(&asset_id)?
+                }));
+            }
+            Ok(json!(records))
+        }
+        Command::Tags {
+            command: TagCommand::List { asset_id, include_overrides },
+        } => {
+            let tags = library.list_asset_tags(&asset_id)?;
+            if include_overrides {
+                Ok(json!({"tags":tags,"suppressedTags":library.list_asset_tag_overrides(&asset_id)?}))
+            } else {
+                Ok(json!(tags))
+            }
+        }
         Command::Tags {
             command:
                 TagCommand::Add {
@@ -593,6 +634,9 @@ fn run() -> Result<serde_json::Value, CoreError> {
         Command::Jobs {
             command: JobCommand::List,
         } => Ok(json!(library.list_jobs()?)),
+        Command::Jobs {
+            command: JobCommand::Summary,
+        } => Ok(library.job_summary()?),
         Command::Jobs {
             command: JobCommand::Cancel { job_id },
         } => Ok(json!({"job_id":job_id,"cancelled":library.cancel_job(&job_id)?})),

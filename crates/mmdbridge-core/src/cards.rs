@@ -1366,3 +1366,17 @@ fn is_windows_numbered_device(name: &str) -> bool {
         })
     })
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn card_metadata_small_dimensions_survive_json_roundtrip() {
+        let metadata: serde_json::Value = serde_json::from_str(
+            r#"{"width":1.9485949565023478e-7,"area":6.3703458713709e-7}"#,
+        )
+        .unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&metadata).unwrap()).unwrap();
+        assert_eq!(metadata, restored);
+    }
+}

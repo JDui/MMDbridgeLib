@@ -11,7 +11,51 @@ use mmdbridge_core::{
 use serde::Serialize;
 use tauri::{Manager, State, ipc::Response};
 
-struct CoreState(Library);
+struct CoreState(Library, std::sync::atomic::AtomicBool);
+
+#[derive(Clone, Serialize)]
+struct StartupStatus {
+    phase: String,
+    detail: String,
+    step: u8,
+    completed: Option<usize>,
+    total: Option<usize>,
+    elapsed_ms: u64,
+    phase_elapsed_ms: u64,
+    idle_ms: u64,
+    #[serde(skip_serializing)]
+    phase_started_ms: u64,
+    #[serde(skip_serializing)]
+    updated_ms: u64,
+    ready: bool,
+    error: Option<String>,
+}
+struct StartupState {
+    status: std::sync::Arc<std::sync::Mutex<StartupStatus>>,
+    started: std::time::Instant,
+}
+
+#[tauri::command]
+fn startup_status(state: State<'_, StartupState>) -> Result<StartupStatus, ApiError> {
+    state.status.lock().map(|status| {
+        let mut snapshot = status.clone();
+        snapshot.elapsed_ms = state.started.elapsed().as_millis() as u64;
+        snapshot.phase_elapsed_ms = snapshot.elapsed_ms.saturating_sub(status.phase_started_ms);
+        snapshot.idle_ms = snapshot.elapsed_ms.saturating_sub(status.updated_ms);
+        snapshot
+    }).map_err(|_| CoreError::LockPoisoned.into())
+}
+
+#[tauri::command]
+fn library_background_start(app: tauri::AppHandle, state: State<'_, CoreState>) {
+    if state.1.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    let library = state.0.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = library.resume_scan_jobs() { eprintln!("扫描恢复失败：{error}"); }
+        if let Err(error) = library.resume_thumbnail_jobs() { eprintln!("缩略图恢复失败：{error}"); }
+        if let Err(error) = file_watcher::start(app, library) { eprintln!("文件监视器启动失败：{error}"); }
+    });
+}
 
 async fn read_core<T: Send + 'static>(
     library: Library,
@@ -341,6 +385,7 @@ async fn assets_page(
     root_id: Option<String>,
     favorites_only: Option<bool>,
     filter_id: Option<String>,
+    expression: Option<FilterExpr>,
     cursor: Option<AssetCursor>,
     limit: Option<usize>,
 ) -> Result<AssetPage, ApiError> {
@@ -357,11 +402,7 @@ async fn assets_page(
         Some(value) => return Err(ApiError::from(CoreError::InvalidAssetType(value.to_owned()))),
     };
     read_core(state.0.clone(), move |library| {
-        if let Some(filter_id) = filter_id {
-            library.apply_saved_filter_page(&filter_id, query.as_deref(), root_id.as_deref(), cursor.as_ref(), page_size)
-        } else {
-            library.list_asset_page(kind, query.as_deref(), root_id.as_deref(), favorites_only.unwrap_or(false), cursor.as_ref(), page_size, motion_format.as_deref(), directory_path.as_deref(), recursive_scope.unwrap_or(true))
-        }
+        library.list_asset_page_with_filters(kind, query.as_deref(), root_id.as_deref(), favorites_only.unwrap_or(false), cursor.as_ref(), page_size, motion_format.as_deref(), directory_path.as_deref(), recursive_scope.unwrap_or(true), filter_id.as_deref(), expression)
     }).await
 }
 
@@ -504,6 +545,21 @@ async fn cards_queue_root(state: State<'_, CoreState>, root_id: String) -> Resul
 #[tauri::command]
 async fn asset_tags(state: State<'_, CoreState>, asset_id: String) -> Result<Vec<AssetTag>, ApiError> {
     read_core(state.0.clone(), move |library| library.list_asset_tags(&asset_id)).await
+}
+
+#[tauri::command]
+async fn tags_list(state: State<'_, CoreState>) -> Result<Vec<String>, ApiError> {
+    read_core(state.0.clone(), |library| library.list_tag_names()).await
+}
+
+#[tauri::command]
+async fn thumbnail_regenerate(state: State<'_, CoreState>, asset_id: String) -> Result<serde_json::Value, ApiError> {
+    read_core(state.0.clone(), move |library| library.regenerate_thumbnail(&asset_id)).await
+}
+
+#[tauri::command]
+async fn thumbnails_regenerate_all(state: State<'_, CoreState>) -> Result<serde_json::Value, ApiError> {
+    read_core(state.0.clone(), |library| library.regenerate_all_thumbnails()).await
 }
 
 #[tauri::command]
@@ -683,26 +739,74 @@ fn jobs_retry(state: State<'_, CoreState>, job_id: String) -> Result<serde_json:
 fn main() {
     let result = tauri::Builder::default()
         .setup(|app| {
-            let database = Library::portable_database_path()?;
-            let library = Library::open(database)?;
-            library.resume_scan_jobs()?;
-            app.manage(CoreState(library.clone()));
+            let started = std::time::Instant::now();
+            let status = std::sync::Arc::new(std::sync::Mutex::new(StartupStatus {
+                phase: "正在打开本地资产库…".to_owned(), ready: false, error: None,
+                detail: "准备数据库初始化线程".to_owned(), step: 0, completed: None, total: None,
+                elapsed_ms: 0, phase_elapsed_ms: 0, idle_ms: 0, phase_started_ms: 0, updated_ms: 0,
+            }));
+            app.manage(StartupState { status: status.clone(), started });
             let app_handle = app.handle().clone();
             std::thread::Builder::new()
                 .name("mmdbridge-background-startup".to_owned())
                 .spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(800));
-                    if let Err(error) = library.resume_thumbnail_jobs() {
-                        eprintln!("MMDbridgeLib 缩略图任务恢复失败：{error}");
-                    }
-                    if let Err(error) = file_watcher::start(app_handle, library) {
-                        eprintln!("MMDbridgeLib 文件监视器启动失败：{error}");
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let database = Library::portable_database_path()?;
+                        let mut log = std::fs::OpenOptions::new().create(true).write(true).truncate(true)
+                            .open(database.with_file_name("startup-progress.log")).ok();
+                        Library::open_with_progress(database, &mut |progress| {
+                            let elapsed = started.elapsed().as_millis() as u64;
+                            let mut phase_changed = false;
+                            if let Ok(mut snapshot) = status.lock() {
+                                phase_changed = snapshot.phase != progress.phase;
+                                if phase_changed { snapshot.phase_started_ms = elapsed; }
+                                snapshot.phase = progress.phase.clone();
+                                snapshot.detail = progress.detail.clone();
+                                snapshot.step = progress.step;
+                                snapshot.completed = progress.completed;
+                                snapshot.total = progress.total;
+                                snapshot.updated_ms = elapsed;
+                            }
+                            if phase_changed || progress.completed == progress.total
+                                || progress.completed.is_some_and(|count| count % 1000 == 0) {
+                                if let Some(log) = log.as_mut() {
+                                    use std::io::Write;
+                                    let _ = writeln!(log, "{elapsed}ms stage {}/6: {} {:?}/{:?}; {}",
+                                        progress.step, progress.phase, progress.completed, progress.total, progress.detail);
+                                }
+                            }
+                        })
+                    })).unwrap_or_else(|panic| {
+                        let message = panic.downcast_ref::<&str>().copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str)).unwrap_or("未知异常");
+                        Err(CoreError::Io(std::io::Error::other(format!("启动线程异常：{message}"))))
+                    });
+                    match result {
+                        Ok(library) => {
+                            app_handle.manage(CoreState(library, std::sync::atomic::AtomicBool::new(false)));
+                            if let Ok(mut status) = status.lock() {
+                                status.ready = true;
+                                status.phase = "资产库已准备好".to_owned();
+                            }
+                        }
+                        Err(error) => {
+                            let message = format!("资产库初始化失败：{error}");
+                            if let Ok(database) = Library::portable_database_path() {
+                                let _ = std::fs::write(database.with_file_name("startup-error.txt"), &message);
+                            }
+                            if let Ok(mut status) = status.lock() { status.error = Some(message); }
+                        }
                     }
                 })?;
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            startup_status,
+            library_background_start,
+            tags_list,
+            thumbnail_regenerate,
+            thumbnails_regenerate_all,
             roots_list,
             root_add,
             root_update,
