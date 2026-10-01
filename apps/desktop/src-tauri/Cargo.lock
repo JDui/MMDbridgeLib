@@ -2301,7 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "mmdbridge-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "mmdbridge-desktop"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "mmdbridge-core",
  "notify",
