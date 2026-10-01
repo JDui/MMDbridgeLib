@@ -10,6 +10,7 @@ mod pmx_runtime;
 mod relations;
 mod scanner;
 mod scan_queue;
+mod scan_snapshot;
 mod thumbnail;
 mod thumbnail_concurrency;
 mod thumbnail_physics;

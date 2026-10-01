@@ -264,7 +264,7 @@ pub(crate) fn enqueue_changes(
     Ok(library.list_scan_states()?.into_iter().find(|state| state.root_id == root_id))
 }
 
-fn is_possible_mmd_dependency(path: &std::path::Path) -> bool {
+pub(crate) fn is_possible_mmd_dependency(path: &std::path::Path) -> bool {
     path.extension().and_then(|value| value.to_str()).is_some_and(|extension| {
         ["png", "jpg", "jpeg", "bmp", "tga", "dds", "webp", "spa", "sph", "toon"]
             .iter()

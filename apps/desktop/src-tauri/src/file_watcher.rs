@@ -47,7 +47,7 @@ fn watch_loop(
 ) {
     let mut watched = HashMap::<String, WatchedRoot>::new();
     let mut reported_watch_errors = HashSet::<String>::new();
-    let mut queued_initial_scans = HashSet::<String>::new();
+    let mut reconciled_roots = HashSet::<String>::new();
     let mut reported_startup_scan_errors = HashSet::<String>::new();
     let mut reported_change_scan_errors = HashSet::<String>::new();
     let mut pending_roots = HashMap::<String, PendingRootChanges>::new();
@@ -117,7 +117,7 @@ fn watch_loop(
                 &mut watcher,
                 &mut watched,
                 &mut reported_watch_errors,
-                &mut queued_initial_scans,
+                &mut reconciled_roots,
                 &mut reported_startup_scan_errors,
             ) {
                 Ok(()) => {
@@ -175,7 +175,7 @@ fn sync_roots(
     watcher: &mut notify::RecommendedWatcher,
     watched: &mut HashMap<String, WatchedRoot>,
     reported_errors: &mut HashSet<String>,
-    queued_initial_scans: &mut HashSet<String>,
+    reconciled_roots: &mut HashSet<String>,
     reported_startup_scan_errors: &mut HashSet<String>,
 ) -> Result<(), String> {
     library.resume_scan_jobs().map_err(|error| error.to_string())?;
@@ -206,20 +206,20 @@ fn sync_roots(
             }
         }
         reported_errors.remove(&root_id);
-        queued_initial_scans.remove(&root_id);
+        reconciled_roots.remove(&root_id);
         reported_startup_scan_errors.remove(&root_id);
     }
 
     for (root_id, root) in desired {
         if watched.contains_key(&root_id) && Path::new(&root.path).is_dir() {
-            if !queued_initial_scans.contains(&root_id) {
-                match library.enqueue_scan(&root_id) {
+            if !reconciled_roots.contains(&root_id) {
+                match library.reconcile_root_changes(&root_id) {
                     Ok(_) => {
-                        queued_initial_scans.insert(root_id.clone());
+                        reconciled_roots.insert(root_id.clone());
                         reported_startup_scan_errors.remove(&root_id);
                     }
                     Err(error) if reported_startup_scan_errors.insert(root_id.clone()) => {
-                        eprintln!("MMDbridgeLib 启动发现排队失败（{root_id}）：{error}");
+                        eprintln!("MMDbridgeLib 启动差量检查失败（{root_id}）：{error}");
                     }
                     Err(_) => {}
                 }
@@ -243,15 +243,15 @@ fn sync_roots(
                     },
                 );
                 let recovered = reported_errors.remove(&root_id);
-                if recovered { queued_initial_scans.remove(&root_id); }
-                if !queued_initial_scans.contains(&root_id) {
-                    match library.enqueue_scan(&root_id) {
+                if recovered { reconciled_roots.remove(&root_id); }
+                if !reconciled_roots.contains(&root_id) {
+                    match library.reconcile_root_changes(&root_id) {
                         Ok(_) => {
-                            queued_initial_scans.insert(root_id.clone());
+                            reconciled_roots.insert(root_id.clone());
                             reported_startup_scan_errors.remove(&root_id);
                         }
                         Err(error) if reported_startup_scan_errors.insert(root_id.clone()) => {
-                            eprintln!("MMDbridgeLib 启动发现排队失败（{root_id}）：{error}");
+                            eprintln!("MMDbridgeLib 启动差量检查失败（{root_id}）：{error}");
                         }
                         Err(_) => {}
                     }
@@ -264,14 +264,14 @@ fn sync_roots(
                         serde_json::json!({"rootId": root_id, "message": error.to_string()}),
                     );
                 }
-                if !queued_initial_scans.contains(&root_id) {
-                    match library.enqueue_scan(&root_id) {
+                if !reconciled_roots.contains(&root_id) {
+                    match library.reconcile_root_changes(&root_id) {
                         Ok(_) => {
-                            queued_initial_scans.insert(root_id.clone());
+                            reconciled_roots.insert(root_id.clone());
                             reported_startup_scan_errors.remove(&root_id);
                         }
                         Err(scan_error) if reported_startup_scan_errors.insert(root_id.clone()) => {
-                            eprintln!("MMDbridgeLib 监视失败后的完整发现排队失败（{root_id}）：{scan_error}");
+                            eprintln!("MMDbridgeLib 监视失败后的差量检查失败（{root_id}）：{scan_error}");
                         }
                         Err(_) => {}
                     }

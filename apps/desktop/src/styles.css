@@ -5,35 +5,35 @@
 :root {
   color-scheme: dark;
 
-  /* 文字渲染：全部使用 Windows 本地字体，中文回退到雅黑，不再引用未安装的 DM Mono / Noto Sans SC */
-  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
-  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "Sarasa Mono SC", "Microsoft YaHei UI", monospace;
+  /* Compatibility aliases: token values come from theme.ts via MantineProvider. */
+  --font-ui: var(--library-font-ui);
+  --font-mono: var(--library-font-mono);
 
-  --bg: #0e141b;
-  --panel: #131c25;
-  --panel-2: #17222c;
-  --panel-3: #1c2935;
-  --raise: #213040;
-  --line: #233040;
-  --line-2: #2d3e50;
-  --line-3: #3c5165;
+  --bg: var(--library-bg);
+  --panel: var(--library-panel);
+  --panel-2: var(--library-panel-secondary);
+  --panel-3: var(--library-elevated);
+  --raise: var(--library-hover);
+  --line: var(--library-border-subtle);
+  --line-2: var(--library-border);
+  --line-3: var(--library-border-strong);
 
-  --text: #e9eff4;
-  --text-2: #b8c4cf;
-  --text-3: #8b99a7;
-  --text-4: #64737f;
+  --text: var(--library-text);
+  --text-2: var(--library-text-secondary);
+  --text-3: var(--library-text-tertiary);
+  --text-4: var(--library-text-muted);
 
-  --mint: #5ed6b2;
-  --mint-2: #93e9cd;
-  --mint-3: #3fbf99;
-  --mint-veil: rgba(94, 214, 178, .12);
-  --violet: #c2a1ef;
-  --violet-veil: rgba(194, 161, 239, .12);
-  --amber: #e7b06d;
-  --amber-veil: rgba(231, 176, 109, .12);
-  --rose: #ef9a95;
-  --rose-veil: rgba(239, 154, 149, .12);
-  --blue: #87b5f0;
+  --mint: var(--library-mint);
+  --mint-2: var(--library-mint-light);
+  --mint-3: var(--library-mint-strong);
+  --mint-veil: var(--library-mint-veil);
+  --violet: var(--library-violet);
+  --violet-veil: var(--library-violet-veil);
+  --amber: var(--library-amber);
+  --amber-veil: var(--library-amber-veil);
+  --rose: var(--library-rose);
+  --rose-veil: var(--library-rose-veil);
+  --blue: var(--library-blue);
 
   --e-spring: cubic-bezier(.34, 1.46, .44, 1);
   --e-spring-2: cubic-bezier(.22, 1.6, .36, 1);
@@ -45,16 +45,16 @@
   --t-med: .32s;
   --t-slow: .55s;
 
-  --r1: 5px;
-  --r2: 8px;
-  --r3: 11px;
-  --r4: 16px;
+  --r1: var(--library-radius-xs);
+  --r2: var(--library-radius-sm);
+  --r3: var(--library-radius-md);
+  --r4: var(--library-radius-lg);
 
-  --sh-1: 0 1px 2px rgba(4, 9, 13, .4);
-  --sh-2: 0 8px 24px rgba(4, 9, 13, .45);
-  --sh-3: 0 18px 50px rgba(3, 7, 11, .55);
-  --sh-pop: 0 28px 80px rgba(2, 5, 9, .7);
-  --ring: 0 0 0 2px rgba(94, 214, 178, .18);
+  --sh-1: var(--library-shadow-card);
+  --sh-2: var(--library-shadow-raised);
+  --sh-3: var(--library-shadow-panel);
+  --sh-pop: var(--library-shadow-overlay);
+  --ring: var(--library-ring);
 }
 
 * {
@@ -96,7 +96,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-ui);
-  font-size: 13px;
+  font-size: var(--mantine-font-size-md);
   font-weight: 400;
   line-height: 1.45;
   font-optical-sizing: auto;
@@ -146,10 +146,6 @@ button:focus-visible {
   from { opacity: 0; transform: translateX(18px); }
   to   { opacity: 1; transform: translateX(0); }
 }
-@keyframes card-in {
-  from { opacity: 0; transform: translateY(18px) scale(.94); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
-}
 @keyframes pop-in {
   from { opacity: 0; transform: translateY(22px) scale(.92); }
   to   { opacity: 1; transform: translateY(0) scale(1); }
@@ -174,20 +170,12 @@ button:focus-visible {
   0%   { opacity: 0; transform: scale(0) rotate(-40deg); }
   100% { opacity: 1; transform: scale(1) rotate(0deg); }
 }
-@keyframes thumb-in {
-  from { opacity: 0; transform: scale(1.03); }
-  to   { opacity: 1; transform: scale(1); }
-}
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
 @keyframes pulse-dot {
   0%, 100% { box-shadow: 0 0 0 0 rgba(94, 214, 178, .55); }
   55%      { box-shadow: 0 0 0 5px rgba(94, 214, 178, 0); }
-}
-@keyframes sweep {
-  from { transform: translateX(-100%); }
-  to   { transform: translateX(320%); }
 }
 @keyframes float-soft {
   from { transform: rotate(-7deg) translateY(0); }
@@ -208,8 +196,7 @@ button:focus-visible {
   position: relative;
   height: 100vh;
   min-height: 660px;
-  display: grid;
-  grid-template-columns: 248px minmax(450px, 1fr) 304px;
+  display: block;
   overflow: hidden;
   background:
     radial-gradient(1100px 520px at 62% -18%, rgba(40, 92, 92, .26), transparent 60%),
@@ -238,7 +225,7 @@ button:focus-visible {
   min-height: 0;
   padding: 25px 15px 14px;
   overflow-y: auto;
-  background: linear-gradient(180deg, rgba(19, 29, 38, .92), rgba(15, 23, 31, .96));
+  background: linear-gradient(180deg, var(--library-sidebar), var(--bg));
   border-right: 1px solid var(--line);
   backdrop-filter: blur(8px);
   z-index: 2;
@@ -642,34 +629,6 @@ button:focus-visible {
   color: var(--text-4);
 }
 
-.storage-track {
-  position: relative;
-  height: 3px;
-  margin: 11px 0 12px;
-  background: #24333f;
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.storage-track span {
-  position: relative;
-  display: block;
-  height: 100%;
-  background: linear-gradient(90deg, var(--mint-3), var(--mint-2));
-  border-radius: 4px;
-  transition: width .7s var(--e-expo);
-  overflow: hidden;
-}
-
-.storage-track span::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  width: 30%;
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .5), transparent);
-  animation: sweep 2.8s var(--e-io) infinite;
-}
-
 .online {
   display: flex;
   align-items: center;
@@ -706,7 +665,7 @@ button:focus-visible {
   gap: 13px;
   padding: 0 26px;
   border-bottom: 1px solid var(--line);
-  background: rgba(16, 24, 32, .72);
+  background: var(--library-overlay);
   backdrop-filter: blur(14px) saturate(1.3);
   animation: fade-down var(--t-slow) .05s var(--e-expo) both;
 }
@@ -912,25 +871,23 @@ button:focus-visible {
   border: 1px solid var(--line);
   border-radius: var(--r3);
   overflow: hidden;
-  background: linear-gradient(160deg, #1a2632, #16202a 70%);
+  background: var(--panel-2);
   text-align: left;
   box-shadow: var(--sh-1);
-  animation: card-in .5s both var(--e-spring);
+  animation: none;
   transition:
-    transform .45s var(--e-spring),
-    border-color .3s var(--e-emph),
-    box-shadow .45s var(--e-emph);
+    background var(--t-fast) var(--e-emph),
+    border-color var(--t-fast) var(--e-emph);
 }
 
 .asset-card:hover {
-  transform: translateY(-4px) scale(1.012);
-  border-color: rgba(94, 180, 152, .55);
-  box-shadow: var(--sh-2), 0 0 0 1px rgba(94, 214, 178, .1);
+  background: var(--panel-3);
+  border-color: var(--mint);
 }
 
-.asset-card:active {
-  transform: translateY(-1px) scale(.985);
-  transition-duration: .12s;
+.asset-card:focus-visible {
+  outline: 2px solid var(--mint);
+  outline-offset: -3px;
 }
 
 .asset-card.selected {
@@ -996,15 +953,6 @@ button:focus-visible {
   border-color: rgba(209, 167, 230, .12);
 }
 
-.asset-card:hover .orbit-one {
-  transform: rotate(-22deg) scaleY(.44);
-  border-color: rgba(142, 233, 208, .22);
-}
-
-.asset-card:hover .orbit-two {
-  transform: rotate(26deg) scaleY(.52);
-}
-
 .asset-art.motion .art-orbit, .inspector-preview.motion .art-orbit {
   border-color: rgba(223, 181, 255, .14);
 }
@@ -1023,25 +971,12 @@ button:focus-visible {
   transition: transform .8s var(--e-expo), background .5s;
 }
 
-.asset-card:hover .art-glow {
-  transform: scale(1.22);
-  background: rgba(139, 227, 195, .2);
-}
-
 .asset-art.motion .art-glow {
   background: rgba(190, 140, 225, .12);
 }
 
-.asset-art.motion:hover .art-glow, .asset-card:hover .asset-art.motion .art-glow {
-  background: rgba(190, 140, 225, .2);
-}
-
 .asset-art.scene .art-glow {
   background: rgba(230, 173, 97, .12);
-}
-
-.asset-card:hover .asset-art.scene .art-glow {
-  background: rgba(230, 173, 97, .2);
 }
 
 .art-glyph {
@@ -1061,12 +996,6 @@ button:focus-visible {
   box-shadow: inset 0 0 24px rgba(153, 236, 209, .11), 0 7px 34px rgba(7, 16, 17, .33);
   transform: translateY(2px);
   transition: transform .55s var(--e-spring), text-shadow .45s, box-shadow .45s;
-}
-
-.asset-card:hover .art-glyph {
-  transform: translateY(-3px) scale(1.06);
-  text-shadow: 0 0 26px rgba(143, 229, 197, .75);
-  box-shadow: inset 0 0 30px rgba(153, 236, 209, .16), 0 12px 40px rgba(7, 16, 17, .4);
 }
 
 .asset-art.motion .art-glyph {
@@ -1111,30 +1040,39 @@ button:focus-visible {
   font-size: 10px;
 }
 
-.missing-preview {
+.asset-status-marker {
   position: absolute;
   z-index: 2;
   top: 9px;
   right: 8px;
   padding: 3px 6px;
-  border: 1px solid rgba(255, 255, 255, .12);
-  border-radius: 4px;
-  background: rgba(12, 18, 25, .68);
-  backdrop-filter: blur(4px);
-  color: #c3cccc;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r1);
+  background: var(--library-overlay);
+  color: var(--text-2);
   font-size: 10px;
+  line-height: 1.35;
 }
+
+.asset-status-marker[data-tone="error"] { color: var(--library-error); border-color: var(--library-error); }
+.asset-status-marker[data-tone="warning"] { color: var(--library-warning); border-color: var(--library-warning); }
+.asset-status-marker[data-tone="info"] { color: var(--library-info); border-color: var(--library-info); }
 
 .asset-card-body {
   padding: 11px 11px 12px;
 }
 
 .asset-card-title {
+  display: -webkit-box;
+  height: 2.9em;
   overflow: hidden;
   color: var(--text);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow-wrap: anywhere;
   font-size: 12px;
+  line-height: 1.45;
   font-weight: 600;
   letter-spacing: -.01em;
 }
@@ -1231,13 +1169,16 @@ button:focus-visible {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  animation: thumb-in .55s var(--e-expo) both;
-  transition: transform .7s var(--e-expo);
+  animation: none;
 }
 
-.asset-card:hover .card-thumbnail-image {
-  transform: scale(1.05);
+/* Virtual cards remount while scrolling; fallback artwork and markers stay still. */
+.asset-card .art-orbit, .asset-card .art-glow, .asset-card .art-glyph,
+.asset-card .favorite-marker, .asset-card .asset-bulk-checkbox {
+  animation: none;
+  transition: none;
 }
+.asset-card .art-glow { filter: none; opacity: .45; }
 
 .asset-art.has-thumbnail {
   background: #101820;
@@ -1251,10 +1192,11 @@ button:focus-visible {
 
 .thumbnail-load-error {
   padding: 10px;
-  color: #e0a8a3;
+  color: var(--text-2);
   font-size: 11px;
   text-align: center;
 }
+.thumbnail-load-error[data-tone="error"] { color: var(--library-error); }
 
 /* ============ 空状态 ============ */
 
@@ -1374,6 +1316,12 @@ button:focus-visible {
   gap: 8px;
 }
 
+/* Recovery actions take priority over decorative artwork in short desktop windows. */
+@media (max-height: 780px) {
+  .empty-state { min-height: 240px; padding: 18px 12px; }
+  .empty-state .empty-illustration { display: none; }
+}
+
 .privacy-note {
   display: flex;
   align-items: center;
@@ -1399,13 +1347,17 @@ button:focus-visible {
   gap: 7px;
   min-height: 32px;
   margin: -8px 0 14px;
-  animation: banner-in .4s var(--e-spring) both;
+  padding: 10px 12px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r2);
+  background: var(--mint-veil);
+  box-shadow: inset 3px 0 0 var(--mint);
 }
 
 .bulk-actions > span {
   flex: 1 0 100%;
   margin-right: auto;
-  color: var(--text-3);
+  color: var(--text-2);
   font-size: 10.5px;
 }
 
@@ -1648,7 +1600,7 @@ button:focus-visible {
   min-height: 0;
   padding: 20px 17px 12px;
   border-left: 1px solid var(--line);
-  background: linear-gradient(180deg, rgba(20, 31, 40, .92), rgba(16, 25, 32, .96));
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
   backdrop-filter: blur(8px);
   overflow: auto;
   animation: fade-right var(--t-slow) .1s var(--e-expo) both;
@@ -2590,9 +2542,6 @@ button:focus-visible {
 @media (max-width: 680px) { .folder-browser-toolbar { align-items: flex-start; flex-direction: column; } .folder-view-actions { justify-content: flex-start; } }
 
 @media (max-width: 1250px) {
-  .app-shell {
-    grid-template-columns: 220px minmax(420px, 1fr) 272px;
-  }
   .topbar {
     padding: 0 18px;
     gap: 9px;
@@ -2612,9 +2561,6 @@ button:focus-visible {
 }
 
 @media (max-width: 1060px) {
-  .app-shell {
-    grid-template-columns: 205px minmax(400px, 1fr) 250px;
-  }
   .breadcrumbs {
     min-width: 100px;
   }
@@ -2637,19 +2583,19 @@ button:focus-visible {
     animation-duration: .01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
 /* Library startup and compact controls */
-.startup-screen { min-height: 100vh; display: flex; flex-direction: column; justify-content: center; align-items: center; background: radial-gradient(ellipse at 50% 40%, #193c39, #0e141b 65%); color: #c4ddd6; font-family: var(--font-sans, sans-serif); }
-.startup-brand { color: #68dbc0; font-size: 64px; margin-bottom: 22px; }
-.startup-screen > span, .startup-screen small { color: #789b9a; letter-spacing: .2em; font-size: 11px; }
+.startup-screen { min-height: 100vh; display: flex; flex-direction: column; justify-content: center; align-items: center; background: radial-gradient(ellipse at 50% 40%, var(--library-selected), var(--bg) 65%); color: var(--text); font-family: var(--font-ui); }
+.startup-brand { color: var(--mint); font-size: 64px; margin-bottom: 22px; }
+.startup-screen > span, .startup-screen small { color: var(--text-4); letter-spacing: .2em; font-size: 11px; }
 .startup-screen h1 { margin: 14px 0; font-size: 32px; }
 .startup-screen p { max-width: 600px; margin: 18px 28px; text-align: center; }
-@keyframes startup-loading { to { background-position: -200% 0; } }
-.startup-status-detail { max-width: min(680px, 85vw); display: grid; gap: 10px; color: #9abbb4; text-align: center; font-size: 12px; overflow-wrap: anywhere; }
-.startup-status-detail strong { color: #c6e9da; }
-.startup-status-detail .startup-waiting { color: #dbc89a; }
+.startup-status-detail { max-width: min(680px, 85vw); display: grid; gap: 10px; color: var(--text-2); text-align: center; font-size: 12px; overflow-wrap: anywhere; }
+.startup-status-detail strong { color: var(--mint-2); }
+.startup-status-detail .startup-waiting { color: var(--library-warning); }
 .startup-screen .startup-log-path { margin-top: 12px; letter-spacing: 0; }
 .topbar { height: auto; min-height: 69px; flex-basis: auto; flex-wrap: wrap; padding-top: 10px; padding-bottom: 10px; }
 .topbar .breadcrumbs { min-width: 0; max-width: 120px; }

@@ -10,13 +10,16 @@ export async function loadViewerTextures(paths: string[], active: () => boolean,
 }
 
 export function setMaterialAlpha(material: any, opacity: number, alphaMode = 0) {
-  const transparent = opacity < 0.999 || alphaMode === 2;
-  const alphaTest = alphaMode === 1 ? 0.5 : transparent ? 0.01 : 0;
-  const coverage = alphaMode === 1 && !transparent;
-  if (material.transparent !== transparent || material.alphaTest !== alphaTest || material.alphaToCoverage !== coverage) material.needsUpdate = true;
-  material.transparent = transparent;
+  // PMX groups contain overlapping triangles; sorting a whole group cannot fix
+  // their self-overdraw. Three's alpha hash keeps per-fragment depth instead.
+  const alphaHash = opacity < 0.999 || alphaMode === 2;
+  const alphaTest = alphaHash ? 0 : alphaMode === 1 ? 0.5 : 0;
+  const coverage = alphaMode === 1 && !alphaHash;
+  if (material.transparent || material.alphaHash !== alphaHash || material.alphaTest !== alphaTest || material.alphaToCoverage !== coverage) material.needsUpdate = true;
+  material.transparent = false;
+  material.alphaHash = alphaHash;
   material.opacity = opacity;
-  material.depthWrite = !transparent;
+  material.depthWrite = true;
   material.alphaTest = alphaTest;
   material.alphaToCoverage = coverage;
 }

@@ -294,26 +294,64 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       if (isScene) {
         controls.enabled = false;
         renderer.domElement.tabIndex = 0;
+        const syncModifiers = (event: { shiftKey: boolean; ctrlKey: boolean }) => {
+          if (event.shiftKey) pressed.add("Shift"); else pressed.delete("Shift");
+          if (event.ctrlKey) pressed.add("Control"); else pressed.delete("Control");
+        };
         const keyDown = (event: KeyboardEvent) => {
           if (event.target instanceof HTMLElement && (event.target.matches("input,select,textarea,button") || event.target.isContentEditable)) return;
-          if (!["KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE"].includes(event.code)) return;
-          event.preventDefault(); pressed.add(event.code);
+          if (!["KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE", "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight"].includes(event.code)) return;
+          event.preventDefault(); syncModifiers(event); pressed.add(event.code);
         };
-        const keyUp = (event: KeyboardEvent) => { pressed.delete(event.code); };
-        const clear = () => { pressed.clear(); dragPointer = null; };
+        const keyUp = (event: KeyboardEvent) => { pressed.delete(event.code); syncModifiers(event); };
+        let disposed = false;
+        let dragButton = 0;
+        const releaseLock = () => {
+          if (document.pointerLockElement === renderer.domElement) document.exitPointerLock();
+        };
+        const up = () => {
+          const pointer = dragPointer;
+          dragPointer = null;
+          if (pointer !== null && renderer.domElement.hasPointerCapture(pointer)) renderer.domElement.releasePointerCapture(pointer);
+          releaseLock();
+        };
+        const clear = () => { pressed.clear(); up(); };
+        const lockError = () => {
+          if (disposed || dragPointer === null) return;
+          clear();
+          console.warn("场景视口无法锁定鼠标，请松开后重新按下鼠标。");
+        };
+        const lockChange = () => {
+          if (document.pointerLockElement === renderer.domElement) {
+            // The button may have been released before the async lock completed.
+            if (disposed || dragPointer === null) releaseLock();
+          } else if (dragPointer !== null) clear();
+        };
         const down = (event: PointerEvent) => {
-          if (event.button !== 0 && event.button !== 2) return;
-          event.preventDefault(); renderer.domElement.focus({ preventScroll: true });
-          renderer.domElement.setPointerCapture(event.pointerId);
-          dragPointer = event.pointerId; lastX = event.clientX; lastY = event.clientY;
+          if ((event.button !== 0 && event.button !== 2) || dragPointer !== null) return;
+          event.preventDefault(); syncModifiers(event); renderer.domElement.focus({ preventScroll: true });
+          dragPointer = event.pointerId; dragButton = event.button; lastX = event.clientX; lastY = event.clientY;
+          if (event.pointerType === "mouse") {
+            try {
+              const request = renderer.domElement.requestPointerLock();
+              request?.then(() => { if (disposed || dragPointer === null) releaseLock(); }).catch(lockError);
+            } catch { lockError(); }
+          } else renderer.domElement.setPointerCapture(event.pointerId);
+        };
+        const rotate = (dx: number, dy: number) => {
+          yaw -= dx * 0.003;
+          pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, pitch - dy * 0.003));
+          orient();
         };
         const move = (event: PointerEvent) => {
-          if (dragPointer !== event.pointerId) return;
-          yaw -= (event.clientX - lastX) * 0.003;
-          pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, pitch - (event.clientY - lastY) * 0.003));
-          lastX = event.clientX; lastY = event.clientY; orient();
+          if (dragPointer !== event.pointerId || document.pointerLockElement === renderer.domElement) return;
+          rotate(event.clientX - lastX, event.clientY - lastY);
+          lastX = event.clientX; lastY = event.clientY;
         };
-        const up = () => { dragPointer = null; };
+        const lockedMove = (event: MouseEvent) => {
+          if (dragPointer !== null && document.pointerLockElement === renderer.domElement) rotate(event.movementX, event.movementY);
+        };
+        const mouseUp = (event: MouseEvent) => { if (event.button === dragButton) up(); };
         const context = (event: Event) => event.preventDefault();
         const wheel = (event: WheelEvent) => {
           event.preventDefault();
@@ -322,12 +360,17 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
           camera.updateProjectionMatrix();
         };
         window.addEventListener("keydown", keyDown); window.addEventListener("keyup", keyUp); window.addEventListener("blur", clear);
+        document.addEventListener("pointerlockchange", lockChange); document.addEventListener("pointerlockerror", lockError);
+        document.addEventListener("mousemove", lockedMove); document.addEventListener("mouseup", mouseUp);
         renderer.domElement.addEventListener("pointerdown", down); renderer.domElement.addEventListener("pointermove", move);
         renderer.domElement.addEventListener("pointerup", up); renderer.domElement.addEventListener("pointercancel", up); renderer.domElement.addEventListener("lostpointercapture", up);
         renderer.domElement.addEventListener("contextmenu", context);
         renderer.domElement.addEventListener("wheel", wheel, { passive: false });
         disposeFlyControls = () => {
+          disposed = true;
           clear(); window.removeEventListener("keydown", keyDown); window.removeEventListener("keyup", keyUp); window.removeEventListener("blur", clear);
+          document.removeEventListener("pointerlockchange", lockChange); document.removeEventListener("pointerlockerror", lockError);
+          document.removeEventListener("mousemove", lockedMove); document.removeEventListener("mouseup", mouseUp);
           renderer.domElement.removeEventListener("pointerdown", down); renderer.domElement.removeEventListener("pointermove", move);
           renderer.domElement.removeEventListener("pointerup", up); renderer.domElement.removeEventListener("pointercancel", up); renderer.domElement.removeEventListener("lostpointercapture", up);
           renderer.domElement.removeEventListener("contextmenu", context);
@@ -378,7 +421,8 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
           movement.set(Number(pressed.has("KeyD")) - Number(pressed.has("KeyA")), 0, Number(pressed.has("KeyS")) - Number(pressed.has("KeyW")));
           movement.applyQuaternion(camera.quaternion);
           movement.y += Number(pressed.has("KeyE")) - Number(pressed.has("KeyQ"));
-          if (movement.lengthSq()) camera.position.addScaledVector(movement.normalize(), flySpeed * delta);
+          const speedMultiplier = pressed.has("Control") ? 0.25 : pressed.has("Shift") ? 4 : 1;
+          if (movement.lengthSq()) camera.position.addScaledVector(movement.normalize(), flySpeed * speedMultiplier * delta);
         } else controls.update();
         renderer.render(scene, camera);
       });
@@ -827,7 +871,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
           <div className="model-viewer-canvas" ref={host} />
           {loading && <div className="model-viewer-message">正在由 Rust Core 解析 3D 网格…</div>}
           {error && <div className="model-viewer-message model-viewer-error">模型无法预览：{error}</div>}
-          {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls">{asset.assetType === "scene" ? <><span>WASD 移动</span><span>Q 降 / E 升</span><span>左键 / 右键拖动朝向</span><span>滚轮调整 FOV</span></> : <><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span></>}<Button onClick={resetCamera}>重置视角</Button></div></>}
+          {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls">{asset.assetType === "scene" ? <><span>WASD 移动</span><span>Q 降 / E 升</span><span>Shift 加速 / Ctrl 慢速</span><span>左键 / 右键拖动朝向</span><span>滚轮调整 FOV</span></> : <><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span></>}<Button onClick={resetCamera}>重置视角</Button></div></>}
         </main>
       </div><footer className="model-viewer-footer">{asset.assetType === "scene" ? "场景以源文件的世界坐标和材质显示。" : "已解析 PMX 权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer></Modal.Body></Modal.Content></Modal.Root>;
 }

@@ -5,7 +5,7 @@ import { setNonce } from "get-nonce";
 import "@mantine/core/styles.css";
 import "./styles.css";
 import "./mantine-layout.css";
-import { libraryTheme } from "./theme";
+import { libraryCssVariablesResolver, libraryTheme } from "./theme";
 import { invoke } from "@tauri-apps/api/core";
 import { toUiError } from "./uiError";
 
@@ -57,7 +57,7 @@ function Startup() {
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <MantineProvider theme={libraryTheme} forceColorScheme="dark" getStyleNonce={getStyleNonce}>
+    <MantineProvider theme={libraryTheme} cssVariablesResolver={libraryCssVariablesResolver} forceColorScheme="dark" getStyleNonce={getStyleNonce}>
       <Startup />
     </MantineProvider>
   </React.StrictMode>,

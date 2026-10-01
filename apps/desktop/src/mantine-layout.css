@@ -1,5 +1,21 @@
 /* Product layout and asset artwork stay local; Mantine owns control styling. */
-.app-shell { display: block; overflow: clip; }
+.app-shell { overflow: clip; }
+
+/* Match existing compact heights while keeping their values in the theme. */
+.mantine-Button-root {
+  --button-height-xs: var(--library-control-xs);
+  --button-height-sm: var(--library-control-sm);
+  --button-height-md: var(--library-control-md);
+  --button-height-lg: var(--library-control-lg);
+  --button-height-xl: var(--library-control-xl);
+}
+.mantine-Input-wrapper {
+  --input-height-xs: var(--library-control-xs);
+  --input-height-sm: var(--library-control-sm);
+  --input-height-md: var(--library-control-md);
+  --input-height-lg: var(--library-control-lg);
+  --input-height-xl: var(--library-control-xl);
+}
 /* Decorative glow must not create a hidden scroll range during modal autofocus. */
 .app-shell::before { inset: -20% 0 auto; }
 .app-shell > .mantine-AppShell-navbar,

@@ -4,22 +4,22 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border: 1px solid #3d5962;
-  border-radius: 9px;
-  background: #14212a;
-  box-shadow: 0 28px 90px #000a;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r4);
+  background: var(--panel);
+  box-shadow: var(--sh-pop);
 }
 
-.motion-viewer-stage { position: relative; flex: 1; min-height: 0; background: #10191f; }
+.motion-viewer-stage { position: relative; flex: 1; min-height: 0; background: var(--bg); }
 .motion-viewer-stage canvas { display: block; width: 100%; height: 100%; }
 .motion-viewer-timeline {
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 12px 16px;
-  border-top: 1px solid #314852;
-  color: #bfd0d1;
+  border-top: 1px solid var(--line);
+  color: var(--text-2);
   font-size: 12px;
 }
 .motion-viewer-timeline span { white-space: nowrap; font-variant-numeric: tabular-nums; }
-.motion-viewer-note { padding: 0 16px 11px; color: #8ba6a8; font-size: 10px; }
+.motion-viewer-note { padding: 0 16px 11px; color: var(--text-4); font-size: 10px; }
