@@ -394,6 +394,7 @@ export default function App() {
   const [jobsExpanded, setJobsExpanded] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const assetReadError = useRef<string | null>(null);
   const assetQueryRevision = useRef(0);
   const assetPageLoading = useRef<number | null>(null);
   const loadMoreRef = useRef<HTMLDivElement>(null);
@@ -488,16 +489,15 @@ export default function App() {
       const current = () => revision === assetQueryRevision.current;
       const reportError = (reason: unknown) => { if (current()) setError(toUiError(reason)); };
       let assetResponseSettled = !assetRequest;
-      let assetTimedOut = false;
       const assetTimeout = assetRequest ? window.setTimeout(() => {
         if (!current() || assetResponseSettled) return;
-        assetTimedOut = true;
         setAssets([]);
         setSelected(null);
         setBulkSelectedIds(new Set());
         setIsRefreshing(false);
         setAssetQueryError("资产读取超时，请重新读取。");
-        setError("资产读取超时，请点击“重新读取”重试。");
+        assetReadError.current = "资产读取超时，请点击“重新读取”重试。";
+        setError(assetReadError.current);
       }, 10_000) : null;
       await Promise.allSettled([
         invoke<Root[]>("roots_list").then((value) => {
@@ -547,14 +547,18 @@ export default function App() {
           setAssetQueryError("");
           void invoke("library_background_start").catch(reportError);
           setSelected((previous) => visible.find((asset) => asset.id === previous?.id) ?? null);
-          if (assetTimedOut) setError("");
+          const resolvedReadError = assetReadError.current;
+          assetReadError.current = null;
+          if (resolvedReadError) setError((previous) => previous === resolvedReadError ? "" : previous);
         }).catch((reason) => {
           if (current()) {
             setAssets([]);
             setSelected(null);
             setBulkSelectedIds(new Set());
-            setAssetQueryError(toUiError(reason));
-            reportError(reason);
+            const message = toUiError(reason);
+            assetReadError.current = message;
+            setAssetQueryError(message);
+            setError(message);
           }
         }).finally(() => {
           assetResponseSettled = true;
