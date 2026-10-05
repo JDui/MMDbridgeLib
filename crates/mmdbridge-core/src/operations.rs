@@ -1176,6 +1176,14 @@ pub(crate) fn execute(
         return Err(CoreError::AssetOperation(message));
     }
 
+    let moved_paths = match prepare_moved_paths(library, &prepared) {
+        Ok(paths) => paths,
+        Err(error) => {
+            let message = format!("索引路径预检失败，文件操作未执行：{error}");
+            finish_journal(library, &operation_id, "Failed", json!({"message":message}))?;
+            return Err(CoreError::AssetOperation(message));
+        }
+    };
     let actions = make_actions(&prepared);
     let completed = match execute_actions(&actions) {
         Ok(completed) => completed,
@@ -1197,7 +1205,7 @@ pub(crate) fn execute(
         }
     };
 
-    let index_warnings = match apply_index_change(library, &prepared) {
+    let index_warnings = match apply_index_change(library, &prepared, &moved_paths) {
         Ok(warnings) => warnings,
         Err(error) => {
             if matches!(prepared.kind, OperationKind::Recycle | OperationKind::DeleteModel) {
@@ -1364,7 +1372,41 @@ fn rollback_moves(completed: &[FileAction]) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<Vec<String>> {
+fn prepare_moved_paths(library: &Library, prepared: &PreparedPlan) -> CoreResult<HashMap<String, String>> {
+    let mut moved_paths = HashMap::new();
+    let connection = library.connection()?;
+    for package in &prepared.packages {
+        let Some(target) = package.target.as_ref() else { continue; };
+        for asset in &package.assets {
+            let mut paths = vec![asset.primary_source.clone(), asset.asset_directory.clone()];
+            let mut statement = connection.prepare("SELECT path FROM asset_files WHERE asset_id=?1")?;
+            paths.extend(statement.query_map([&asset.id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?);
+            if let Some(card_path) = connection.query_row(
+                "SELECT card_path FROM cards WHERE asset_id=?1", [&asset.id], |row| row.get::<_, String>(0),
+            ).optional()? { paths.push(card_path); }
+            let parsed: Option<String> = connection.query_row(
+                "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='parsed'", [&asset.id], |row| row.get(0),
+            ).optional()?;
+            if let Some(parsed) = parsed.and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                && let Some(dependencies) = parsed.get("file_dependencies").and_then(Value::as_array)
+            {
+                paths.extend(dependencies.iter().filter_map(|entry| entry.get("path").and_then(Value::as_str)).map(str::to_owned));
+            }
+            paths.extend(prepared.view.dependency_snapshots.iter()
+                .filter(|entry| entry.asset_id == asset.id).filter_map(|entry| entry.path.clone()));
+            for path in paths {
+                // Resolve Windows short names and verbatim prefixes while the source still exists.
+                let canonical = fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+                let new_path = remap_path(&canonical.to_string_lossy(), &package.source, target)?;
+                moved_paths.insert(path, new_path);
+            }
+        }
+    }
+    Ok(moved_paths)
+}
+
+fn apply_index_change(library: &Library, prepared: &PreparedPlan, moved_paths: &HashMap<String, String>) -> CoreResult<Vec<String>> {
     let mut connection = library.connection()?;
     let transaction = connection.transaction()?;
     if matches!(prepared.kind, OperationKind::Recycle | OperationKind::DeleteModel) {
@@ -1376,7 +1418,9 @@ fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<
         return Ok(refresh_derived_indices(library));
     }
 
-    let mut moved_path_map = HashMap::<String, String>::new();
+    let mapped_path = |path: &str| moved_paths.get(path).cloned().ok_or_else(|| {
+        CoreError::AssetOperation(format!("索引路径在文件操作期间发生变化，已拒绝更新：{path}"))
+    });
     for package in &prepared.packages {
         let target = package
             .target
@@ -1399,8 +1443,8 @@ fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<
             } else {
                 asset.root_id.clone()
             };
-            let primary = remap_path(&asset.primary_source, &package.source, target)?;
-            let asset_directory = remap_path(&asset.asset_directory, &package.source, target)?;
+            let primary = mapped_path(&asset.primary_source)?;
+            let asset_directory = mapped_path(&asset.asset_directory)?;
             let old_statuses: String = transaction.query_row(
                 "SELECT statuses_json FROM assets WHERE id=?1",
                 [&asset.id],
@@ -1410,8 +1454,6 @@ fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<
                 serde_json::from_str::<Vec<String>>(&old_statuses).unwrap_or_default();
             statuses.retain(|status| status != "MissingSource");
             let statuses_json = serde_json::to_string(&statuses)?;
-            moved_path_map.insert(asset.primary_source.clone(), primary.clone());
-            moved_path_map.insert(asset.asset_directory.clone(), asset_directory.clone());
             transaction.execute(
                 "UPDATE assets SET root_id=?2,primary_source=?3,asset_directory=?4,statuses_json=?5,updated_at=?6,last_seen_at=?6 WHERE id=?1",
                 params![asset.id, root_id, primary, asset_directory, statuses_json, Utc::now().to_rfc3339()],
@@ -1424,8 +1466,7 @@ fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<
                     .collect::<Result<Vec<_>, _>>()?
             };
             for old_path in file_paths {
-                let new_path = remap_path(&old_path, &package.source, target)?;
-                moved_path_map.insert(old_path.clone(), new_path.clone());
+                let new_path = mapped_path(&old_path)?;
                 transaction.execute(
                     "UPDATE asset_files SET path=?3,path_key=?4 WHERE asset_id=?1 AND path=?2",
                     params![asset.id, old_path, new_path,
@@ -1440,8 +1481,7 @@ fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<
                 )
                 .optional()?;
             if let Some(card_path) = card_path {
-                let new_card_path = remap_path(&card_path, &package.source, target)?;
-                moved_path_map.insert(card_path, new_card_path.clone());
+                let new_card_path = mapped_path(&card_path)?;
                 transaction.execute(
                     "UPDATE cards SET card_path=?2,status=CASE WHEN status='CardMissing' THEN status ELSE 'CardStale' END,last_checked_at=?3 WHERE asset_id=?1",
                     params![asset.id, new_card_path, Utc::now().to_rfc3339()],
@@ -1449,24 +1489,8 @@ fn apply_index_change(library: &Library, prepared: &PreparedPlan) -> CoreResult<
             }
         }
     }
-    for snapshot in &prepared.view.dependency_snapshots {
-        let Some(path) = snapshot.path.as_deref() else {
-            continue;
-        };
-        let Some(package) = prepared
-            .packages
-            .iter()
-            .find(|package| path_is_within(&package.source, Path::new(path)))
-        else {
-            continue;
-        };
-        let Some(target) = package.target.as_ref() else {
-            continue;
-        };
-        moved_path_map.insert(path.to_owned(), remap_path(path, &package.source, target)?);
-    }
-    rewrite_asset_dependency_paths(&transaction, &prepared.affected_assets, &moved_path_map)?;
-    rewrite_relation_paths(&transaction, &moved_path_map)?;
+    rewrite_asset_dependency_paths(&transaction, &prepared.affected_assets, moved_paths)?;
+    rewrite_relation_paths(&transaction, moved_paths)?;
     transaction.commit()?;
     drop(connection);
     Ok(refresh_derived_indices(library))
