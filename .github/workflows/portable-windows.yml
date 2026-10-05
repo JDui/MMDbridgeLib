@@ -1,0 +1,46 @@
+name: Portable Windows build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/desktop/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/portable-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+        working-directory: apps/desktop
+      - run: npm run tauri -- build --no-bundle
+        working-directory: apps/desktop
+      - name: Prepare portable EXE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts/MBL -Force | Out-Null
+          Copy-Item -LiteralPath target/release/mmdbridge-desktop.exe -Destination artifacts/MBL/MMDbridgeLib.exe
+          Get-Item artifacts/MBL/MMDbridgeLib.exe | Select-Object Name, Length
+      - uses: actions/upload-artifact@v7
+        with:
+          name: MBL-Portable-Windows
+          path: artifacts/MBL/MMDbridgeLib.exe
+          if-no-files-found: error
