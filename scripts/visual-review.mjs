@@ -27,7 +27,7 @@ await new Promise((ready, reject) => { server.once('error', reject); server.list
 let browser;
 try {
   browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ viewport: { width: 1480, height: 960 }, colorScheme: 'dark' });
+  const page = await browser.newPage({ viewport: { width: 1480, height: 960 }, colorScheme: 'dark', reducedMotion: 'reduce', locale: 'zh-CN' });
   page.setDefaultTimeout(15000);
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -46,10 +46,17 @@ try {
     }
   };
   await checkEvidence();
+  const resolveButton = journal.getByRole('button', { name: '已人工恢复并重扫，标记已核对', exact: true });
+  const listBounds = await journal.locator('.journal-entry-list').boundingBox();
+  const buttonBounds = await resolveButton.boundingBox();
+  assert.ok(listBounds && buttonBounds && buttonBounds.y >= listBounds.y
+    && buttonBounds.y + buttonBounds.height <= listBounds.y + listBounds.height,
+  'Expanded evidence must not clip the recovery action.');
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({ path: join(output, 'MBL_Continue_Stage5_Recovery.jpg'), type: 'jpeg', quality: 92, animations: 'disabled' });
   await journal.getByRole('button', { name: '已人工恢复并重扫，标记已核对', exact: true }).click();
   await page.getByRole('dialog', { name: '确认操作', exact: true }).getByRole('button', { name: '确认', exact: true }).click();
+  await page.getByRole('dialog', { name: '确认操作', exact: true }).waitFor({ state: 'hidden' });
   await journal.getByText('已核对', { exact: true }).waitFor();
   assert.equal(await journal.getByRole('button', { name: '已人工恢复并重扫，标记已核对', exact: true }).count(), 0);
   await checkEvidence();
@@ -63,7 +70,7 @@ try {
   assert.deepEqual(errors, []);
   await fs.writeFile(join(output, 'verification.json'), JSON.stringify({ sourceCommit: process.env.GITHUB_SHA,
     sampleData: true, headless: true, recoveryEvidenceGroups: 3, resolvedEvidenceGroups: 3,
-    activeResolveButtonCount: 0, pageErrors: errors }, null, 2));
+    activeResolveButtonCount: 0, recoveryActionFullyVisible: true, pageErrors: errors }, null, 2));
   console.log('Recovery evidence, resolved evidence, and active-operation controls verified.');
 } finally {
   await browser?.close();

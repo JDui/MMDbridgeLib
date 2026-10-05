@@ -228,6 +228,14 @@ html[data-library-transparency="off"] .mantine-Overlay-root { backdrop-filter: n
 .journal-status.needs-recovery { color: var(--library-warning); background: var(--amber-veil); }
 .journal-status.failed { color: var(--library-error); background: var(--rose-veil); }
 .journal-action-details summary { color: var(--text-2); }
+.journal-entry-list { max-height: min(56vh, 560px); }
+.journal-entry { flex-shrink: 0; padding: 14px; }
+.journal-heading-row { font-size: 13px; line-height: 1.65; }
+.journal-entry-heading { font-size: 13px; }
+.journal-status { font-size: 11px; }
+.journal-entry-paths, .journal-entry-result, .journal-action-details { font-size: 12px; line-height: 1.65; }
+.journal-entry-result, .journal-action-details { color: var(--text-3); }
+.journal-resolve-button { margin-top: 12px; font-size: 12px; }
 .thumbnail-preview-frame { background: var(--library-art); border-color: var(--line-2); }
 .thumbnail-preview-empty { color: var(--text-3); }
 .jobs-panel-row:hover { background: var(--raise); }

@@ -18,6 +18,11 @@ const reviewJournal = [{
  completedPaths: ['E:\\MMD\\Models\\初音ミク'], uncertainPaths: ['E:\\MMD\\Models\\洛天依'],
  notStartedPaths: ['E:\\MMD\\Models\\乐正绫'], indexUpdateFailed: true}
 }];
+if (params.get('review') === 'live') {
+ delete reviewJournal[0].result.uncertainPaths;
+ delete reviewJournal[0].result.indexUpdateFailed;
+ reviewJournal[0].result.notStartedPaths.push('E:\\MMD\\Models\\洛天依');
+}
 const empty = params.get('state') === 'empty';
 let callback = 0;
 window.__TAURI_INTERNALS__ = {
