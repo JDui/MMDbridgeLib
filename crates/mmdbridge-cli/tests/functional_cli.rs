@@ -205,8 +205,11 @@ fn failed_worker_commands_fail_but_job_queries_still_succeed() {
     let batch = fixture.run(&["thumbnail", "batch", &id, &id]);
     assert!(!batch.status.success());
     let jobs: Value = serde_json::from_slice(&batch.stdout).unwrap();
-    assert_eq!(jobs.as_array().unwrap().len(), 1);
+    // Results retain input order, while duplicate assets share a single job.
+    assert_eq!(jobs.as_array().unwrap().len(), 2);
+    assert_eq!(jobs[0]["id"], jobs[1]["id"]);
     assert_eq!(jobs[0]["status"], "Failed");
+    assert_eq!(jobs[1]["status"], "Failed");
 
     let generate = fixture.run(&["cards", "generate", "--root", &root_id]);
     assert!(!generate.status.success());
