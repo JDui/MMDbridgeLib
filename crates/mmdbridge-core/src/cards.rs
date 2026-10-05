@@ -7,7 +7,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -747,6 +747,15 @@ fn create_checked(
         return Err(CoreError::Card("资产路径或文件操作状态在资源卡准备期间发生变化，请稍后重试".to_owned()));
     }
 
+    let context_is_current = match publication_context_is_current(&transaction, &context) {
+        Ok(current) => current,
+        Err(error) => { let _ = fs::remove_file(&temp_path); return Err(error); }
+    };
+    if !context_is_current {
+        let _ = fs::remove_file(&temp_path);
+        return Err(CoreError::Card("资产信息或资源卡在准备期间发生变化，请稍后重试".to_owned()));
+    }
+
     let replacing = matches!(target_kind, TargetKind::Replace);
     if replacing && !card_owned_by(&target, &context.asset_id) {
         let _ = fs::remove_file(&temp_path);
@@ -902,6 +911,21 @@ pub(crate) fn cached_thumbnail(
 fn load_context(library: &Library, asset_id: &str) -> CoreResult<AssetContext> {
     library.ensure_asset_visible(asset_id)?;
     let connection = library.connection()?;
+    load_context_on(&connection, asset_id)
+}
+
+fn publication_context_is_current(connection: &Connection, expected: &AssetContext) -> CoreResult<bool> {
+    let current = load_context_on(connection, &expected.asset_id)?;
+    Ok(current.asset_type == expected.asset_type && current.name == expected.name
+        && current.source_path == expected.source_path && current.root_path == expected.root_path
+        && current.fingerprint == expected.fingerprint && current.metadata == expected.metadata
+        && current.tags == expected.tags && current.suppressed_tags == expected.suppressed_tags
+        && current.is_favorite == expected.is_favorite
+        && current.current_card_path == expected.current_card_path
+        && current.current_manifest_json == expected.current_manifest_json)
+}
+
+fn load_context_on(connection: &Connection, asset_id: &str) -> CoreResult<AssetContext> {
     let row: Option<(
         String,
         String,
@@ -1409,6 +1433,47 @@ fn is_windows_numbered_device(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn publication_library() -> Library {
+        let library = Library::in_memory().unwrap();
+        library.connection().unwrap().execute_batch(
+            "INSERT INTO roots(id,asset_type,path,path_key,display_name,created_at) VALUES ('r','model','/r','/r','Root','now');
+             INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,fingerprint,created_at,updated_at,last_seen_at)
+             VALUES ('a','r','model','A','/r/a/model.pmx','/r/a','before','now','now','now');
+             INSERT INTO metadata(asset_id,key,value_json) VALUES ('a','parsed','{}');
+             INSERT INTO cards(asset_id,card_path,status,manifest_json,last_checked_at) VALUES ('a','/r/a/A.MMDRCV','CardValid','{}','now');"
+        ).unwrap();
+        library
+    }
+
+    #[test]
+    fn publication_rejects_annotations_changed_after_preparation() {
+        let library = publication_library();
+        let original = load_context(&library, "a").unwrap();
+        assert!(publication_context_is_current(&library.connection().unwrap(), &original).unwrap());
+        library.set_favorite("a", true).unwrap();
+        assert!(!publication_context_is_current(&library.connection().unwrap(), &original).unwrap());
+        let favorite = load_context(&library, "a").unwrap();
+        assert!(publication_context_is_current(&library.connection().unwrap(), &favorite).unwrap());
+        library.add_asset_tag("a", "新标签", "user", None).unwrap();
+        assert!(!publication_context_is_current(&library.connection().unwrap(), &favorite).unwrap());
+        let tagged = load_context(&library, "a").unwrap();
+        library.remove_asset_tag("a", "新标签").unwrap();
+        assert!(!publication_context_is_current(&library.connection().unwrap(), &tagged).unwrap());
+        let removed = load_context(&library, "a").unwrap();
+        library.connection().unwrap().execute(r#"UPDATE metadata SET value_json='{"bone_count":20}' WHERE asset_id='a' AND key='parsed'"#, []).unwrap();
+        assert!(!publication_context_is_current(&library.connection().unwrap(), &removed).unwrap());
+    }
+
+    #[test]
+    fn publication_rejects_a_card_updated_by_another_writer() {
+        let library = publication_library();
+        let prepared = load_context(&library, "a").unwrap();
+        library.connection().unwrap().execute(r#"UPDATE cards SET manifest_json='{"updated_at":"later"}' WHERE asset_id='a'"#, []).unwrap();
+        assert!(!publication_context_is_current(&library.connection().unwrap(), &prepared).unwrap());
+        let current = load_context(&library, "a").unwrap();
+        assert!(publication_context_is_current(&library.connection().unwrap(), &current).unwrap());
+    }
 
     #[test]
     fn rendered_asset_version_cannot_be_published_as_a_newly_scanned_version() {
