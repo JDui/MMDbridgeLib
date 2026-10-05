@@ -3,10 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0e141b" />
+    <meta name="theme-color" content="#e9edf3" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#14171d" media="(prefers-color-scheme: dark)" />
     <title>MMDbridgeLib</title>
     <!-- Tauri assigns this style a per-document nonce during packaging. -->
-    <style id="library-style-nonce">html, body { background: #0e141b; color-scheme: dark; } .startup-fallback { min-height: 95vh; display: grid; place-content: center; text-align: center; font-family: sans-serif; color: #c4ddd6; }</style>
+    <style id="library-style-nonce">html, body { background: #e9edf3; color-scheme: light; } @media (prefers-color-scheme: dark) { html, body { background: #14171d; color-scheme: dark; } } .startup-fallback { min-height: 95vh; display: grid; place-content: center; text-align: center; font-family: sans-serif; color: #64738a; }</style>
   </head>
   <body>
     <div id="root"><div class="startup-fallback"><h1>MMDbridgeLib</h1><p>正在启动资产库…</p></div></div>

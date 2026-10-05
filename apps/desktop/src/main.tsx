@@ -1,10 +1,13 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { Alert, Loader, MantineProvider, Progress } from "@mantine/core";
+import { Alert, Loader, localStorageColorSchemeManager, MantineProvider, Progress } from "@mantine/core";
+import { Boxes } from "lucide-react";
 import { setNonce } from "get-nonce";
 import "@mantine/core/styles.css";
 import "./styles.css";
 import "./mantine-layout.css";
+import "./glass.css";
+import { applyAppearancePreferences } from "./AppearanceSettings";
 import { libraryCssVariablesResolver, libraryTheme } from "./theme";
 import { invoke } from "@tauri-apps/api/core";
 import { toUiError } from "./uiError";
@@ -15,6 +18,8 @@ const App = React.lazy(() => import("./App"));
 const getStyleNonce = () => document.querySelector<HTMLStyleElement>("#library-style-nonce")?.nonce || "";
 // Mantine's modal scroll lock uses react-style-singleton, which has its own nonce API.
 setNonce(getStyleNonce());
+applyAppearancePreferences();
+const colorSchemeManager = localStorageColorSchemeManager({ key: "mmdbridge-color-scheme" });
 
 function Startup() {
   const [ready, setReady] = React.useState(false);
@@ -38,10 +43,10 @@ function Startup() {
     void poll();
     return () => { active = false; window.clearTimeout(timer); };
   }, []);
-  if (ready) return <React.Suspense fallback={<div className="startup-screen" role="status"><Loader size="sm" /><p>正在载入 Library 界面…</p></div>}><App /></React.Suspense>;
+  if (ready) return <React.Suspense fallback={<div className="startup-screen" role="status"><Loader size="sm" /><p>正在载入资产库…</p></div>}><App /></React.Suspense>;
   const determinate = progress?.completed !== null && progress?.completed !== undefined && (progress.total ?? 0) > 0;
   const percent = determinate ? Math.min(100, progress!.completed! / progress!.total! * 100) : null;
-  return <div className="startup-screen"><div className="startup-brand">◇</div><span>ASSET LIBRARY</span><h1>MMDbridgeLib</h1>
+  return <div className="startup-screen"><div className="startup-brand"><Boxes size={36} strokeWidth={1.5} aria-hidden="true" /></div><h1>MMDbridgeLib</h1>
     {!error && <p role="status">{phase}</p>}
     {progress && <div className="startup-status-detail"><div>{progress.detail}</div>
       <div>初始化阶段 {Math.max(1, progress.step)} / 6 · 已用 {Math.floor(progress.elapsed_ms / 1000)} 秒 · 本阶段 {Math.floor(progress.phase_elapsed_ms / 1000)} 秒</div>
@@ -57,7 +62,7 @@ function Startup() {
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <MantineProvider theme={libraryTheme} cssVariablesResolver={libraryCssVariablesResolver} forceColorScheme="dark" getStyleNonce={getStyleNonce}>
+    <MantineProvider theme={libraryTheme} cssVariablesResolver={libraryCssVariablesResolver} defaultColorScheme="auto" colorSchemeManager={colorSchemeManager} getStyleNonce={getStyleNonce}>
       <Startup />
     </MantineProvider>
   </React.StrictMode>,

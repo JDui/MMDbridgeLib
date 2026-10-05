@@ -1,5 +1,7 @@
 import { ActionIcon, Button, Checkbox, NativeSelect, Slider, TextInput, UnstyledButton, Alert, AppShell, Badge, Menu, Modal, MultiSelect, Progress, Tabs } from "@mantine/core";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowUpRight, Box, Boxes, Camera, Check, ChevronDown, ChevronRight, ChevronUp, Clapperboard, FileText, Folder, FolderOpen, Grid2X2, History, Layers3, ListTodo, Minus, MoreHorizontal, PanelRight, Play, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, Star, X } from "lucide-react";
+import { AppearanceSettings } from "./AppearanceSettings";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -196,7 +198,17 @@ function readLocalJson<T>(key: string, fallback: T): T {
 }
 
 const categoryLabels: Record<AssetType, string> = { model: "模型", motion: "动作", scene: "场景" };
-const categoryGlyphs: Record<AssetType, string> = { model: "◇", motion: "♫", scene: "▧" };
+const categoryIcons = { model: Box, motion: Clapperboard, scene: Layers3 };
+function AssetKindIcon({ type, size = 18 }: { type: AssetType; size?: number }) {
+  const Icon = categoryIcons[type];
+  return <Icon size={size} strokeWidth={1.6} aria-hidden="true" />;
+}
+function assetSummary(asset: Asset) {
+  if (asset.assetType === "motion" && typeof asset.metadata.duration_seconds === "number") return `${asset.metadata.duration_seconds.toFixed(1)} 秒`;
+  if (typeof asset.metadata.polygon_count === "number") return `${asset.metadata.polygon_count.toLocaleString()} 面`;
+  if (typeof asset.metadata.total_frames === "number") return `${asset.metadata.total_frames.toLocaleString()} 帧`;
+  return asset.primarySource.split(/[\\/]/).pop();
+}
 const filterFieldLabels: Record<FilterField, string> = {
   skeletonClass: "骨架分类", assetType: "资产类型", rootId: "资产根目录", directory: "目录", tag: "标签", favorite: "收藏",
   cardStatus: "资源卡状态", duplicateStatus: "已停用的重复项条件", relationStatus: "有关联", recentlyAdded: "添加时间",
@@ -319,7 +331,7 @@ export default function App() {
   const [previewAsset, setPreviewAsset] = useState<Asset | null>(null);
   const [cardSize, setCardSize] = useState(() => {
     const saved = Number(window.localStorage.getItem("mmdbridge-card-size"));
-    return Number.isFinite(saved) && saved >= 130 && saved <= 300 ? saved : 176;
+    return Number.isFinite(saved) && saved >= 130 && saved <= 300 ? saved : 200;
   });
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const [selectedDetails, setSelectedDetails] = useState<SelectedDetails | null>(null);
@@ -360,6 +372,7 @@ export default function App() {
   }, [selectedTags, tagMatch, skeletonClass]);
   useEffect(() => { if (activeType !== "all" && activeType !== "model") setSkeletonClass("all"); }, [activeType]);
   const [selected, setSelected] = useState<Asset | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [selectedDetailsRevision, setSelectedDetailsRevision] = useState(0);
   const currentDetails = selectedDetails?.assetId === selected?.id && selectedDetails?.revision === selectedDetailsRevision ? selectedDetails : null;
   const detailsReady = currentDetails?.status === "ready";
@@ -435,6 +448,7 @@ export default function App() {
     event.preventDefault();
     event.stopPropagation();
     setSelected(asset);
+    setInspectorOpen(true);
     setRootMenu(null);
     const bounds = event.currentTarget.getBoundingClientRect();
     setAssetMenu({
@@ -1198,13 +1212,13 @@ export default function App() {
   }
 
   async function removeRoot(root: Root) {
-    if (!await dialogs.confirm(`从 Library 移除“${root.displayName}”？磁盘文件不会删除。`)) return;
+    if (!await dialogs.confirm(`从资产库移除“${root.displayName}”？磁盘文件不会删除。`)) return;
     try {
       await invoke("root_remove", { rootId: root.id });
       setActiveRoot(null);
       setSelected(null);
       await refresh();
-      setNotice("已从 Library 移除目录索引。");
+      setNotice("已从资产库移除目录索引。");
     } catch (reason) { setError(toUiError(reason)); }
   }
 
@@ -1341,6 +1355,7 @@ export default function App() {
   function toggleBulkSelection(asset: Asset) {
     if (!bulkSelectMode) {
       setSelected(asset);
+      setInspectorOpen(true);
       return;
     }
     setBulkSelectedIds((current) => {
@@ -1517,7 +1532,7 @@ export default function App() {
       const expanded = activeDirectory !== null && isPathWithinRoot(activeDirectory, node.path);
       return <div key={node.path}>
         <UnstyledButton className={`folder-tree-node ${selectedFolder ? "selected" : ""}`} style={{ paddingLeft: `${10 + depth * 16}px` }} title={node.path} aria-expanded={node.children.size ? expanded : undefined} aria-current={selectedFolder ? "location" : undefined} onClick={() => { setActiveDirectory(node.path); setSelected(null); }}>
-          <span aria-hidden="true">{node.children.size ? expanded ? "▾" : "▸" : "·"}</span><strong>{node.name}</strong><small>{node.count.toLocaleString()}</small>
+          <span aria-hidden="true">{node.children.size ? expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} /> : "·"}</span><strong>{node.name}</strong><small>{node.count.toLocaleString()}</small>
         </UnstyledButton>
         {expanded && node.children.size > 0 && renderFolderNodes(Array.from(node.children.values()), depth + 1)}
       </div>;
@@ -1531,17 +1546,17 @@ export default function App() {
   const showIndexedTotal = !searchText && !favoritesOnly && !activeSavedFilterId && !quickExpression && (activeType !== "motion" || activeMotionFormat === "all") && (viewMode !== "folders" || !!activeRoot);
   const activeTitle = viewMode === "folders"
     ? folderRoot?.displayName ?? "文件夹"
-    : favoritesOnly ? "收藏" : savedFilters.find((filter) => filter.id === activeSavedFilterId)?.name ?? (activeRoot ? roots.find((root) => root.id === activeRoot)?.displayName ?? "Library" : activeType === "all" ? "全部资产" : categoryLabels[activeType]);
+    : favoritesOnly ? "收藏" : savedFilters.find((filter) => filter.id === activeSavedFilterId)?.name ?? (activeRoot ? roots.find((root) => root.id === activeRoot)?.displayName ?? "资产库" : activeType === "all" ? "全部资产" : categoryLabels[activeType]);
   const libraryHomeActive = viewMode === "assets" && activeType === "all" && !activeRoot && !favoritesOnly && !activeSavedFilterId;
   const hasQueryFilters = !!(searchText || quickExpression || activeSavedFilterId || (activeType === "motion" && activeMotionFormat !== "all"));
   const emptyKind = assetQueryError ? "error" : !roots.length ? "no-roots" : hasQueryFilters ? "filter" : favoritesOnly ? "favorite"
     : (activeDirectory || (viewMode === "folders" && activeRoot)) && (activeRoot ? (counts.byRoot[activeRoot] ?? 0) > 0 : counts.all > 0) ? "folder" : "collection";
   const emptyCopy = {
     error: { title: "资产读取失败", description: assetQueryError },
-    "no-roots": { title: "从你的第一个资产库开始", description: "添加模型、动作或场景目录，建立一个可搜索、可整理的本地 MMD 资产库。" },
+    "no-roots": { title: "尚未添加资产目录", description: "添加模型、动作或场景目录后，扫描其中的资产。" },
     filter: { title: "没有符合当前条件的资产", description: "试试其他条件，或清除搜索、标签、骨架、动作格式和智能集合条件。当前文件夹范围会保留。" },
-    favorite: { title: "还没有收藏资产", description: "返回 Library，在资产卡片菜单或详情中添加收藏。" },
-    folder: { title: "当前文件夹没有已索引资产", description: recursiveScope ? "此文件夹及子目录中没有符合当前类型的资产。可返回 Library，或查看扫描进度。" : "当前只查看此文件夹。可勾选“包含子目录”，或返回 Library。" },
+    favorite: { title: "还没有收藏资产", description: "返回资产库，在资产卡片菜单或详情中添加收藏。" },
+    folder: { title: "当前文件夹没有已索引资产", description: recursiveScope ? "此文件夹及子目录中没有符合当前类型的资产。可返回资产库，或查看扫描进度。" : "当前只查看此文件夹。可勾选“包含子目录”，或返回资产库。" },
     collection: { title: "这个集合还没有已索引资产", description: "在目录旁发起扫描，并在扫描队列查看阶段与进度。" },
   }[emptyKind];
 
@@ -1561,24 +1576,24 @@ export default function App() {
   }
 
   return (
-    <AppShell className="app-shell" navbar={{ width: { base: 205, sm: 205, md: 220, lg: 248 }, breakpoint: 0 }} aside={{ width: { base: 250, sm: 250, md: 272, lg: 304 }, breakpoint: 0 }} padding={0} withBorder={false}>
+    <AppShell className="app-shell" navbar={{ width: { base: 212, sm: 212, md: 224, lg: 236 }, breakpoint: 0 }} aside={{ width: { base: 268, sm: 268, md: 288, lg: 312 }, breakpoint: 0, collapsed: { desktop: !inspectorOpen } }} padding={0} withBorder={false} transitionDuration={0}>
       <AppShell.Navbar className="sidebar">
         <div className="brand-row">
-          <div className="brand-mark"><span /><span /><span /></div>
-          <div><div className="brand-name">MMDbridge<span>Lib</span></div><div className="brand-subtitle">ASSET LIBRARY</div></div>
+          <div className="brand-mark"><Boxes size={25} strokeWidth={1.5} aria-hidden="true" /></div>
+          <div><div className="brand-name">MMDbridge<span>Lib</span></div><div className="brand-subtitle">资产管理</div></div>
         </div>
 
         <UnstyledButton className={`nav-item library-home ${libraryHomeActive ? "active" : ""}`} aria-current={libraryHomeActive ? "page" : undefined} onClick={() => selectCategory("all")}>
-          <span className="nav-icon">▦</span><span>Library</span><span className="count">{counts.all}</span>
+          <Grid2X2 className="nav-icon" size={18} strokeWidth={1.6} aria-hidden="true" /><span>资产库</span><span className="count">{counts.all}</span>
         </UnstyledButton>
         <UnstyledButton className={`nav-item folder-home ${viewMode === "folders" ? "active" : ""}`} aria-current={viewMode === "folders" && !activeRoot ? "page" : undefined} onClick={() => enterFolderView()}>
-          <span className="nav-icon">▤</span><span>按目录查看</span>
+          <Folder className="nav-icon" size={18} strokeWidth={1.6} aria-hidden="true" /><span>文件夹</span>
         </UnstyledButton>
-        <div className="sidebar-section-heading"><span>资产类型</span><ActionIcon variant="subtle" size="sm" aria-label="添加资产根目录" className="icon-button tiny" onClick={addAnyRoot}>＋</ActionIcon></div>
+        <div className="sidebar-section-heading"><span>资产类型</span><ActionIcon variant="subtle" size="sm" aria-label="添加资产根目录" className="icon-button tiny" onClick={addAnyRoot}><Plus size={15} aria-hidden="true" /></ActionIcon></div>
         {(Object.keys(categoryLabels) as AssetType[]).map((type) => (
           <div className={`type-block ${activeType === type ? "type-selected" : ""}`} key={type}>
             <UnstyledButton className="nav-item type-item" aria-current={viewMode === "assets" && activeType === type && !activeRoot && !favoritesOnly && !activeSavedFilterId ? "page" : undefined} onClick={() => selectCategory(type)}>
-              <span className={`type-icon ${type}`}>{categoryGlyphs[type]}</span><span>{categoryLabels[type]}</span><span className="count">{counts[type]}</span>
+              <span className={`type-icon ${type}`}><AssetKindIcon type={type} /></span><span>{categoryLabels[type]}</span><span className="count">{counts[type]}</span>
             </UnstyledButton>
             {(activeType === type || activeType === "all") && <div className="root-list">
               {roots.filter((root) => root.assetType === type).map((root) => {
@@ -1589,44 +1604,44 @@ export default function App() {
                   </UnstyledButton>
                   {rootScan && activeScanStatuses.has(rootScan.status) &&
                     <span className="root-scan-percent" title="扫描进度">{Math.round(rootScan.progress * 100)}%</span>}
-                  <ActionIcon variant="subtle" size="sm" className="root-action root-primary-action" aria-label={rootScan?.status === "Paused" ? `继续 ${root.displayName} 的本次扫描` : `扫描 ${root.displayName}`} title={rootScan?.status === "Paused" ? "继续本次扫描" : "扫描目录"} disabled={busy || !root.enabled} onClick={() => void scanRoot(root)}>{rootScan?.status === "Paused" ? "▶" : "↻"}</ActionIcon>
-                  <ActionIcon variant="subtle" size="sm" className="root-action root-more-action" aria-label={`${root.displayName} 更多操作`} aria-haspopup="menu" aria-expanded={rootMenu?.root.id === root.id} title="更多目录操作" onClick={(event) => openRootMenu(event, root)}>⋯</ActionIcon>
+                  <ActionIcon variant="subtle" size="sm" className="root-action root-primary-action" aria-label={rootScan?.status === "Paused" ? `继续 ${root.displayName} 的本次扫描` : `扫描 ${root.displayName}`} title={rootScan?.status === "Paused" ? "继续本次扫描" : "扫描目录"} disabled={busy || !root.enabled} onClick={() => void scanRoot(root)}>{rootScan?.status === "Paused" ? <Play size={14} aria-hidden="true" /> : <RefreshCw size={14} aria-hidden="true" />}</ActionIcon>
+                  <ActionIcon variant="subtle" size="sm" className="root-action root-more-action" aria-label={`${root.displayName} 更多操作`} aria-haspopup="menu" aria-expanded={rootMenu?.root.id === root.id} title="更多目录操作" onClick={(event) => openRootMenu(event, root)}><MoreHorizontal size={16} aria-hidden="true" /></ActionIcon>
                 </div>;
               })}
-              <Button className="add-root" onClick={() => void addRoot(type)}><span>＋</span> 添加目录</Button>
             </div>}
           </div>
         ))}
 
         <div className="sidebar-divider" />
-        <UnstyledButton className={`nav-item subdued ${favoritesOnly ? "active" : ""}`} aria-current={favoritesOnly ? "page" : undefined} onClick={() => { setFavoritesOnly(true); setActiveSavedFilterId(null); setActiveType("all"); setViewMode("assets"); setActiveRoot(null); setActiveDirectory(null); setSelected(null); setQuery(""); setSearchText(""); }}><span className="nav-icon">◇</span><span>收藏</span><span className="count">{favoritesOnly ? assets.length : ""}</span></UnstyledButton>
-        <div className="sidebar-section-heading smart-filter-heading"><span>智能集合</span><ActionIcon variant="subtle" size="sm" aria-label="新建智能集合" className="icon-button tiny" onClick={() => setFilterBuilderOpen((open) => !open)}>＋</ActionIcon></div>
+        <UnstyledButton className={`nav-item subdued ${favoritesOnly ? "active" : ""}`} aria-current={favoritesOnly ? "page" : undefined} onClick={() => { setFavoritesOnly(true); setActiveSavedFilterId(null); setActiveType("all"); setViewMode("assets"); setActiveRoot(null); setActiveDirectory(null); setSelected(null); setQuery(""); setSearchText(""); }}><Star className="nav-icon" size={18} strokeWidth={1.6} aria-hidden="true" /><span>收藏</span><span className="count">{favoritesOnly ? assets.length : ""}</span></UnstyledButton>
+        <div className="sidebar-section-heading smart-filter-heading"><span>智能集合</span><ActionIcon variant="subtle" size="sm" aria-label="新建智能集合" className="icon-button tiny" onClick={() => setFilterBuilderOpen((open) => !open)}><Plus size={15} aria-hidden="true" /></ActionIcon></div>
         {savedFilters.map((filter) => {
           const retired = hasRetiredFilterCondition(filter.expression);
           return <div className={`smart-filter-row ${retired ? "retired-filter" : ""} ${activeSavedFilterId === filter.id ? "selected" : ""}`} key={filter.id}>
-            <UnstyledButton className="nav-item smart-filter-item" aria-current={activeSavedFilterId === filter.id ? "page" : undefined} title={retired ? `${filter.name} · 条件已停用，需要编辑` : filter.name} onClick={() => selectSavedFilter(filter)}><span className="nav-icon">◷</span><span>{filter.name}{retired && <small className="smart-filter-warning">条件已停用，需要编辑</small>}</span></UnstyledButton>
-            <ActionIcon variant="subtle" size="sm" className="smart-filter-remove" aria-label={`删除智能集合 ${filter.name}`} title="删除智能集合" onClick={() => void removeSmartFilter(filter)}>×</ActionIcon>
+            <UnstyledButton className="nav-item smart-filter-item" aria-current={activeSavedFilterId === filter.id ? "page" : undefined} title={retired ? `${filter.name} · 条件已停用，需要编辑` : filter.name} onClick={() => selectSavedFilter(filter)}><SlidersHorizontal className="nav-icon" size={17} strokeWidth={1.6} aria-hidden="true" /><span>{filter.name}{retired && <small className="smart-filter-warning">条件已停用，需要编辑</small>}</span></UnstyledButton>
+            <ActionIcon variant="subtle" size="sm" className="smart-filter-remove" aria-label={`删除智能集合 ${filter.name}`} title="删除智能集合" onClick={() => void removeSmartFilter(filter)}><X size={14} aria-hidden="true" /></ActionIcon>
           </div>;
         })}
 
         <div className="sidebar-bottom">
-          <div className="storage-label"><span>本地 Library</span><span>{roots.length} 个目录</span></div>
+          <Button className="sidebar-add" fullWidth leftSection={<Plus size={16} aria-hidden="true" />} onClick={addAnyRoot}>添加资产目录</Button>
+          <div className="storage-label"><span>本地资产库</span><span>{roots.length} 个目录</span></div>
           <div className="storage-foot"><span>{counts.all.toLocaleString()} 项资产</span><span className="online"><i />{busy ? "处理中" : isRefreshing ? "读取中" : activeScans.length ? `${activeScans.length} 项扫描中` : activeThumbnailCount ? `${activeThumbnailCount} 项缩略图处理中` : assetQueryError ? "读取失败" : "就绪"}</span></div>
         </div>
       </AppShell.Navbar>
 
       <AppShell.Main className="main-area">
         <header className="topbar">
-          <div className="breadcrumbs"><span>Library</span><b>/</b><strong>{activeTitle}</strong></div>
           <form className="search-box" onSubmit={submitSearch}>
-            <span>⌕</span><TextInput value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、文件名、路径或标签（空格分词）…" aria-label="搜索资产" />
-            {query && <ActionIcon variant="subtle" size="sm" type="button" className="clear-search" aria-label="清除资产搜索" onClick={() => { setQuery(""); setSearchText(""); }}>×</ActionIcon>}
-            <kbd>ENTER</kbd>
+            <Search size={17} strokeWidth={1.8} aria-hidden="true" /><TextInput value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、文件名、路径或标签（空格分词）…" aria-label="搜索资产" />
+            {query && <ActionIcon variant="subtle" size="sm" type="button" className="clear-search" aria-label="清除资产搜索" onClick={() => { setQuery(""); setSearchText(""); }}><X size={14} aria-hidden="true" /></ActionIcon>}
+            <kbd>Enter</kbd>
           </form>
-          <Button variant={filterBuilderOpen ? "filled" : "light"} aria-expanded={filterBuilderOpen} title="组合筛选并保存为智能集合" onClick={() => setFilterBuilderOpen((open) => !open)}>☷ 筛选 ⌄</Button>
-          <Button variant={scanQueueOpen ? "filled" : "light"} onClick={() => setScanQueueOpen(true)}>扫描队列 {activeScans.length ? `(${activeScans.length})` : ""}</Button>
-          <Button className="journal-button" onClick={() => void openOperationJournal()}>操作日志</Button>
-          <ActionIcon variant="subtle" size="sm" className="avatar" aria-label="设置" title="设置" onClick={() => void openSettings()}>⚙</ActionIcon>
+          <Button variant={filterBuilderOpen ? "filled" : "light"} aria-expanded={filterBuilderOpen} title="组合筛选并保存为智能集合" onClick={() => setFilterBuilderOpen((open) => !open)} leftSection={<SlidersHorizontal size={16} aria-hidden="true" />} rightSection={<ChevronDown size={13} aria-hidden="true" />}>筛选</Button>
+          <Button variant={scanQueueOpen ? "light" : "subtle"} leftSection={<ListTodo size={16} aria-hidden="true" />} onClick={() => setScanQueueOpen(true)}>扫描队列 {activeScans.length ? `(${activeScans.length})` : ""}</Button>
+          <ActionIcon variant="subtle" className="journal-button" aria-label="操作日志" title="操作日志" onClick={() => void openOperationJournal()}><History size={18} aria-hidden="true" /></ActionIcon>
+          <ActionIcon variant={inspectorOpen ? "light" : "subtle"} className="inspector-toggle" aria-label={inspectorOpen ? "隐藏资产详情" : "显示资产详情"} aria-pressed={inspectorOpen} title="资产详情" onClick={() => setInspectorOpen((opened) => !opened)}><PanelRight size={18} aria-hidden="true" /></ActionIcon>
+          <ActionIcon variant="subtle" size="sm" className="avatar" aria-label="设置" title="设置" onClick={() => void openSettings()}><Settings2 size={18} aria-hidden="true" /></ActionIcon>
         </header>
 
         <div className={`library-content${viewMode === "folders" ? " browsing-folders" : ""}`} ref={setLibraryScrollParent} onScroll={(event) => {
@@ -1635,8 +1650,8 @@ export default function App() {
           if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 900) void loadNextAssetPage();
         }}>
           <div className="page-heading">
-            <div><div className="eyebrow">YOUR COLLECTION</div><h1>{activeTitle}</h1><p>浏览、搜索并整理你的 MMD 资产</p></div>
-            <div className="view-controls"><Button className="open-model-button" onClick={() => void openModelPreview()}>＋ 打开 PMX</Button><Button className="open-model-button" onClick={() => viewMode === "folders" ? returnToAssetView() : enterFolderView()}>{viewMode === "folders" ? "返回资产" : "按目录查看"}</Button><span className="asset-total"><b>{(showIndexedTotal ? indexedTotal : visibleAssets.length).toLocaleString()}{!showIndexedTotal && nextAssetCursor ? "+" : ""}</b> {showIndexedTotal ? "在库资产" : "已加载资产"}</span><label className="card-size-control">卡片大小 <Slider  min={130} max={300} step={10} value={cardSize} thumbLabel="资产卡片大小" onChange={(value) => setCardSize(value)} /></label></div>
+            <div className="heading-copy"><h1>{activeTitle}<span className="heading-count">{(showIndexedTotal ? indexedTotal : visibleAssets.length).toLocaleString()}{!showIndexedTotal && nextAssetCursor ? "+" : ""}</span></h1></div>
+            <div className="view-controls"><Button variant="filled" className="open-model-button" leftSection={<Plus size={16} aria-hidden="true" />} onClick={() => void openModelPreview()}>打开 PMX</Button><label className="card-size-control">视图大小 <Slider  min={130} max={300} step={10} value={cardSize} thumbLabel="资产卡片大小" onChange={(value) => setCardSize(value)} /></label></div>
           </div>
 
           <Tabs value={activeType} onChange={(value) => { if (value) selectCategory(value as AssetType | "all", viewMode === "folders"); }}>
@@ -1645,7 +1660,7 @@ export default function App() {
             {(Object.keys(categoryLabels) as AssetType[]).map((type) => <Tabs.Tab value={type} key={type}>{categoryLabels[type]} <span>{counts[type]}</span></Tabs.Tab>)}
             <div className="tabs-spacer" />
             <Button className="quick-add" aria-pressed={bulkSelectMode} disabled={busy} onClick={() => { setBulkSelectMode((mode) => !mode); setBulkSelectedIds(new Set()); }}>{bulkSelectMode ? "退出批量选择" : "批量选择"}</Button>
-            {activeType !== "all" && <Button className="quick-add" onClick={() => void addRoot(activeType)}><span>＋</span> 添加目录</Button>}
+            {activeType !== "all" && <Button className="quick-add" onClick={() => void addRoot(activeType)}><Plus size={14} aria-hidden="true" /> 添加目录</Button>}
           </Tabs.List>
           </Tabs>
           <div className="quick-filters" aria-label="标签与骨架筛选">
@@ -1673,7 +1688,7 @@ export default function App() {
                 <Button className="folder-return-assets" onClick={returnToAssetView}>返回资产</Button>
               </div>
             </div>
-            {!folderRoot ? <div className="folder-root-grid">{roots.filter((root) => activeType === "all" || root.assetType === activeType).map((root) => <UnstyledButton key={root.id} className="folder-root-card" onClick={() => { setActiveRoot(root.id); setActiveDirectory(null); setActiveType(root.assetType); setActiveMotionFormat("all"); setActiveSavedFilterId(null); setFavoritesOnly(false); setSelected(null); }} title={root.path}><span className={`type-icon ${root.assetType}`}>{categoryGlyphs[root.assetType]}</span><strong>{root.displayName}</strong><small>{(counts.byRoot[root.id] ?? 0).toLocaleString()} 项 · {root.path}</small></UnstyledButton>)}{!roots.length && <UnstyledButton className="folder-root-card add-folder-root" onClick={addAnyRoot}>＋ 添加资产根目录</UnstyledButton>}</div>
+            {!folderRoot ? <div className="folder-root-grid">{roots.filter((root) => activeType === "all" || root.assetType === activeType).map((root) => <UnstyledButton key={root.id} className="folder-root-card" onClick={() => { setActiveRoot(root.id); setActiveDirectory(null); setActiveType(root.assetType); setActiveMotionFormat("all"); setActiveSavedFilterId(null); setFavoritesOnly(false); setSelected(null); }} title={root.path}><span className={`type-icon ${root.assetType}`}><AssetKindIcon type={root.assetType} /></span><strong>{root.displayName}</strong><small>{(counts.byRoot[root.id] ?? 0).toLocaleString()} 项 · {root.path}</small></UnstyledButton>)}{!roots.length && <UnstyledButton className="folder-root-card add-folder-root" onClick={addAnyRoot}><Plus size={18} aria-hidden="true" /> 添加资产根目录</UnstyledButton>}</div>
               : <div className="folder-tree" aria-label={`${folderRoot.displayName} 的目录层级`}>{renderFolderNodes(folderTree)}</div>}
           </section>}
 
@@ -1681,16 +1696,16 @@ export default function App() {
             <span>已选择 {bulkSelectedIds.size} 项</span>
             <Button disabled={busy || visibleAssets.length === 0} title="仅选择当前已加载的资产，不包含尚未加载的页面" onClick={() => setBulkSelectedIds(new Set(visibleAssets.map((asset) => asset.id)))}>选择已加载（{visibleAssets.length}）</Button>
             <Button disabled={busy || bulkSelectedIds.size === 0} onClick={() => setBulkSelectedIds(new Set())}>清空选择</Button>
-            <Button disabled={busy || bulkSelectedIds.size === 0} onClick={() => void setFavoriteForSelection(true)}>☆ 批量收藏</Button>
+            <Button disabled={busy || bulkSelectedIds.size === 0} onClick={() => void setFavoriteForSelection(true)} leftSection={<Star size={14} aria-hidden="true" />}>批量收藏</Button>
             <Button disabled={busy || bulkSelectedIds.size === 0} onClick={() => void setFavoriteForSelection(false)}>取消收藏</Button>
-            <Button disabled={busy || bulkSelectedIds.size === 0} onClick={() => void addTagToSelection()}>＋ 批量添加标签</Button>
-            <Button disabled={busy || bulkSelectedIds.size === 0} onClick={() => void removeTagFromSelection()}>− 批量移除标签</Button>
+            <Button disabled={busy || bulkSelectedIds.size === 0} onClick={() => void addTagToSelection()} leftSection={<Plus size={14} aria-hidden="true" />}>批量添加标签</Button>
+            <Button disabled={busy || bulkSelectedIds.size === 0} onClick={() => void removeTagFromSelection()} leftSection={<Minus size={14} aria-hidden="true" />}>批量移除标签</Button>
             <Button disabled={busy || bulkSelectedIds.size === 0} onClick={() => void planMoveAssets(Array.from(bulkSelectedIds))}>移动资产包…</Button>
             <Button color="red" className="bulk-delete" disabled={busy || !canDeleteBulkPmx} onClick={() => void requestAssetOperation("delete_model", bulkPmxModelIds)}>删除所选模型…</Button>
             <Button color="red" className="bulk-delete" disabled={busy || bulkSelectedIds.size === 0} onClick={() => void requestAssetOperation("recycle", Array.from(bulkSelectedIds))}>移到回收站…</Button>
           </div>}
 
-          {filterBuilderOpen && <section className="filter-builder"><div className="filter-builder-heading"><div><strong>组合筛选</strong><span>将条件保存为可复用的智能集合</span></div><ActionIcon variant="subtle" size="sm" className="icon-button" aria-label="关闭筛选面板" onClick={() => setFilterBuilderOpen(false)}>×</ActionIcon></div>
+          {filterBuilderOpen && <section className="filter-builder"><div className="filter-builder-heading"><div><strong>组合筛选</strong><span>将条件保存为可复用的智能集合</span></div><ActionIcon variant="subtle" size="sm" className="icon-button" aria-label="关闭筛选面板" onClick={() => setFilterBuilderOpen(false)}><X size={14} aria-hidden="true" /></ActionIcon></div>
             <div className="filter-builder-name"><label htmlFor="smart-filter-name">集合名称</label><TextInput id="smart-filter-name" value={filterName} onChange={(event) => setFilterName(event.target.value)} placeholder="例如：收藏的模型" /></div>
             <div className="filter-rule-list">{filterRules.map((rule, index) => <div className="filter-rule-row" key={index}>
               <NativeSelect aria-label="筛选字段" value={rule.field} onChange={(event) => changeFilterField(index, event.target.value as FilterField)}>{(Object.keys(filterFieldLabels) as FilterField[]).filter((field) => field !== "duplicateStatus" && field !== "cameraOnly" && field !== "needsReview").map((field) => <option key={field} value={field}>{filterFieldLabels[field]}</option>)}</NativeSelect>
@@ -1703,17 +1718,16 @@ export default function App() {
                 : dateFilterFields.has(rule.field) ? <TextInput aria-label="日期值" type="datetime-local" value={rule.value} onChange={(event) => changeFilterRule(index, { value: event.target.value })} />
                 : numericFilterFields.has(rule.field) ? <TextInput aria-label="数值" type="number" step="any" value={rule.value} onChange={(event) => changeFilterRule(index, { value: event.target.value })} />
                 : <TextInput aria-label="文本值" value={rule.value} onChange={(event) => changeFilterRule(index, { value: event.target.value })} placeholder="输入匹配内容" />}
-              <Checkbox className="filter-not" checked={rule.negate} onChange={(event) => changeFilterRule(index, { negate: event.target.checked })} label={<>NOT</>} />
-              <ActionIcon variant="subtle" size="sm" className="filter-rule-remove" aria-label="移除此条件" disabled={filterRules.length <= 1} onClick={() => setFilterRules((current) => current.filter((_, ruleIndex) => ruleIndex !== index))}>×</ActionIcon>
+              <Checkbox className="filter-not" checked={rule.negate} onChange={(event) => changeFilterRule(index, { negate: event.target.checked })} label={<>取反</>} />
+              <ActionIcon variant="subtle" size="sm" className="filter-rule-remove" aria-label="移除此条件" disabled={filterRules.length <= 1} onClick={() => setFilterRules((current) => current.filter((_, ruleIndex) => ruleIndex !== index))}><X size={14} aria-hidden="true" /></ActionIcon>
             </div>)}</div>
-            <div className="filter-builder-footer"><Button className="filter-add-rule" onClick={() => setFilterRules((current) => [...current, { field: "tag", operator: "contains", value: "", negate: false }])}>＋ 添加条件</Button><label className="filter-group-op">条件组合<NativeSelect value={filterGroupOp} onChange={(event) => setFilterGroupOp(event.target.value as "and" | "or")}><option value="and">全部满足（AND）</option><option value="or">任一满足（OR）</option></NativeSelect></label><span className="filter-builder-spacer" /><Button className="filter-save" disabled={!filterName.trim()} onClick={() => void saveSmartFilter()}>保存并应用</Button></div>
+            <div className="filter-builder-footer"><Button className="filter-add-rule" onClick={() => setFilterRules((current) => [...current, { field: "tag", operator: "contains", value: "", negate: false }])} leftSection={<Plus size={14} aria-hidden="true" />}>添加条件</Button><label className="filter-group-op">条件组合<NativeSelect value={filterGroupOp} onChange={(event) => setFilterGroupOp(event.target.value as "and" | "or")}><option value="and">全部满足（AND）</option><option value="or">任一满足（OR）</option></NativeSelect></label><span className="filter-builder-spacer" /><Button className="filter-save" disabled={!filterName.trim()} onClick={() => void saveSmartFilter()}>保存并应用</Button></div>
           </section>}
 
           {error && <Alert color="red" title="操作未完成" withCloseButton onClose={() => setError("")} closeButtonLabel="关闭错误提示" mb="sm">{error}{error.startsWith("资产读取超时") && <Button ml="sm" onClick={() => { setError(""); void refresh(); }}>重新读取</Button>}</Alert>}
           {notice && <Alert color="mint" title={busy ? "正在处理" : undefined} withCloseButton onClose={() => setNotice("")} closeButtonLabel="关闭任务提示" mb="sm" role="status">{notice}</Alert>}
 
           {viewMode === "folders" && !folderRoot ? null : isRefreshing ? <div className="asset-grid-waiting" role="status">正在读取资产…</div> : visibleAssets.length ? libraryScrollParent ? <VirtuosoGrid
-            key={cardSize}
             data={visibleAssets}
             customScrollParent={libraryScrollParent}
             increaseViewportBy={{ top: 360, bottom: 720 }}
@@ -1730,24 +1744,23 @@ export default function App() {
               }}>
               <div className={`asset-art ${asset.assetType} ${asset.hasThumbnail ? "has-thumbnail" : ""}`}>
                 {asset.hasThumbnail && <CardThumbnail revision={thumbnailRevisions[asset.id]} assetId={asset.id} alt={`${asset.name} 缩略图`} />}
-                <div className="art-orbit orbit-one" /><div className="art-orbit orbit-two" /><div className="art-glow" /><span className="art-glyph">{categoryGlyphs[asset.assetType]}</span><span className="art-format">{String(asset.metadata.file_type ?? asset.assetType).toUpperCase()}</span>
-                <div className="asset-markers">{asset.isFavorite && <span className="favorite-marker" role="img" aria-label="已收藏" title="已收藏">★</span>}{typeof asset.metadata.paired_camera_path === "string" && <span className="paired-camera-marker" title={`配套镜头：${asset.metadata.paired_camera_path}`}>◉ 镜头</span>}{asset.assetType === "model" && asset.metadata.skeleton_class === "nonstandard" && <span className="skeleton-badge">非标准</span>}{status && <span className="asset-status-marker" data-tone={status.tone} title={status.text}>{status.text}</span>}</div>
+                {!asset.hasThumbnail && <div className="asset-placeholder"><AssetKindIcon type={asset.assetType} size={36} /><span>尚未生成预览</span></div>}<span className="art-format">{String(asset.metadata.file_type ?? asset.assetType).toUpperCase()}</span>
+                <div className="asset-markers">{asset.isFavorite && <span className="favorite-marker" role="img" aria-label="已收藏" title="已收藏"><Star size={14} fill="currentColor" aria-hidden="true" /></span>}{typeof asset.metadata.paired_camera_path === "string" && <span className="paired-camera-marker" title={`配套镜头：${asset.metadata.paired_camera_path}`}><Camera size={12} aria-hidden="true" /> 镜头</span>}{asset.assetType === "model" && asset.metadata.skeleton_class === "nonstandard" && <span className="skeleton-badge">非标准</span>}{status && <span className="asset-status-marker" data-tone={status.tone} title={status.text}>{status.text}</span>}</div>
               </div>
-              <div className="asset-card-body"><div className="asset-card-title" title={asset.name}>{asset.name}</div><div className="asset-card-subline"><Badge size="xs" variant="light" color={asset.assetType === "motion" ? "violet" : asset.assetType === "scene" ? "yellow" : "mint"}>{String(asset.metadata.is_pose ? "POSE" : asset.assetType).toUpperCase()}</Badge><span className="asset-source-name" title={asset.primarySource}>{asset.primarySource.split(/[\\/]/).pop()}</span></div></div>
-              {bulkSelectMode && <span className={`asset-bulk-checkbox ${bulkSelectedIds.has(asset.id) ? "checked" : ""}`} aria-hidden="true">{bulkSelectedIds.has(asset.id) ? "✓" : ""}</span>}
+              <div className="asset-card-body"><div className="asset-card-title" title={asset.name}>{asset.name}</div><div className="asset-card-subline"><Badge size="xs" variant="light" color={asset.assetType === "motion" ? "violet" : asset.assetType === "scene" ? "yellow" : "mint"}>{asset.metadata.is_pose ? "姿势" : categoryLabels[asset.assetType]}</Badge><span className="asset-source-name" title={asset.primarySource}>{assetSummary(asset)}</span></div></div>
+              {bulkSelectMode && <span className={`asset-bulk-checkbox ${bulkSelectedIds.has(asset.id) ? "checked" : ""}`} aria-hidden="true">{bulkSelectedIds.has(asset.id) ? <Check size={14} aria-hidden="true" /> : null}</span>}
             </UnstyledButton>;
             }}
           /> : <div className="asset-grid-waiting" role="status">正在载入资产卡片…</div> : <section className="empty-state">
-            <div className="empty-illustration"><div className="empty-frame"><span className="empty-star">✳</span><span className="empty-orbit" /><span className="empty-base" /></div><div className="empty-spark spark-a">✦</div><div className="empty-spark spark-b">·</div></div>
-            <div className="empty-kicker">A LIBRARY FOR YOUR MMD WORLD</div>
+            <div className="empty-illustration"><FolderOpen size={48} strokeWidth={1.2} aria-hidden="true" /></div>
             <h2>{emptyCopy.title}</h2>
             <p>{emptyCopy.description}</p>
-            <div className="empty-actions">{emptyKind === "no-roots" ? (Object.keys(categoryLabels) as AssetType[]).map((type) => <Button key={type} onClick={() => void addRoot(type)}><span>{categoryGlyphs[type]}</span>添加{categoryLabels[type]}目录</Button>)
+            <div className="empty-actions">{emptyKind === "no-roots" ? (Object.keys(categoryLabels) as AssetType[]).map((type) => <Button key={type} onClick={() => void addRoot(type)}><span><AssetKindIcon type={type} /></span>添加{categoryLabels[type]}目录</Button>)
               : emptyKind === "error" ? <Button disabled={isRefreshing} onClick={() => void refresh()}>重新读取</Button>
                 : emptyKind === "filter" ? <Button onClick={clearQueryConditions}>清除查询条件</Button>
-                  : emptyKind === "favorite" ? <Button onClick={returnToLibrary}>返回 Library</Button>
-                    : <>{emptyKind === "folder" && <Button onClick={returnToLibrary}>返回 Library</Button>}<Button onClick={() => setScanQueueOpen(true)}>查看扫描队列</Button></>}</div>
-            <div className="privacy-note"><span>⌂</span>资产留在本机 · 移除目录不会删除文件</div>
+                  : emptyKind === "favorite" ? <Button onClick={returnToLibrary}>返回资产库</Button>
+                    : <>{emptyKind === "folder" && <Button onClick={returnToLibrary}>返回资产库</Button>}<Button onClick={() => setScanQueueOpen(true)}>查看扫描队列</Button></>}</div>
+            <div className="privacy-note">移除目录仅移除索引，不会删除源文件。</div>
           </section>}
           {!isRefreshing && (nextAssetCursor || loadingNextPage) && <div className="asset-grid-footer" ref={loadMoreRef} role="status">{loadingNextPage ? "正在载入更多资产…" : <><span>已载入 {visibleAssets.length.toLocaleString()} 项</span><Button onClick={() => void loadNextAssetPage()}>加载更多</Button></>}</div>}
         </div>
@@ -1758,7 +1771,7 @@ export default function App() {
           {busy ? notice : activeScans.length ? `${activeScans.length} 个扫描任务 · ${scanStatusLabels[activeScans[0].status]} ${Math.round(activeScans[0].progress * 100)}%` : activeThumbnailCount ? `${activeThumbnailCount} 个缩略图任务 · 已完成 ${jobSummary.Completed ?? 0} · 失败 ${jobSummary.Failed ?? 0}` : "没有进行中的任务"}
         </div>
         {scanStates.length > 0 && <Button className="jobbar-scan-link" onClick={() => setScanQueueOpen(true)}>管理扫描</Button>}
-        {totalThumbnailCount > 0 && <Button className="jobbar-chevron" aria-label={jobsExpanded ? "收起缩略图任务" : "展开缩略图任务"} onClick={() => setJobsExpanded((expanded) => !expanded)}>{jobsExpanded ? "⌄" : "⌃"}</Button>}
+        {totalThumbnailCount > 0 && <Button className="jobbar-chevron" aria-label={jobsExpanded ? "收起缩略图任务" : "展开缩略图任务"} onClick={() => setJobsExpanded((expanded) => !expanded)}>{jobsExpanded ? <ChevronDown size={15} aria-hidden="true" /> : <ChevronUp size={15} aria-hidden="true" />}</Button>}
         {jobsExpanded && <div className="jobs-panel" aria-label="后台任务列表">
           <div className="jobs-panel-heading"><strong>缩略图任务</strong><span>{totalThumbnailCount} 项 · 显示最近 12 项</span></div>
           {jobs.length ? jobs.slice(0, 12).map((job) => <div className="jobs-panel-row" key={job.id}>
@@ -1770,19 +1783,19 @@ export default function App() {
       </footer>
       </AppShell.Main>
 
-      <AppShell.Aside className={`inspector ${selected ? "has-selection" : ""}`}>
-        <div className="inspector-top"><div><div className="eyebrow">ASSET INSPECTOR</div><h2>资产详情</h2></div>{selected && <ActionIcon variant="subtle" size="sm" className="icon-button" aria-label="取消选择" onClick={() => setSelected(null)}>×</ActionIcon>}</div>
+      <AppShell.Aside className={`inspector ${selected ? "has-selection" : ""}`} aria-hidden={!inspectorOpen}>
+        <div className="inspector-top"><div><div className="eyebrow">当前选择</div><h2>资产详情</h2></div><ActionIcon variant="subtle" size="sm" className="icon-button" aria-label="关闭资产详情" onClick={() => setInspectorOpen(false)}><X size={17} aria-hidden="true" /></ActionIcon></div>
         {selected ? <>
-          <UnstyledButton className={`inspector-preview ${selected.assetType} ${selected.hasThumbnail ? "has-thumbnail" : ""}`} title="查看缩略图" onClick={() => setPreviewAsset(selected)}>{selected.hasThumbnail && <CardThumbnail revision={thumbnailRevisions[selected.id]} assetId={selected.id} alt={`${selected.name} 缩略图`} />}<div className="art-orbit orbit-one" /><div className="art-orbit orbit-two" /><span className="inspector-glyph">{categoryGlyphs[selected.assetType]}</span><span className="preview-badge">{String(selected.metadata.is_pose ? "POSE" : selected.assetType).toUpperCase()}</span></UnstyledButton>
-          <div className="inspector-title"><div><div className="inspector-type">{categoryLabels[selected.assetType]}</div><h3>{selected.name}</h3></div><Button color={selected.isFavorite ? "yellow" : "mint"} aria-label={selected.isFavorite ? "取消收藏" : "添加收藏"} aria-pressed={selected.isFavorite} title={selected.isFavorite ? "取消收藏" : "添加收藏"} onClick={() => void toggleFavorite(selected)}>{selected.isFavorite ? "★" : "☆"}</Button></div>
+          <UnstyledButton className={`inspector-preview ${selected.assetType} ${selected.hasThumbnail ? "has-thumbnail" : ""}`} title="查看缩略图" onClick={() => setPreviewAsset(selected)}>{selected.hasThumbnail && <CardThumbnail revision={thumbnailRevisions[selected.id]} assetId={selected.id} alt={`${selected.name} 缩略图`} />}{!selected.hasThumbnail && <div className="asset-placeholder"><AssetKindIcon type={selected.assetType} size={38} /><span>尚未生成预览</span></div>}<span className="preview-badge">{selected.metadata.is_pose ? "姿势" : categoryLabels[selected.assetType]}</span></UnstyledButton>
+          <div className="inspector-title"><div><div className="inspector-type">{categoryLabels[selected.assetType]}</div><h3>{selected.name}</h3></div><Button color={selected.isFavorite ? "yellow" : "gray"} aria-label={selected.isFavorite ? "取消收藏" : "添加收藏"} aria-pressed={selected.isFavorite} title={selected.isFavorite ? "取消收藏" : "添加收藏"} onClick={() => void toggleFavorite(selected)}><Star size={18} fill={selected.isFavorite ? "currentColor" : "none"} aria-hidden="true" /></Button></div>
           <div className="inspector-section"><div className="section-title">基本信息</div><div className="detail-list">
             {Object.entries(selected.metadata).filter(([key, value]) => metadataLabels[key] && (typeof value === "number" || typeof value === "boolean" || typeof value === "string")).slice(0, 10).map(([key, value]) => <div className="detail-row" key={key}><span>{metadataLabels[key]}</span><strong>{formatValue(value)}</strong></div>)}
             <div className="detail-row"><span>资产状态</span><strong className={selected.statuses.includes("ParseFailed") || selected.statuses.includes("MissingSource") ? "state-warn" : "state-ready"}>{assetStatusText(selected.statuses)}</strong></div>
             <div className="detail-row"><span>资源卡</span><strong className={selected.cardStatus === "CardValid" ? "state-ready" : "state-muted"}>{cardStatusText(selected.cardStatus)}{!selected.hasThumbnail ? " · 尚无缩略图" : ""}</strong><span className="detail-row-actions">{(selected.cardStatus !== "CardValid" || !selected.hasThumbnail) && <Button className="tiny-link" disabled={busy} onClick={() => void createCard(selected.id)}>创建 / 刷新</Button>}<Button className="tiny-link" disabled={busy} onClick={() => void verifyCard(selected.id)}>校验</Button></span></div>
           </div></div>
           {selected.assetType === "model" && <div className="detail-row"><span>骨架分类</span><strong>{selected.metadata.skeleton_class === "standard" ? "MMD 标准人形" : selected.metadata.skeleton_class === "nonstandard" ? "非标准" : "待分类"}</strong></div>}
-          <div className="inspector-section source-section"><div className="section-title">源文件</div><div className="source-path" title={selected.primarySource}><span className="file-icon">▧</span><div><strong>{selected.primarySource.split(/[\\/]/).pop()}</strong><small>{selected.assetDirectory}</small></div></div><div className="asset-file-actions"><Button disabled={busy} onClick={() => void planRenameAsset(selected)}>重命名资产包</Button><Button disabled={busy} onClick={() => void planMoveAssets([selected.id])}>移动…</Button>{selected.assetType === "model" && selected.primarySource.toLowerCase().endsWith(".pmx") ? <Button color="red" className="danger" disabled={busy} onClick={() => void requestAssetOperation("delete_model", [selected.id])}>删除模型…</Button> : <Button disabled={busy} onClick={() => void requestAssetOperation("recycle", [selected.id])}>移到回收站…</Button>}</div></div>
-          <div className="inspector-section tags-section"><div className="section-title">标签 <ActionIcon variant="subtle" size="sm" className="add-tag" aria-label="添加用户标签" title="添加用户标签" disabled={!detailsReady || busy} onClick={() => void addTag()}>＋</ActionIcon></div>{currentDetails?.status === "failed" ? <Alert color="red" title="标签与关系读取失败" role="alert">{currentDetails.error}<Button disabled={busy} onClick={() => setSelectedDetailsRevision((value) => value + 1)}>重试详情</Button></Alert> : !detailsReady ? <div className="tag-empty" role="status">正在加载标签与关系…</div> : assetTags.length ? <div className="tag-list">{assetTags.map((tag) => <span className={`tag-chip ${tag.source}`} key={`${tag.name}-${tag.source}`} title={`来源：${tag.source}`}><span className="tag-chip-name">{tag.name}</span><ActionIcon variant="subtle" size="xs" aria-label={`移除标签 ${tag.name}`} disabled={!detailsReady || busy} onClick={() => void removeTag(tag.name)}>×</ActionIcon></span>)}</div> : <div className="tag-empty">尚未添加标签</div>}</div>
+          <div className="inspector-section source-section"><div className="section-title">源文件</div><div className="source-path" title={selected.primarySource}><FileText className="file-icon" size={17} aria-hidden="true" /><div><strong>{selected.primarySource.split(/[\\/]/).pop()}</strong><small>{selected.assetDirectory}</small></div></div><div className="asset-file-actions"><Button disabled={busy} onClick={() => void planRenameAsset(selected)}>重命名资产包</Button><Button disabled={busy} onClick={() => void planMoveAssets([selected.id])}>移动…</Button>{selected.assetType === "model" && selected.primarySource.toLowerCase().endsWith(".pmx") ? <Button color="red" className="danger" disabled={busy} onClick={() => void requestAssetOperation("delete_model", [selected.id])}>删除模型…</Button> : <Button disabled={busy} onClick={() => void requestAssetOperation("recycle", [selected.id])}>移到回收站…</Button>}</div></div>
+          <div className="inspector-section tags-section"><div className="section-title">标签 <ActionIcon variant="subtle" size="sm" className="add-tag" aria-label="添加用户标签" title="添加用户标签" disabled={!detailsReady || busy} onClick={() => void addTag()}><Plus size={15} aria-hidden="true" /></ActionIcon></div>{currentDetails?.status === "failed" ? <Alert color="red" title="标签与关系读取失败" role="alert">{currentDetails.error}<Button disabled={busy} onClick={() => setSelectedDetailsRevision((value) => value + 1)}>重试详情</Button></Alert> : !detailsReady ? <div className="tag-empty" role="status">正在加载标签与关系…</div> : assetTags.length ? <div className="tag-list">{assetTags.map((tag) => <span className={`tag-chip ${tag.source}`} key={`${tag.name}-${tag.source}`} title={`来源：${tag.source}`}><span className="tag-chip-name">{tag.name}</span><ActionIcon variant="subtle" size="xs" aria-label={`移除标签 ${tag.name}`} disabled={!detailsReady || busy} onClick={() => void removeTag(tag.name)}><X size={14} aria-hidden="true" /></ActionIcon></span>)}</div> : <div className="tag-empty">尚未添加标签</div>}</div>
           {assetRelations.length > 0 && <div className="inspector-section relation-section"><div className="section-title">关系与版本 <span className="relation-count">{assetRelations.length}</span></div><div className="relation-list">{assetRelations.map((relation) => {
             const otherPath = selected.id === relation.sourceAsset ? relation.reason.target_path : relation.reason.source_path;
             const otherName = typeof otherPath === "string" ? otherPath.split(/[\\/]/).pop() : (selected.id === relation.sourceAsset ? relation.targetAsset : relation.sourceAsset).slice(0, 8);
@@ -1792,13 +1805,13 @@ export default function App() {
             return <div className="relation-card" key={relation.id} title={reasonCodes.join(" · ")}><div className="relation-card-main"><strong>{relationName}</strong><span>{otherName}</span></div>{typeof otherPath === "string" && <small className="relation-card-path" title={otherPath}>{otherPath}</small>}<div className="relation-card-meta"><span>{Math.round(relation.confidence * 100)}% · {relation.confirmed ? "已确认" : "待确认"}</span>{canPreviewCamera ? <Button className="tiny-link" disabled={!detailsReady || busy} onClick={() => void selectCameraAndPreview(relation, selected)}>{relation.confirmed ? "预览此镜头" : "选择并预览"}</Button> : !relation.confirmed && <Button className="tiny-link" disabled={!detailsReady || busy} onClick={() => void confirmRelation(relation)}>确认</Button>}</div></div>;
           })}</div></div>}
           <div className="inspector-spacer" />
-          <div className="inspector-actions"><Button onClick={() => void revealAsset(selected)} title="在资源管理器中定位源文件"><span>↗</span> 在资源管理器中定位</Button><Button onClick={() => viewAssetDirectory(selected)} title="在 MMDbridgeLib 文件夹视图中打开">查看所在文件夹</Button><Button onClick={() => void openAssetDirectory(selected)} title="在资源管理器中打开资产源目录">在资源管理器中打开</Button>{selected.assetType !== "motion" && <Button className="preview-3d-button" onClick={() => setViewerAsset({ id: selected.id, name: selected.name, primarySource: selected.primarySource, assetType: selected.assetType as "model" | "scene" })}><span>◇</span> 3D 预览</Button>}{selected.assetType === "motion" && selected.primarySource.toLowerCase().endsWith(".vmd") && <Button className="preview-3d-button" onClick={() => setMotionViewerAsset(selected)}><span>▶</span> 3D 动作</Button>}</div>
-        </> : <div className="inspector-empty"><div className="inspector-empty-icon">◇</div><strong>选择一个资产</strong><span>详细信息将在此处显示</span></div>}
+          <div className="inspector-actions"><Button onClick={() => void revealAsset(selected)} title="在资源管理器中定位源文件"><ArrowUpRight size={15} aria-hidden="true" /> 在资源管理器中定位</Button><Button onClick={() => viewAssetDirectory(selected)} title="在 MMDbridgeLib 文件夹视图中打开">查看所在文件夹</Button><Button onClick={() => void openAssetDirectory(selected)} title="在资源管理器中打开资产源目录">在资源管理器中打开</Button>{selected.assetType !== "motion" && <Button className="preview-3d-button" onClick={() => setViewerAsset({ id: selected.id, name: selected.name, primarySource: selected.primarySource, assetType: selected.assetType as "model" | "scene" })}><Box size={16} aria-hidden="true" /> 3D 预览</Button>}{selected.assetType === "motion" && selected.primarySource.toLowerCase().endsWith(".vmd") && <Button className="preview-3d-button" onClick={() => setMotionViewerAsset(selected)}><Play size={16} aria-hidden="true" /> 3D 动作</Button>}</div>
+        </> : <div className="inspector-empty"><div className="inspector-empty-icon"><Box size={28} strokeWidth={1.4} aria-hidden="true" /></div><strong>选择一个资产</strong><span>详细信息将在此处显示</span></div>}
       </AppShell.Aside>
       {dialogs.dialog}
       {assetMenu && <LibraryContextMenu x={assetMenu.x} y={assetMenu.y} label={`${assetMenu.asset.name} 操作`} onClose={() => setAssetMenu(null)}><Menu.Item role="menuitem" onClick={() => { setPreviewAsset(assetMenu.asset); setAssetMenu(null); }}>查看缩略图</Menu.Item>{assetMenu.asset.assetType !== "motion" && <Menu.Item role="menuitem" onClick={() => { setViewerAsset({ id: assetMenu.asset.id, name: assetMenu.asset.name, primarySource: assetMenu.asset.primarySource, assetType: assetMenu.asset.assetType as "model" | "scene" }); setAssetMenu(null); }}>查看 3D {assetMenu.asset.assetType === "scene" ? "场景" : "模型"}</Menu.Item>}{assetMenu.asset.assetType === "motion" && assetMenu.asset.primarySource.toLowerCase().endsWith(".vmd") && <Menu.Item role="menuitem" onClick={() => { setMotionViewerAsset(assetMenu.asset); setAssetMenu(null); }}>播放 3D 动作{typeof assetMenu.asset.metadata.paired_camera_path === "string" ? " / 配套镜头" : ""}</Menu.Item>}<Menu.Divider /><Menu.Item role="menuitem" onClick={() => { viewAssetDirectory(assetMenu.asset); setAssetMenu(null); }}>查看所在文件夹</Menu.Item><Menu.Item role="menuitem" onClick={() => { void revealAsset(assetMenu.asset); setAssetMenu(null); }}>在资源管理器中定位源文件</Menu.Item><Menu.Item role="menuitem" onClick={() => { void openAssetDirectory(assetMenu.asset); setAssetMenu(null); }}>在资源管理器中打开所在目录</Menu.Item>{assetMenu.asset.assetType === "model" && assetMenu.asset.primarySource.toLowerCase().endsWith(".pmx") && <Menu.Item role="menuitem" color="red" disabled={busy} onClick={() => { void requestAssetOperation("delete_model", [assetMenu.asset.id]); setAssetMenu(null); }}>删除模型…</Menu.Item>}<Menu.Divider /><Menu.Item role="menuitem" onClick={() => { void toggleFavorite(assetMenu.asset); setAssetMenu(null); }}>{assetMenu.asset.isFavorite ? "取消收藏" : "添加收藏"}</Menu.Item><Menu.Item role="menuitem" disabled={busy} onClick={() => { void createCard(assetMenu.asset.id); setAssetMenu(null); }}>重新生成此缩略图</Menu.Item></LibraryContextMenu>}
-      {rootMenu && <LibraryContextMenu x={rootMenu.x} y={rootMenu.y} label={`${rootMenu.root.displayName} 目录操作`} onClose={() => setRootMenu(null)} width={280}><Menu.Item role="menuitem" disabled={!!activeScans.length} onClick={() => { renameRoot(rootMenu.root); setRootMenu(null); }}>修改显示名称</Menu.Item><Menu.Item role="menuitem" disabled={!!activeScans.length} onClick={() => { void updateRoot(rootMenu.root, { enabled: !rootMenu.root.enabled }); setRootMenu(null); }}>{rootMenu.root.enabled ? "停用目录监视与后续扫描" : "启用目录监视与后续扫描"}</Menu.Item><Menu.Item role="menuitem" disabled={!!activeScans.length} title="设置影响后续扫描；关闭递归时，现有子目录索引状态会保留。" onClick={() => { void updateRoot(rootMenu.root, { scanRecursive: !rootMenu.root.scanRecursive }); setRootMenu(null); }}>递归扫描：{rootMenu.root.scanRecursive ? "已开启 · 点击关闭" : "已关闭 · 点击开启"}</Menu.Item><Menu.Divider /><Menu.Item role="menuitem" disabled={busy || !rootMenu.root.enabled || scanStates.some((scan) => scan.rootId === rootMenu.root.id && (activeScanStatuses.has(scan.status) || scan.status === "Paused"))} onClick={() => { void scanRoot(rootMenu.root, true); setRootMenu(null); }}>完整检查源文件与资源卡</Menu.Item><Menu.Item role="menuitem" disabled={busy || !rootMenu.root.enabled || activeScans.some((scan) => scan.rootId === rootMenu.root.id)} onClick={() => { void queueCards(rootMenu.root); setRootMenu(null); }}>生成资源卡和缩略图</Menu.Item><Menu.Divider /><Menu.Item role="menuitem" className="root-menu-remove" disabled={!!activeScans.length} onClick={() => { void removeRoot(rootMenu.root); setRootMenu(null); }}>从 Library 移除目录</Menu.Item></LibraryContextMenu>}
-      {scanQueueOpen && <Modal opened onClose={() => { setScanQueueOpen(false); }} title={<div><span>SCAN QUEUE</span><strong id="scan-queue-title">扫描索引队列</strong></div>} size={900} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal scan-queue-modal" }}><p className="operation-summary">扫描按队列顺序依次执行。暂停会保留已建立的索引；继续时会重新核对该目录。</p><div className="scan-queue-list">{scanStates.length ? scanStates.map((scan) => {
+      {rootMenu && <LibraryContextMenu x={rootMenu.x} y={rootMenu.y} label={`${rootMenu.root.displayName} 目录操作`} onClose={() => setRootMenu(null)} width={280}><Menu.Item role="menuitem" disabled={!!activeScans.length} onClick={() => { renameRoot(rootMenu.root); setRootMenu(null); }}>修改显示名称</Menu.Item><Menu.Item role="menuitem" disabled={!!activeScans.length} onClick={() => { void updateRoot(rootMenu.root, { enabled: !rootMenu.root.enabled }); setRootMenu(null); }}>{rootMenu.root.enabled ? "停用目录监视与后续扫描" : "启用目录监视与后续扫描"}</Menu.Item><Menu.Item role="menuitem" disabled={!!activeScans.length} title="设置影响后续扫描；关闭递归时，现有子目录索引状态会保留。" onClick={() => { void updateRoot(rootMenu.root, { scanRecursive: !rootMenu.root.scanRecursive }); setRootMenu(null); }}>递归扫描：{rootMenu.root.scanRecursive ? "已开启 · 点击关闭" : "已关闭 · 点击开启"}</Menu.Item><Menu.Divider /><Menu.Item role="menuitem" disabled={busy || !rootMenu.root.enabled || scanStates.some((scan) => scan.rootId === rootMenu.root.id && (activeScanStatuses.has(scan.status) || scan.status === "Paused"))} onClick={() => { void scanRoot(rootMenu.root, true); setRootMenu(null); }}>完整检查源文件与资源卡</Menu.Item><Menu.Item role="menuitem" disabled={busy || !rootMenu.root.enabled || activeScans.some((scan) => scan.rootId === rootMenu.root.id)} onClick={() => { void queueCards(rootMenu.root); setRootMenu(null); }}>生成资源卡和缩略图</Menu.Item><Menu.Divider /><Menu.Item role="menuitem" className="root-menu-remove" disabled={!!activeScans.length} onClick={() => { void removeRoot(rootMenu.root); setRootMenu(null); }}>从资产库移除目录</Menu.Item></LibraryContextMenu>}
+      {scanQueueOpen && <Modal opened onClose={() => { setScanQueueOpen(false); }} title={<div><strong id="scan-queue-title">扫描索引队列</strong></div>} size={900} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal scan-queue-modal" }}><p className="operation-summary">扫描按队列顺序依次执行。暂停会保留已建立的索引；继续时会重新核对该目录。</p><div className="scan-queue-list">{scanStates.length ? scanStates.map((scan) => {
           const root = roots.find((item) => item.id === scan.rootId);
           const pending = scanStates.filter((item) => item.status === "Pending").sort((a, b) => a.queueOrder - b.queueOrder);
           const pendingIndex = pending.findIndex((item) => item.rootId === scan.rootId);
@@ -1814,16 +1827,16 @@ export default function App() {
             </div>
           </div>;
         }) : <div className="jobs-panel-empty">队列为空。点击目录旁的扫描按钮加入任务。</div>}</div></Modal>}
-      {previewAsset && <Modal opened onClose={() => { setPreviewAsset(null); }} title={<div><span>ASSET THUMBNAIL</span><strong id="thumbnail-preview-title">{previewAsset.name}</strong></div>} size={760} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal thumbnail-preview-modal" }}><div className="thumbnail-preview-frame">{previewAsset.hasThumbnail ? <CardThumbnail revision={thumbnailRevisions[previewAsset.id]} assetId={previewAsset.id} alt={`${previewAsset.name} 缩略图`} /> : <div className="thumbnail-preview-empty">该资产尚未生成缩略图</div>}</div>{!previewAsset.hasThumbnail && <div className="settings-modal-actions"><Button onClick={() => { void createCard(previewAsset.id); setPreviewAsset(null); }}>生成资源卡和缩略图</Button></div>}</Modal>}
+      {previewAsset && <Modal opened onClose={() => { setPreviewAsset(null); }} title={<div><strong id="thumbnail-preview-title">{previewAsset.name}</strong></div>} size={760} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal thumbnail-preview-modal" }}><div className="thumbnail-preview-frame">{previewAsset.hasThumbnail ? <CardThumbnail revision={thumbnailRevisions[previewAsset.id]} assetId={previewAsset.id} alt={`${previewAsset.name} 缩略图`} /> : <div className="thumbnail-preview-empty">该资产尚未生成缩略图</div>}</div>{!previewAsset.hasThumbnail && <div className="settings-modal-actions"><Button onClick={() => { void createCard(previewAsset.id); setPreviewAsset(null); }}>生成资源卡和缩略图</Button></div>}</Modal>}
       {viewerAsset && <Suspense fallback={<div role="status" style={{ position: "fixed", inset: 0, zIndex: 50, display: "grid", placeItems: "center", background: "#050a0de8", color: "#bbcbc9", fontSize: 12 }}>正在载入 3D Viewer…</div>}><ModelViewer asset={viewerAsset} onClose={() => setViewerAsset(null)} /></Suspense>}
       {motionViewerAsset && <Suspense fallback={<div role="status" style={{ position: "fixed", inset: 0, zIndex: 50, display: "grid", placeItems: "center", background: "#050a0de8", color: "#bbcbc9", fontSize: 12 }}>正在载入 VMD 3D Viewer…</div>}><MotionViewer asset={motionViewerAsset} onClose={() => setMotionViewerAsset(null)} /></Suspense>}
-      {assetOperationPlan && <Modal opened onClose={() => { if (!busy) setAssetOperationPlan(null); }} title={<div><span>PACKAGE OPERATION</span><strong id="operation-plan-title">确认资产操作</strong></div>} size={720} zIndex={200} closeOnClickOutside={!busy} closeOnEscape={!busy} closeButtonProps={{ "aria-label": "关闭窗口", disabled: busy }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal" }}>{assetOperationError && <Alert color="red" role="alert" mb="sm">{assetOperationError}</Alert>}<p className="operation-summary">{assetOperationPlan.operation === "move" ? "移动" : assetOperationPlan.operation === "rename" ? "重命名" : assetOperationPlan.operation === "delete_model" ? (assetOperationPlan.deleteMode === "folder" ? "回收整个模型文件夹" : "只回收所选 PMX 文件") : "发送到 Windows 回收站"}将处理 {assetOperationPlan.sourcePaths.length} 个路径、{assetOperationPlan.affectedAssets.length} 项索引资产。</p>{assetOperationPlan.operation === "delete_model" && <>
+      {assetOperationPlan && <Modal opened onClose={() => { if (!busy) setAssetOperationPlan(null); }} title={<div><strong id="operation-plan-title">确认资产操作</strong></div>} size={720} zIndex={200} closeOnClickOutside={!busy} closeOnEscape={!busy} closeButtonProps={{ "aria-label": "关闭窗口", disabled: busy }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal" }}>{assetOperationError && <Alert color="red" role="alert" mb="sm">{assetOperationError}</Alert>}<p className="operation-summary">{assetOperationPlan.operation === "move" ? "移动" : assetOperationPlan.operation === "rename" ? "重命名" : assetOperationPlan.operation === "delete_model" ? (assetOperationPlan.deleteMode === "folder" ? "回收整个模型文件夹" : "只回收所选 PMX 文件") : "发送到 Windows 回收站"}将处理 {assetOperationPlan.sourcePaths.length} 个路径、{assetOperationPlan.affectedAssets.length} 项索引资产。</p>{assetOperationPlan.operation === "delete_model" && <>
           {assetOperationPlan.deleteReason && <div className="operation-warnings"><p>{assetOperationPlan.deleteReason}</p></div>}
           {(assetOperationPlan.pmxDirectories ?? []).map((directory) => <div className="operation-assets" key={directory.path}><strong>同目录 PMX · {directory.pmxPaths.length}</strong><details><summary>查看目录与 PMX 清单</summary><div><span>{directory.path}</span>{directory.pmxPaths.map((path) => <span title={path} key={path}>{path}</span>)}</div></details></div>)}
           {assetOperationPlan.deleteMode === "folder" && assetOperationPlan.packageSnapshots.length > 0 && <div className="operation-assets"><strong>整目录回收内容 · {assetOperationPlan.packageSnapshots.length}</strong><details><summary>展开全部文件与目录</summary><div>{assetOperationPlan.packageSnapshots.map((entry) => <span title={entry.path} key={entry.path}>{entry.path}</span>)}</div></details></div>}
           {assetOperationPlan.deleteMode === "pmxOnly" && (assetOperationPlan.preservedPaths?.length ?? 0) > 0 && <div className="operation-assets"><strong>保留路径 · {assetOperationPlan.preservedPaths?.length}</strong><details><summary>展开保留的文件与目录</summary><div>{assetOperationPlan.preservedPaths?.map((path) => <span title={path} key={path}>{path}</span>)}</div></details><p>同目录的其他模型、纹理、说明文件、文件夹和资源卡保留。</p></div>}
         </>}<div className="operation-path-list">{assetOperationPlan.sourcePaths.map((source, index) => <div className="operation-path-row" key={source}><span>{source}</span>{assetOperationPlan.destinationPaths[index] && <><b>→</b><span>{assetOperationPlan.destinationPaths[index]}</span></>}</div>)}</div>{assetOperationPlan.affectedAssets.length > 0 && <div className="operation-assets"><strong>受影响资产 · {assetOperationPlan.affectedAssets.length}</strong><details><summary>展开全部资产</summary><div>{assetOperationPlan.affectedAssets.map((asset) => <span title={asset.primarySource} key={asset.id}>{asset.name}</span>)}</div></details></div>}{assetOperationPlan.dependencyPaths.length > 0 && <div className="operation-assets"><strong>包内依赖文件 · {assetOperationPlan.dependencyPaths.length}</strong><details><summary>展开全部依赖</summary><div>{assetOperationPlan.dependencyPaths.map((path) => <span title={path} key={path}>{path}</span>)}</div></details></div>}{assetOperationPlan.warnings.length > 0 && <div className="operation-warnings"><strong>安全检查未通过</strong>{assetOperationPlan.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}<footer className="operation-modal-actions"><Button disabled={busy} onClick={() => { if (!busy) setAssetOperationPlan(null); }}>取消</Button><Button variant="filled" color={assetOperationPlan.operation === "recycle" || assetOperationPlan.operation === "delete_model" ? "red" : "mint"} disabled={!assetOperationPlan.canExecute || busy} onClick={() => void executePlannedAssetOperation()}>{busy ? "正在执行…" : assetOperationPlan.operation === "delete_model" ? assetOperationPlan.deleteMode === "folder" ? "回收整个文件夹" : "只回收所选 PMX" : assetOperationPlan.operation === "recycle" ? "确认移到回收站" : "确认执行"}</Button></footer></Modal>}
-      {operationJournalOpen && <Modal opened onClose={() => { setOperationJournalOpen(false); }} title={<div><span>FILE OPERATION HISTORY</span><strong id="operation-journal-title">资产操作日志</strong></div>} size={900} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal journal-modal" }}>{operationJournalError && <Alert color="red" role="alert" mb="sm">{operationJournalError}</Alert>}<div className="journal-heading-row"><span>记录保留在本地数据库；“需要恢复”表示文件操作部分完成或索引更新失败。</span><Button disabled={busy} onClick={() => void openOperationJournal()}>刷新</Button></div><div className="journal-entry-list">{operationJournal.length ? operationJournal.map((entry) => <article className="journal-entry" key={entry.id}>
+      {operationJournalOpen && <Modal opened onClose={() => { setOperationJournalOpen(false); }} title={<div><strong id="operation-journal-title">资产操作日志</strong></div>} size={900} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal journal-modal" }}>{operationJournalError && <Alert color="red" role="alert" mb="sm">{operationJournalError}</Alert>}<div className="journal-heading-row"><span>记录保留在本地数据库；“需要恢复”表示文件操作部分完成或索引更新失败。</span><Button disabled={busy} onClick={() => void openOperationJournal()}>刷新</Button></div><div className="journal-entry-list">{operationJournal.length ? operationJournal.map((entry) => <article className="journal-entry" key={entry.id}>
           <div className="journal-entry-heading"><strong>{entry.operation === "move" ? "移动资产包" : entry.operation === "rename" ? "重命名资产包" : entry.operation === "delete_model" ? "删除模型" : "移到回收站"}</strong><span className={`journal-status ${entry.status === "RecoveryNeeded" || entry.status === "Started" ? "needs-recovery" : entry.status.toLowerCase()}`}>{entry.status === "RecoveryNeeded" || entry.status === "Started" ? "需要检查" : entry.status === "Completed" ? "完成" : entry.status === "Resolved" ? "已核对" : "失败"}</span></div>
           <div className="journal-entry-paths">{entry.sourcePaths.map((source, index) => <div key={`${entry.id}-${source}`}><span>{source}</span>{entry.destinationPaths[index] && <><b>→</b><span>{entry.destinationPaths[index]}</span></>}</div>)}</div>
           <div className="journal-entry-result">{entry.affectedAssetCount} 项资产 · {entry.result?.message ?? "没有结果说明"} · {new Date(entry.updatedAt).toLocaleString()}</div>
@@ -1834,15 +1847,15 @@ export default function App() {
           </div>}
           {entry.status === "RecoveryNeeded" && <Button className="journal-resolve-button" onClick={() => void resolveJournalEntry(entry)}>已人工恢复并重扫，标记已核对</Button>}
         </article>) : <div className="jobs-panel-empty">暂无资产文件操作记录</div>}</div></Modal>}
-      {settingsOpen && <Modal opened onClose={() => { setSettingsOpen(false); }} title={<div><span>LIBRARY PREFERENCES</span><strong id="settings-title">设置</strong></div>} size={620} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "settings-modal" }}>{settingsError && <Alert color="red" role="alert" mb="sm">{settingsError}</Alert>}<div className="settings-field"><label>Motion Preview Model</label><p>用于 VMD/VPD 缩略图的 PMX 模型。设置后，VMD 会预览首帧或第一关键帧并应用骨骼、顶点/组、UV、材质、Flip 与 Impulse 表情（Impulse 为静帧近似）；文件含镜头轨道时也会按该帧相机取景，没有镜头轨道时按模型自动取景。VPD 会应用姿势骨骼。</p><div className="settings-model-path" title={motionPreviewModel ?? "尚未设置"}>{motionPreviewModel ?? "尚未设置模型"}</div><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void chooseMotionPreviewModel()}>{settingsBusy ? "正在保存…" : "选择 PMX 模型"}</Button><Button disabled={settingsBusy || !motionPreviewModel} onClick={() => void clearMotionPreviewModel()}>清除</Button></div></div><div className="settings-field"><label>缩略图</label><p>新版以 5° 微俯视取景，旧版预览标为过期。重新生成通过后台队列执行，可取消、重试；未设置预览模型的动作会跳过。</p><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void regenerateAllThumbnails()}>{settingsBusy ? "正在加入队列…" : "一键全部重新生成缩略图"}</Button></div>{notice && <p role="status">{notice}</p>}</div><div className="settings-field concurrency-settings"><label>缩略图阶段并发上限</label><p>分别限制解析、GPU 渲染和 WebP 编码。自动模式会按设备资源选择；每阶段可设 1–8 路，渲染自动模式为 1 路。</p>
+      {settingsOpen && <Modal opened onClose={() => { setSettingsOpen(false); }} title={<div><strong id="settings-title">外观与设置</strong></div>} size={620} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "settings-modal" }}><AppearanceSettings />{settingsError && <Alert color="red" role="alert" mb="sm">{settingsError}</Alert>}<div className="settings-field"><label>动作预览模型</label><p>选择用于动作和姿势缩略图的 PMX 模型。VMD 使用首帧或第一关键帧；包含镜头轨道时按镜头取景。</p><div className="settings-model-path" title={motionPreviewModel ?? "尚未设置"}>{motionPreviewModel ?? "尚未设置模型"}</div><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void chooseMotionPreviewModel()}>{settingsBusy ? "正在保存…" : "选择 PMX 模型"}</Button><Button disabled={settingsBusy || !motionPreviewModel} onClick={() => void clearMotionPreviewModel()}>清除</Button></div></div><div className="settings-field"><label>缩略图</label><p>重新生成在后台执行，可取消或重试。尚未设置预览模型时会跳过动作。</p><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void regenerateAllThumbnails()}>{settingsBusy ? "正在加入队列…" : "重新生成全部缩略图"}</Button></div>{notice && <p role="status">{notice}</p>}</div><div className="settings-field concurrency-settings"><label>缩略图阶段并发上限</label><p>分别限制解析、GPU 渲染和 WebP 编码。自动模式会按设备资源选择；每阶段可设 1–8 路，渲染自动模式为 1 路。</p>
           {(["parse", "render", "encode"] as const).map((stage) => {
             const value = thumbnailConcurrencyDraft[stage];
             const selection = value === null ? "auto" : ([1, 2, 4, 8].includes(value) ? String(value) : "custom");
-            const label = stage === "parse" ? "解析 Parse" : stage === "render" ? "渲染 Render" : "编码 Encode";
+            const label = stage === "parse" ? "解析" : stage === "render" ? "渲染" : "编码";
             return <div className="concurrency-row" key={stage}><span>{label}</span><div className="concurrency-controls"><NativeSelect aria-label={`${label}并发上限`} value={selection} disabled={settingsBusy} onChange={(event) => {
               const selected = event.target.value;
               setThumbnailConcurrencyDraft((current) => ({ ...current, [stage]: selected === "auto" ? null : selected === "custom" ? (current[stage] ?? 3) : Number(selected) }));
-            }}><option value="auto">Auto</option><option value="1">1</option><option value="2">2</option><option value="4">4</option><option value="8">8</option><option value="custom">自定义</option></NativeSelect>
+            }}><option value="auto">自动</option><option value="1">1</option><option value="2">2</option><option value="4">4</option><option value="8">8</option><option value="custom">自定义</option></NativeSelect>
               {selection === "custom" && <TextInput aria-label={`${label}自定义并发数`} type="number" min={1} max={8} step={1} value={value ?? 3} disabled={settingsBusy} onChange={(event) => {
                 const number = Number(event.target.value);
                 if (Number.isInteger(number) && number >= 1 && number <= 8) setThumbnailConcurrencyDraft((current) => ({ ...current, [stage]: number }));
@@ -1850,7 +1863,7 @@ export default function App() {
           })}
           <div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void saveThumbnailConcurrency()}>{settingsBusy ? "正在保存…" : "保存并发设置"}</Button></div>
         </div>{storageInfo && <div className="settings-field storage-settings"><label>便携数据库</label><p title={storageInfo.path}>{storageInfo.path}</p><div>数据库 {formatMiB(storageInfo.databaseBytes)} / {formatMiB(storageInfo.databaseLimitBytes)} · WAL {formatMiB(storageInfo.walBytes)}（目标不超过 {formatMiB(storageInfo.walTargetBytes)}）</div><div className="settings-modal-actions"><Button disabled={settingsBusy || activeScans.length > 0 || activeThumbnailCount > 0} onClick={() => void compactStorage()}>整理数据库和历史任务</Button></div></div>}<footer>模型文件保留在原位置；数据库保存在程序旁的 data 目录。</footer></Modal>}
-      {addRootOpen && <Modal opened onClose={() => { if (!addRootBusy) setAddRootOpen(false); }} title={<div><span>ADD LIBRARY ROOT</span><strong id="add-root-title">添加目录并扫描</strong></div>} size={540} zIndex={200} closeOnClickOutside={!addRootBusy} closeOnEscape={!addRootBusy} closeButtonProps={{ "aria-label": "关闭窗口", disabled: addRootBusy }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal add-root-modal" }}><form className="add-root-form" onSubmit={(event) => { event.preventDefault(); void submitAddRoot(); }}>
+      {addRootOpen && <Modal opened onClose={() => { if (!addRootBusy) setAddRootOpen(false); }} title={<div><strong id="add-root-title">添加目录并扫描</strong></div>} size={540} zIndex={200} closeOnClickOutside={!addRootBusy} closeOnEscape={!addRootBusy} closeButtonProps={{ "aria-label": "关闭窗口", disabled: addRootBusy }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal add-root-modal" }}><form className="add-root-form" onSubmit={(event) => { event.preventDefault(); void submitAddRoot(); }}>
           <label className="add-root-field">资产类型<NativeSelect value={addRootType} disabled={addRootBusy} onChange={(event) => setAddRootType(event.target.value as AssetType)}><option value="model">模型</option><option value="motion">动作</option><option value="scene">场景</option></NativeSelect></label>
           <label className="add-root-field">目录路径<div className="add-root-path-row"><TextInput aria-label="目录路径" value={addRootPath} disabled={addRootBusy} placeholder="选择或输入本地目录路径" onChange={(event) => setAddRootPath(event.target.value)} /><Button type="button" disabled={addRootBusy} onClick={() => void chooseAddRootDirectory()}>选择目录</Button></div></label>
           <label className="add-root-field">显示名称（可选）<TextInput value={addRootName} maxLength={128} disabled={addRootBusy} placeholder="默认使用目录名称" onChange={(event) => setAddRootName(event.target.value)} /></label>

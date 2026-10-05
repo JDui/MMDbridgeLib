@@ -804,7 +804,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
   };
 
   return <Modal.Root opened onClose={onClose} withinPortal={false} centered xOffset={20} yOffset={20} size={1120} zIndex={250} padding={0} transitionProps={{ duration: 150 }}><Modal.Overlay backgroundOpacity={0.72} blur={6} /><Modal.Content className="viewer-modal-content" aria-label={`${asset.name} 3D 查看器`}><Modal.Body p={0} className={`model-viewer-window ${asset.assetType === "scene" ? "scene-viewer" : ""}`}><header className="model-viewer-header">
-        <div><span className="model-viewer-eyebrow">{asset.assetType === "scene" ? "SCENE 3D VIEWER" : "PMX MODEL & WEIGHT INSPECTOR"}</span><h2 title={asset.name}>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div>
+        <div><span className="model-viewer-eyebrow">{asset.assetType === "scene" ? "场景预览" : "模型与权重预览"}</span><h2 title={asset.name}>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div>
         <div className="model-viewer-header-actions"><Button disabled={!model} title="导出当前视角 PNG" onClick={exportPng}>导出截图</Button><ActionIcon variant="subtle" size="sm" className="model-viewer-close" aria-label="关闭 3D 预览" onClick={onClose}>×</ActionIcon></div>
       </header><div className="model-viewer-content">
         <aside className="model-viewer-sidebar">
