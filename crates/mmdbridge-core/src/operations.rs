@@ -1278,7 +1278,8 @@ pub(crate) fn mark_interrupted(library: &Library) -> CoreResult<()> {
         if crate::scan_queue::claim_owner_is_live(owner) { continue; }
         connection.execute(
         "UPDATE operation_journal SET status='RecoveryNeeded',updated_at=?1,
-         result_json=json_object('message','Application stopped before this operation was confirmed complete; inspect the source and destination, restore files if needed, then rescan before resolving this entry')
+         result_json=json_patch(CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,
+           json_object('message','程序在操作完成确认前停止；请检查源路径和目标路径，恢复文件并重新扫描后再确认处理','interruptedAt',?1))
          WHERE id=?2 AND status='Started'",
         params![Utc::now().to_rfc3339(), id],
         )?;
@@ -1290,7 +1291,8 @@ pub(crate) fn resolve_journal(library: &Library, id: &str) -> CoreResult<bool> {
     let connection = library.connection()?;
     let changed = connection.execute(
         "UPDATE operation_journal SET status='Resolved',updated_at=?1,
-         result_json=json_object('message','User confirmed manual recovery and rescan')
+         result_json=json_patch(CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,
+           json_object('message','用户已确认手动恢复并重新扫描','resolvedAt',?1))
          WHERE id=?2 AND status='RecoveryNeeded'",
         params![Utc::now().to_rfc3339(), id],
     )?;
@@ -2401,6 +2403,116 @@ unsafe fn shell_item(path: &Path) -> Result<windows::Win32::UI::Shell::IShellIte
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interruption_and_resolution_preserve_recovery_evidence() {
+        let library = Library::in_memory().unwrap();
+        let evidence = json!({
+            "ownerPid":2147483647, "rootIds":["root"],
+            "completedPaths":["已完成"], "uncertainPaths":["待核查"],
+            "notStartedPaths":["未开始"], "indexUpdateFailed":true,
+        });
+        library.connection().unwrap().execute(
+            "INSERT INTO operation_journal(id,operation,status,asset_ids_json,sources_json,destinations_json,created_at,updated_at,result_json)
+             VALUES ('recovery','move','Started','[]','[]','[]','now','now',?1)",
+            [evidence.to_string()],
+        ).unwrap();
+        mark_interrupted(&library).unwrap();
+        let interrupted = library.list_operation_journal(10).unwrap().remove(0);
+        assert_eq!(interrupted.status, "RecoveryNeeded");
+        for key in ["rootIds", "completedPaths", "uncertainPaths", "notStartedPaths", "indexUpdateFailed"] {
+            assert_eq!(interrupted.result[key], evidence[key]);
+        }
+        assert!(interrupted.result["interruptedAt"].is_string());
+        assert!(library.resolve_operation_journal("recovery").unwrap());
+        let resolved = library.list_operation_journal(10).unwrap().remove(0);
+        assert_eq!(resolved.status, "Resolved");
+        for key in ["rootIds", "completedPaths", "uncertainPaths", "notStartedPaths", "indexUpdateFailed"] {
+            assert_eq!(resolved.result[key], evidence[key]);
+        }
+        assert_eq!(resolved.result["interruptedAt"], interrupted.result["interruptedAt"]);
+        assert!(resolved.result["resolvedAt"].is_string());
+        assert!(!library.resolve_operation_journal("recovery").unwrap());
+        assert_eq!(library.list_operation_journal(10).unwrap()[0].result, resolved.result);
+    }
+
+    #[test]
+    fn resolution_cannot_release_a_live_operation_or_rewrite_terminal_entries() {
+        let library = Library::in_memory().unwrap();
+        for (id, status) in [("live", "Started"), ("done", "Completed"), ("failed", "Failed"), ("recover", "RecoveryNeeded")] {
+            library.connection().unwrap().execute(
+                "INSERT INTO operation_journal(id,operation,status,asset_ids_json,sources_json,destinations_json,created_at,updated_at,result_json)
+                 VALUES (?1,'move',?2,?3,'[]','[]','now','now',?4)",
+                params![id, status, json!([id]).to_string(), json!({"ownerPid":std::process::id(),"marker":id}).to_string()],
+            ).unwrap();
+        }
+        assert!(is_asset_operation_active_on(&library.connection().unwrap(), "live").unwrap());
+        for id in ["live", "done", "failed"] {
+            assert!(!library.resolve_operation_journal(id).unwrap());
+        }
+        assert!(is_asset_operation_active_on(&library.connection().unwrap(), "live").unwrap());
+        assert!(is_asset_operation_active_on(&library.connection().unwrap(), "recover").unwrap());
+        assert!(library.resolve_operation_journal("recover").unwrap());
+        assert!(!is_asset_operation_active_on(&library.connection().unwrap(), "recover").unwrap());
+        let entries = library.list_operation_journal(10).unwrap();
+        for (id, status) in [("live", "Started"), ("done", "Completed"), ("failed", "Failed")] {
+            let entry = entries.iter().find(|entry| entry.id == id).unwrap();
+            assert_eq!(entry.status, status);
+            assert_eq!(entry.result["marker"], id);
+        }
+    }
+
+    #[test]
+    fn actual_move_and_rename_preserve_package_identity_annotations_and_dependencies() {
+        let fixture = Fixture::new();
+        let library = Library::in_memory().unwrap();
+        let (source_root, destination_root) = setup_roots(&fixture, &library);
+        let package = source_root.join("模型_日本");
+        fs::create_dir_all(&package).unwrap();
+        let primary = package.join("model.pmx");
+        let texture = package.join("texture.png");
+        fs::write(&primary, b"fixture-pmx").unwrap();
+        fs::write(&texture, b"texture").unwrap();
+        fs::write(package.join("说明.txt"), b"package-note").unwrap();
+        let parsed = json!({
+            "file_type":"pmx",
+            "file_dependencies":[dependency("texture.png", "texture", &texture, "resolved")],
+        });
+        add_asset(&library, "asset-1", "source-root", "Fixture", &primary, &package, &parsed, &[(texture.to_str().unwrap(), "texture")]);
+        library.add_asset_tag("asset-1", "手动标签", "user", None).unwrap();
+        library.set_favorite("asset-1", true).unwrap();
+
+        let plan = move_plan(&library, &destination_root);
+        assert!(plan.can_execute, "{:?}", plan.warnings);
+        let moved = library.execute_asset_operation(&plan).unwrap();
+        assert_eq!(moved.status, "Completed");
+        assert!(!package.exists());
+        let moved_package = destination_root.join("模型_日本");
+        assert_eq!(fs::read(moved_package.join("说明.txt")).unwrap(), b"package-note");
+        let asset = library.inspect_asset("asset-1").unwrap();
+        assert_eq!(asset.id, "asset-1");
+        assert_eq!(asset.root_id, "destination-root");
+        assert_eq!(Path::new(&asset.primary_source), fs::canonicalize(moved_package.join("model.pmx")).unwrap());
+        assert!(asset.is_favorite);
+        assert!(library.list_asset_tags("asset-1").unwrap().iter().any(|tag| tag.name == "手动标签"));
+
+        let plan = library.plan_asset_operation("rename", &["asset-1".to_owned()], None, Some("重命名_日本")).unwrap();
+        assert!(plan.can_execute, "{:?}", plan.warnings);
+        assert_eq!(library.execute_asset_operation(&plan).unwrap().status, "Completed");
+        let renamed = destination_root.join("重命名_日本");
+        assert!(!moved_package.exists());
+        assert_eq!(fs::read(renamed.join("model.pmx")).unwrap(), b"fixture-pmx");
+        assert_eq!(fs::read(renamed.join("texture.png")).unwrap(), b"texture");
+        assert_eq!(fs::read(renamed.join("说明.txt")).unwrap(), b"package-note");
+        let asset = library.inspect_asset("asset-1").unwrap();
+        assert_eq!(asset.id, "asset-1");
+        assert!(asset.is_favorite);
+        assert_eq!(Path::new(&asset.primary_source), fs::canonicalize(renamed.join("model.pmx")).unwrap());
+        assert_eq!(asset.metadata["file_dependencies"][0]["path"], fs::canonicalize(renamed.join("texture.png")).unwrap().to_string_lossy().as_ref());
+        assert!(library.list_asset_tags("asset-1").unwrap().iter().any(|tag| tag.name == "手动标签"));
+        assert!(!is_asset_operation_active_on(&library.connection().unwrap(), "asset-1").unwrap());
+        assert_eq!(library.list_operation_journal(10).unwrap().len(), 2);
+    }
 
     #[test]
     fn journal_recovery_does_not_interrupt_a_live_operation() {

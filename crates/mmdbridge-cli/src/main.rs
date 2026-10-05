@@ -275,18 +275,20 @@ enum MotionPreviewModelCommand {
     Clear,
 }
 
+struct CommandOutput {
+    value: serde_json::Value,
+    failed: bool,
+}
+
 fn main() -> ExitCode {
     match run() {
-        Ok(value) => {
+        Ok(output) => {
+            let value = output.value;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_owned())
             );
-            if value
-                .get("partialFailure")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
+            if output.failed {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
@@ -312,11 +314,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<serde_json::Value, CoreError> {
+fn run() -> Result<CommandOutput, CoreError> {
     let cli = Cli::parse();
     let _json_output = cli.json;
     let library = Library::open(Library::portable_database_path()?)?;
-    match cli.command {
+    let checks_job_outcome = matches!(
+        &cli.command,
+        Command::Thumbnail { .. }
+            | Command::Cards {
+                command: CardCommand::Generate { .. } | CardCommand::SyncManifest { .. }
+            }
+    );
+    let value = match cli.command {
         Command::Roots {
             command: RootCommand::List,
         } => Ok(json!(library.list_roots()?)),
@@ -671,7 +680,22 @@ fn run() -> Result<serde_json::Value, CoreError> {
             }
             Ok(json!(completed))
         }
+    }?;
+    let failed = checks_job_outcome && job_output_failed(&value);
+    Ok(CommandOutput { value, failed })
+}
+
+fn job_output_failed(value: &serde_json::Value) -> bool {
+    if value.get("partialFailure").and_then(serde_json::Value::as_bool) == Some(true)
+        || value.get("failed").and_then(serde_json::Value::as_u64).is_some_and(|count| count > 0)
+        || value.get("cancelled").and_then(serde_json::Value::as_u64).is_some_and(|count| count > 0)
+    {
+        return true;
     }
+    if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
+        return status != "Completed";
+    }
+    value.as_array().is_some_and(|jobs| jobs.iter().any(job_output_failed))
 }
 
 fn read_preview(path: PathBuf) -> Result<Vec<u8>, CoreError> {
