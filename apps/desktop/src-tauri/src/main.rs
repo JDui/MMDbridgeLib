@@ -92,6 +92,7 @@ impl From<CoreError> for ApiError {
         };
         let error_code = match &error {
             CoreError::Database(_) => "DatabaseError",
+            CoreError::UnsupportedDatabaseVersion { .. } => "UnsupportedDatabaseVersion",
             CoreError::Io(_) => "FilesystemError",
             CoreError::InvalidRoot(_) => "InvalidRoot",
             CoreError::RootNotFound(_) => "RootNotFound",

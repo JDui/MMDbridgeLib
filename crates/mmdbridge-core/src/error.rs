@@ -6,6 +6,8 @@ pub type CoreResult<T> = Result<T, CoreError>;
 pub enum CoreError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("数据库版本 {found} 高于当前程序支持的版本 {supported}，请使用新版程序打开")]
+    UnsupportedDatabaseVersion { found: i64, supported: i64 },
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid root path: {0}")]
@@ -66,6 +68,7 @@ impl CoreError {
             _ => !matches!(
                 self,
                 Self::RootNotFound(_)
+                    | Self::UnsupportedDatabaseVersion { .. }
                     | Self::RootDisabled(_)
                     | Self::ScanCancelled
                     | Self::ScanPaused

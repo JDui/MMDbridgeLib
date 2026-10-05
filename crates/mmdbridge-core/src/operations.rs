@@ -7,7 +7,7 @@ use std::{
 };
 
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -186,7 +186,7 @@ pub(crate) fn plan(
     destination_parent: Option<&str>,
     new_name: Option<&str>,
 ) -> CoreResult<AssetOperationPlan> {
-    Ok(prepare(library, operation, asset_ids, destination_parent, new_name)?.view)
+    Ok(prepare(library, operation, asset_ids, destination_parent, new_name, None)?.view)
 }
 
 fn prepare(
@@ -195,6 +195,7 @@ fn prepare(
     asset_ids: &[String],
     destination_parent: Option<&str>,
     new_name: Option<&str>,
+    own_operation: Option<&str>,
 ) -> CoreResult<PreparedPlan> {
     let kind = OperationKind::parse(operation)?;
     let mut requested_ids = asset_ids
@@ -215,7 +216,7 @@ fn prepare(
         ));
     }
     if kind == OperationKind::DeleteModel {
-        return prepare_model_delete(library, requested_ids);
+        return prepare_model_delete(library, requested_ids, own_operation);
     }
     let requested_name = if kind == OperationKind::Rename {
         Some(validate_name(new_name.unwrap_or_default())?)
@@ -479,7 +480,7 @@ fn prepare(
                     asset.name
                 ));
             }
-            if has_unresolved_operation(library, &asset.id)? {
+            if has_unresolved_operation(library, &asset.id, own_operation)? {
                 warnings.push(format!(
                     "该资产有待人工核对的文件操作记录，请先恢复文件并重新扫描：{}",
                     asset.name
@@ -633,7 +634,7 @@ fn prepare(
     })
 }
 
-fn prepare_model_delete(library: &Library, requested_ids: Vec<String>) -> CoreResult<PreparedPlan> {
+fn prepare_model_delete(library: &Library, requested_ids: Vec<String>, own_operation: Option<&str>) -> CoreResult<PreparedPlan> {
     let selected_assets = requested_ids
         .iter()
         .map(|asset_id| load_asset(library, asset_id))
@@ -931,7 +932,7 @@ fn prepare_model_delete(library: &Library, requested_ids: Vec<String>) -> CoreRe
             if has_active_job(library, &asset.id)? {
                 warnings.push(format!("资产仍有后台任务运行，请等待任务完成后再操作：{}", asset.name));
             }
-            if has_unresolved_operation(library, &asset.id)? {
+            if has_unresolved_operation(library, &asset.id, own_operation)? {
                 warnings.push(format!("该资产有待人工核对的文件操作记录，请先恢复文件并重新扫描：{}", asset.name));
             }
         }
@@ -1110,6 +1111,7 @@ pub(crate) fn execute(
     library: &Library,
     confirmed_plan: &AssetOperationPlan,
 ) -> CoreResult<AssetOperationJournalEntry> {
+    if !confirmed_plan.can_execute { return Err(CoreError::AssetOperation("不能执行被安全检查阻止的计划".to_owned())); }
     let _operation_guard = library.asset_operation_guard()?;
     let prepared = prepare(
         library,
@@ -1117,6 +1119,7 @@ pub(crate) fn execute(
         &confirmed_plan.asset_ids,
         confirmed_plan.destination_parent.as_deref(),
         confirmed_plan.new_name.as_deref(),
+        None,
     )?;
     if !prepared.view.can_execute {
         return Err(CoreError::AssetOperation(format!(
@@ -1124,19 +1127,7 @@ pub(crate) fn execute(
             prepared.view.warnings.join("；")
         )));
     }
-    if prepared.view.source_paths != confirmed_plan.source_paths
-        || prepared.view.destination_paths != confirmed_plan.destination_paths
-        || prepared.view.affected_assets != confirmed_plan.affected_assets
-        || prepared.view.dependency_paths != confirmed_plan.dependency_paths
-        || prepared.view.source_snapshots != confirmed_plan.source_snapshots
-        || prepared.view.package_snapshots != confirmed_plan.package_snapshots
-        || prepared.view.dependency_snapshots != confirmed_plan.dependency_snapshots
-        || prepared.view.delete_mode != confirmed_plan.delete_mode
-        || prepared.view.delete_reason != confirmed_plan.delete_reason
-        || prepared.view.pmx_directories != confirmed_plan.pmx_directories
-        || prepared.view.preserved_paths != confirmed_plan.preserved_paths
-        || prepared.view.warnings != confirmed_plan.warnings
-    {
+    if !plans_match(&prepared.view, confirmed_plan) {
         return Err(CoreError::AssetOperation(
             "资产或文件在确认后发生变化，请重新生成操作计划".to_owned(),
         ));
@@ -1158,8 +1149,22 @@ pub(crate) fn execute(
         &prepared.view.source_paths,
         &prepared.view.destination_paths,
         &now,
-        json!({"message":"Operation started"}),
+        json!({"message":"Operation started","ownerPid":std::process::id()}),
     )?;
+
+    let current = prepare(library, &confirmed_plan.operation, &confirmed_plan.asset_ids,
+        confirmed_plan.destination_parent.as_deref(), confirmed_plan.new_name.as_deref(), Some(&operation_id));
+    let prepared = match current {
+        Ok(current) if current.view.can_execute && plans_match(&current.view, confirmed_plan) => current,
+        result => {
+            let message = match result {
+                Err(error) => error.to_string(),
+                Ok(_) => "资产或文件在取得操作占用前发生变化，请重新生成操作计划".to_owned(),
+            };
+            finish_journal(library, &operation_id, "Failed", json!({"message":message}))?;
+            return Err(CoreError::AssetOperation(message));
+        }
+    };
 
     if let Some(asset) = prepared
         .affected_assets
@@ -1253,14 +1258,31 @@ pub(crate) fn execute(
     })
 }
 
+fn plans_match(left: &AssetOperationPlan, right: &AssetOperationPlan) -> bool {
+    left.source_paths == right.source_paths && left.destination_paths == right.destination_paths
+        && left.affected_assets == right.affected_assets && left.dependency_paths == right.dependency_paths
+        && left.source_snapshots == right.source_snapshots && left.package_snapshots == right.package_snapshots
+        && left.dependency_snapshots == right.dependency_snapshots && left.delete_mode == right.delete_mode
+        && left.delete_reason == right.delete_reason && left.pmx_directories == right.pmx_directories
+        && left.preserved_paths == right.preserved_paths && left.warnings == right.warnings
+}
+
 pub(crate) fn mark_interrupted(library: &Library) -> CoreResult<()> {
     let connection = library.connection()?;
-    connection.execute(
+    let started = connection.prepare("SELECT id,result_json FROM operation_journal WHERE status='Started'")?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (id, result) in started {
+        let owner = serde_json::from_str::<Value>(&result).ok()
+            .and_then(|value| value.get("ownerPid").and_then(Value::as_i64));
+        if crate::scan_queue::claim_owner_is_live(owner) { continue; }
+        connection.execute(
         "UPDATE operation_journal SET status='RecoveryNeeded',updated_at=?1,
          result_json=json_object('message','Application stopped before this operation was confirmed complete; inspect the source and destination, restore files if needed, then rescan before resolving this entry')
-         WHERE status='Started'",
-        [Utc::now().to_rfc3339()],
-    )?;
+         WHERE id=?2 AND status='Started'",
+        params![Utc::now().to_rfc3339(), id],
+        )?;
+    }
     Ok(())
 }
 
@@ -1581,10 +1603,55 @@ fn insert_journal(
     sources: &[String],
     destinations: &[String],
     timestamp: &str,
-    result: Value,
+    mut result: Value,
 ) -> CoreResult<()> {
-    let connection = library.connection()?;
-    connection.execute(
+    let mut connection = library.connection()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let occupied_paths = transaction.prepare(
+        "SELECT sources_json,destinations_json FROM operation_journal WHERE status IN ('Started','RecoveryNeeded')",
+    )?.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (occupied_sources, occupied_destinations) in occupied_paths {
+        let occupied_sources: Vec<String> = serde_json::from_str(&occupied_sources)?;
+        let occupied_destinations: Vec<String> = serde_json::from_str(&occupied_destinations)?;
+        if sources.iter().chain(destinations).any(|path| occupied_sources.iter().chain(&occupied_destinations)
+            .any(|occupied| same_path(Path::new(path), Path::new(occupied))
+                || path_is_within(Path::new(path), Path::new(occupied))
+                || path_is_within(Path::new(occupied), Path::new(path)))) {
+            return Err(CoreError::AssetOperation("源路径或目标路径已有进行中或待恢复的文件操作，请先处理该操作".to_owned()));
+        }
+    }
+    let mut root_ids = HashSet::new();
+    for asset_id in asset_ids {
+        let root_id: Option<String> = transaction.query_row("SELECT root_id FROM assets WHERE id=?1", [asset_id], |row| row.get(0)).optional()?;
+        root_ids.insert(root_id.ok_or_else(|| CoreError::AssetNotFound(asset_id.clone()))?);
+        if is_asset_operation_active_on(&transaction, asset_id)? {
+            return Err(CoreError::AssetOperation("该资产已有进行中或待恢复的文件操作".to_owned()));
+        }
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE asset_id=?1 AND status IN ('Pending','Parsing','Rendering','Encoding','Cancelling'))",
+            [asset_id], |row| row.get(0),
+        )?;
+        if active { return Err(CoreError::AssetOperation("该资产仍有后台任务占用，请等待任务退出后再操作".to_owned())); }
+    }
+    let roots = transaction.prepare("SELECT id,path FROM roots")?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (root_id, root_path) in roots {
+        if sources.iter().chain(destinations).any(|path| path_is_within(Path::new(&root_path), Path::new(path)) || path_is_within(Path::new(path), Path::new(&root_path))) {
+            root_ids.insert(root_id);
+        }
+    }
+    let mut root_ids = root_ids.into_iter().collect::<Vec<_>>();
+    root_ids.sort();
+    let active_scan: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scan_state WHERE root_id IN (SELECT value FROM json_each(?1))
+         AND status IN ('Discovering','Indexing','Verifying','Relations','Pausing','Cancelling'))",
+        [serde_json::to_string(&root_ids)?], |row| row.get(0),
+    )?;
+    if active_scan { return Err(CoreError::AssetOperation("源目录或目标目录仍有扫描任务占用，请等待扫描退出后再操作".to_owned())); }
+    result["rootIds"] = json!(root_ids);
+    transaction.execute(
         "INSERT INTO operation_journal(id,operation,status,asset_ids_json,sources_json,destinations_json,created_at,updated_at,result_json)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8)",
         params![
@@ -1598,6 +1665,7 @@ fn insert_journal(
             serde_json::to_string(&result)?
         ],
     )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -2015,22 +2083,22 @@ fn has_active_job(library: &Library, asset_id: &str) -> CoreResult<bool> {
     let connection = library.connection()?;
     connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE asset_id=?1 AND status IN ('Pending','Parsing','Rendering','Encoding'))",
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE asset_id=?1 AND status IN ('Pending','Parsing','Rendering','Encoding','Cancelling'))",
             [asset_id],
             |row| row.get(0),
         )
         .map_err(Into::into)
 }
 
-fn has_unresolved_operation(library: &Library, asset_id: &str) -> CoreResult<bool> {
+fn has_unresolved_operation(library: &Library, asset_id: &str, own_operation: Option<&str>) -> CoreResult<bool> {
     let connection = library.connection()?;
     connection
         .query_row(
             "SELECT EXISTS(
                SELECT 1 FROM operation_journal j, json_each(j.asset_ids_json) ids
-               WHERE j.status='RecoveryNeeded' AND ids.value=?1
+               WHERE j.status IN ('Started','RecoveryNeeded') AND ids.value=?1 AND (?2 IS NULL OR j.id<>?2)
              )",
-            [asset_id],
+            params![asset_id, own_operation],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -2038,6 +2106,10 @@ fn has_unresolved_operation(library: &Library, asset_id: &str) -> CoreResult<boo
 
 pub(crate) fn is_asset_operation_active(library: &Library, asset_id: &str) -> CoreResult<bool> {
     let connection = library.connection()?;
+    is_asset_operation_active_on(&connection, asset_id)
+}
+
+pub(crate) fn is_asset_operation_active_on(connection: &Connection, asset_id: &str) -> CoreResult<bool> {
     connection
         .query_row(
             "SELECT EXISTS(
@@ -2048,6 +2120,15 @@ pub(crate) fn is_asset_operation_active(library: &Library, asset_id: &str) -> Co
             |row| row.get(0),
         )
         .map_err(Into::into)
+}
+
+pub(crate) fn is_root_operation_active_on(connection: &Connection, root_id: &str) -> CoreResult<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operation_journal j WHERE j.status='Started' AND (
+           EXISTS(SELECT 1 FROM json_each(j.result_json,'$.rootIds') ids WHERE ids.value=?1)
+           OR EXISTS(SELECT 1 FROM json_each(j.asset_ids_json) ids JOIN assets a ON a.id=ids.value WHERE a.root_id=?1)))",
+        [root_id], |row| row.get(0),
+    )?)
 }
 
 fn find_root_for_path(
@@ -2320,6 +2401,66 @@ unsafe fn shell_item(path: &Path) -> Result<windows::Win32::UI::Shell::IShellIte
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_recovery_does_not_interrupt_a_live_operation() {
+        let library = Library::in_memory().unwrap();
+        let connection = library.connection().unwrap();
+        for (id, owner) in [("live", i64::from(std::process::id())), ("dead", 2147483647)] {
+            connection.execute("INSERT INTO operation_journal(id,operation,status,asset_ids_json,sources_json,destinations_json,created_at,updated_at,result_json)
+                VALUES (?1,'move','Started','[]','[]','[]','now','now',?2)", params![id, json!({"ownerPid":owner}).to_string()]).unwrap();
+        }
+        drop(connection);
+        mark_interrupted(&library).unwrap();
+        let entries = list_journal(&library, 10).unwrap();
+        assert_eq!(entries.iter().find(|entry| entry.id == "live").unwrap().status, "Started");
+        assert_eq!(entries.iter().find(|entry| entry.id == "dead").unwrap().status, "RecoveryNeeded");
+    }
+
+    #[test]
+    fn journal_reservation_blocks_cancelling_tasks_and_overlapping_operations() {
+        let library = Library::in_memory().unwrap();
+        library.connection().unwrap().execute_batch(
+            "INSERT INTO roots(id,asset_type,path,path_key,display_name,created_at) VALUES ('r','model','/r','/r','Root','now');
+             INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,created_at,updated_at,last_seen_at)
+             VALUES ('a','r','model','A','/r/a/model.pmx','/r/a','now','now','now');
+             INSERT INTO jobs(id,asset_id,kind,status,created_at,updated_at) VALUES ('j','a','thumbnail','Cancelling','now','now');"
+        ).unwrap();
+        let reserve = |id| insert_journal(&library, id, OperationKind::Move, "Started", &["a".to_owned()], &[], &[], "now", json!({"ownerPid":std::process::id()}));
+        assert!(reserve("first").is_err());
+        assert!(library.remove_root("r").is_err());
+        library.connection().unwrap().execute("UPDATE jobs SET status='Cancelled' WHERE id='j'", []).unwrap();
+        library.connection().unwrap().execute("INSERT INTO scan_state(root_id,status,updated_at) VALUES ('r','Discovering','now')", []).unwrap();
+        assert!(reserve("first").is_err());
+        library.connection().unwrap().execute("UPDATE scan_state SET status='Completed' WHERE root_id='r'", []).unwrap();
+        reserve("first").unwrap();
+        assert!(library.remove_root("r").is_err());
+        library.connection().unwrap().execute("UPDATE scan_state SET status='Pending' WHERE root_id='r'", []).unwrap();
+        assert!(library.claim_pending_scan("r").unwrap().is_none());
+        assert!(reserve("second").is_err());
+        assert!(matches!(library.create_card("a", None), Err(CoreError::AssetOperation(_))));
+        assert_eq!(list_journal(&library, 10).unwrap().len(), 1);
+        finish_journal(&library, "first", "Completed", json!({})).unwrap();
+        assert!(library.claim_pending_scan("r").unwrap().is_some());
+    }
+
+    #[test]
+    fn different_assets_cannot_reserve_overlapping_destination_paths() {
+        let library = Library::in_memory().unwrap();
+        library.connection().unwrap().execute_batch(
+            "INSERT INTO roots(id,asset_type,path,path_key,display_name,created_at) VALUES ('r','model','/r','/r','Root','now');
+             INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,created_at,updated_at,last_seen_at)
+             VALUES ('a','r','model','A','/r/a/model.pmx','/r/a','now','now','now'),
+                    ('b','r','model','B','/r/b/model.pmx','/r/b','now','now','now');"
+        ).unwrap();
+        let reserve = |id: &str, asset: &str, destination: &str| insert_journal(&library, id, OperationKind::Move, "Started",
+            &[asset.to_owned()], &[format!("/r/{asset}")], &[destination.to_owned()], "now", json!({}));
+        reserve("first", "a", "/target/shared").unwrap();
+        assert!(reserve("second", "b", "/TARGET/shared").is_err());
+        assert!(reserve("second", "b", "/target/shared/child").is_err());
+        assert!(reserve("second", "b", "/target").is_err());
+        reserve("second", "b", "/target/sibling").unwrap();
+    }
 
     struct Fixture {
         path: PathBuf,

@@ -1,0 +1,59 @@
+name: Functional regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+      - run: npm run test:functional
+      - run: npm run build
+
+  core:
+    name: Core (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --locked
+      - uses: actions/setup-node@v5
+        if: runner.os == 'Windows'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+        if: runner.os == 'Windows'
+        working-directory: apps/desktop
+      - run: npm run build
+        if: runner.os == 'Windows'
+        working-directory: apps/desktop
+      - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+        if: runner.os == 'Windows'
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target

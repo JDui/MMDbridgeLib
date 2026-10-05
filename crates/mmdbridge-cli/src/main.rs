@@ -685,6 +685,7 @@ fn read_preview(path: PathBuf) -> Result<Vec<u8>, CoreError> {
 fn error_code(error: &CoreError) -> &'static str {
     match error {
         CoreError::Database(_) => "DatabaseError",
+        CoreError::UnsupportedDatabaseVersion { .. } => "UnsupportedDatabaseVersion",
         CoreError::Io(_) => "FilesystemError",
         CoreError::InvalidRoot(_) => "InvalidRoot",
         CoreError::RootNotFound(_) => "RootNotFound",

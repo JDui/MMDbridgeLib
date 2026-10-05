@@ -45,7 +45,7 @@ fn worker_queue() -> CoreResult<Arc<ScanQueue>> {
 
 fn push(queue: &ScanQueue, library: &Library, root_id: &str) -> CoreResult<()> {
     let mut pending = queue.pending.lock().map_err(|_| CoreError::LockPoisoned)?;
-    if !pending.tasks.iter().any(|(_, queued_id)| queued_id == root_id) {
+    if !pending.tasks.iter().any(|(queued_library, queued_id)| queued_id == root_id && queued_library.same_database(library)) {
         pending.tasks.push_back((library.clone(), root_id.to_owned()));
         queue.changed.notify_one();
     }
@@ -53,13 +53,21 @@ fn push(queue: &ScanQueue, library: &Library, root_id: &str) -> CoreResult<()> {
 }
 
 pub(crate) fn enqueue(library: &Library, root_id: &str, full_check: bool) -> CoreResult<ScanState> {
+    enqueue_with_dispatch(library, root_id, full_check, true)
+}
+
+pub(crate) fn enqueue_inline(library: &Library, root_id: &str) -> CoreResult<ScanState> {
+    enqueue_with_dispatch(library, root_id, false, false)
+}
+
+fn enqueue_with_dispatch(library: &Library, root_id: &str, full_check: bool, dispatch: bool) -> CoreResult<ScanState> {
     let root = library.list_roots()?.into_iter()
         .find(|root| root.id == root_id)
         .ok_or_else(|| CoreError::RootNotFound(root_id.to_owned()))?;
     if !root.enabled {
         return Err(CoreError::RootDisabled(root_id.to_owned()));
     }
-    let queue = worker_queue()?;
+    let queue = if dispatch { Some(worker_queue()?) } else { None };
     let now = Utc::now().to_rfc3339();
     let mut connection = library.connection()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -113,7 +121,7 @@ pub(crate) fn enqueue(library: &Library, root_id: &str, full_check: bool) -> Cor
     }
     transaction.commit()?;
     drop(connection);
-    if should_queue { push(&queue, library, root_id)?; }
+    if should_queue && let Some(queue) = queue { push(&queue, library, root_id)?; }
     library.list_scan_states()?.into_iter()
         .find(|state| state.root_id == root_id)
         .ok_or_else(|| CoreError::RootNotFound(root_id.to_owned()))
@@ -321,7 +329,7 @@ pub(crate) fn resume(library: &Library) -> CoreResult<()> {
     Ok(())
 }
 
-fn claim_owner_is_live(owner: Option<i64>) -> bool {
+pub(crate) fn claim_owner_is_live(owner: Option<i64>) -> bool {
     match owner {
         Some(owner) if owner == i64::from(std::process::id()) => true,
         Some(owner) => process_is_alive(owner).unwrap_or(true),
@@ -440,11 +448,13 @@ fn worker_loop(queue: Arc<ScanQueue>) {
                 }
                 Ok(Ok(_)) => {}
             }
-            if library.list_scan_states().ok().is_some_and(|states| {
-                states.iter().any(|state| state.root_id == root_id && state.status == "Pending")
-            }) {
-                let _ = push(&queue, &library, &root_id);
-            }
+        } else {
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if library.list_scan_states().ok().is_some_and(|states| {
+            states.iter().any(|state| state.root_id == root_id && state.status == "Pending")
+        }) {
+            let _ = push(&queue, &library, &root_id);
         }
     }
 }
@@ -455,6 +465,31 @@ mod tests {
     use crate::AssetType;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    #[test]
+    fn synchronous_scan_does_not_dispatch_its_task_to_the_background_worker() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-inline-scan-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let library = Library::in_memory().unwrap();
+        let root = library.add_root(AssetType::Model, directory.to_str().unwrap(), None).unwrap();
+        for _ in 0..20 {
+            let report = library.scan_root(&root.id).unwrap();
+            assert_eq!(report.files_seen, 0);
+            assert_eq!(library.list_scan_states().unwrap()[0].status, "Completed");
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn queue_deduplication_keeps_identical_root_ids_from_different_databases() {
+        let queue = ScanQueue { pending: Mutex::new(PendingScans { tasks: VecDeque::new() }), changed: Condvar::new() };
+        let first = Library::in_memory().unwrap();
+        let second = Library::in_memory().unwrap();
+        push(&queue, &first, "same-root-id").unwrap();
+        push(&queue, &first.clone(), "same-root-id").unwrap();
+        push(&queue, &second, "same-root-id").unwrap();
+        assert_eq!(queue.pending.lock().unwrap().tasks.len(), 2);
+    }
 
     #[test]
     fn ordinary_rescan_clears_previous_terminal_full_check() {

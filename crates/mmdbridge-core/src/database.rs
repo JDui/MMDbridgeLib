@@ -24,6 +24,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Library {
     connection: Arc<Mutex<Connection>>,
+    database_path: Option<Arc<PathBuf>>,
     scan_lock: Arc<Mutex<()>>,
     visibility_lock: Arc<Mutex<()>>,
 }
@@ -44,6 +45,19 @@ impl LibraryOpenProgress {
 }
 
 impl Library {
+    const SCHEMA_VERSION: i64 = 16;
+
+    fn check_schema_version(connection: &Connection) -> CoreResult<i64> {
+        let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > Self::SCHEMA_VERSION {
+            return Err(CoreError::UnsupportedDatabaseVersion {
+                found: version,
+                supported: Self::SCHEMA_VERSION,
+            });
+        }
+        Ok(version)
+    }
+
     pub(crate) fn visibility_guard(&self) -> CoreResult<MutexGuard<'_, ()>> {
         self.visibility_lock
             .lock()
@@ -73,7 +87,10 @@ impl Library {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let connection = Connection::open(path.as_ref())?;
+        Self::check_schema_version(&connection)?;
+        let database_path = connection.path().filter(|path| !path.is_empty())
+            .map(|_| std::fs::canonicalize(path.as_ref()).map(Arc::new)).transpose()?;
         connection.busy_timeout(Duration::from_secs(5))?;
         progress(LibraryOpenProgress::stage(2, "准备数据库读写", "启用外键、WAL 日志；若其他程序占用写入锁，最多等待 5 秒"));
         connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -92,6 +109,7 @@ impl Library {
         connection.pragma_update(None, "journal_size_limit", Self::WAL_TARGET_BYTES as i64)?;
         let library = Self {
             connection: Arc::new(Mutex::new(connection)),
+            database_path,
             scan_lock: Arc::new(Mutex::new(())),
             visibility_lock: Arc::new(Mutex::new(())),
         };
@@ -109,6 +127,7 @@ impl Library {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let library = Self {
             connection: Arc::new(Mutex::new(connection)),
+            database_path: None,
             scan_lock: Arc::new(Mutex::new(())),
             visibility_lock: Arc::new(Mutex::new(())),
         };
@@ -118,27 +137,36 @@ impl Library {
     }
 
     pub fn storage_info(&self) -> CoreResult<serde_json::Value> {
-        let path = Self::portable_database_path()?;
+        let path = self.database_path.as_deref();
         let bytes = |path: &Path| std::fs::metadata(path).map(|item| item.len()).unwrap_or(0);
-        let wal = path.with_file_name("library.sqlite3-wal");
+        let wal = path.map(|path| {
+            let mut name = path.as_os_str().to_os_string();
+            name.push("-wal");
+            PathBuf::from(name)
+        });
         Ok(serde_json::json!({
-            "path": path,
-            "databaseBytes": bytes(&path),
-            "walBytes": bytes(&wal),
+            "path": path.map(|path| path.to_string_lossy().into_owned()).unwrap_or_else(|| ":memory:".to_owned()),
+            "databaseBytes": path.map_or(0, |path| bytes(path)),
+            "walBytes": wal.as_deref().map_or(0, bytes),
             "databaseLimitBytes": Self::DATABASE_LIMIT_BYTES,
             "walTargetBytes": Self::WAL_TARGET_BYTES,
         }))
+    }
+
+    pub(crate) fn same_database(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.connection, &other.connection)
+            || matches!((&self.database_path, &other.database_path), (Some(left), Some(right)) if left == right)
     }
 
     pub fn compact_storage(&self) -> CoreResult<serde_json::Value> {
         let _scan_guard = self.scan_lock.lock().map_err(|_| CoreError::LockPoisoned)?;
         let connection = self.connection()?;
         let active_scans: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM scan_state WHERE status IN ('Pending','Pausing','Discovering','Indexing','Verifying','Relations')",
+            "SELECT COUNT(*) FROM scan_state WHERE status IN ('Pending','Pausing','Discovering','Indexing','Verifying','Relations','Cancelling')",
             [], |row| row.get(0),
         )?;
         let active_cards: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM jobs WHERE status IN ('Pending','Parsing','Rendering','Encoding')",
+            "SELECT COUNT(*) FROM jobs WHERE status IN ('Pending','Parsing','Rendering','Encoding','Cancelling')",
             [], |row| row.get(0),
         )?;
         if active_scans + active_cards > 0 {
@@ -162,10 +190,9 @@ impl Library {
             .connection
             .lock()
             .map_err(|_| CoreError::LockPoisoned)?;
-        let schema_version: i64 =
-            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if schema_version == 15 {
-            progress(LibraryOpenProgress::stage(4, "检查与升级数据库结构", "数据库版本 15，结构已是最新，无需升级"));
+        let schema_version = Self::check_schema_version(&connection)?;
+        if schema_version == Self::SCHEMA_VERSION {
+            progress(LibraryOpenProgress::stage(4, "检查与升级数据库结构", format!("数据库版本 {schema_version}，结构已是最新，无需升级")));
             return Ok(());
         }
         progress(LibraryOpenProgress::stage(4, "检查与升级数据库结构", format!("当前版本 {schema_version}，准备基础表与目录计数")));
@@ -646,6 +673,17 @@ impl Library {
                  COMMIT;",
             )?;
         }
+        if schema_version < 16 {
+            progress(LibraryOpenProgress::stage(4, "升级数据库：任务恢复", "记录缩略图工作进程，保留取消中的占用状态"));
+            let transaction = connection.unchecked_transaction()?;
+            let has_owner = transaction.prepare("PRAGMA table_info(jobs)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?.iter().any(|name| name == "claim_owner");
+            if !has_owner { transaction.execute("ALTER TABLE jobs ADD COLUMN claim_owner INTEGER", [])?; }
+            transaction.execute("CREATE INDEX IF NOT EXISTS idx_jobs_asset_status ON jobs(asset_id,kind,status)", [])?;
+            transaction.pragma_update(None, "user_version", Self::SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -1055,11 +1093,23 @@ impl Library {
     pub fn remove_root(&self, root_id: &str) -> CoreResult<bool> {
         let _scan_guard = self.scan_lock.lock().map_err(|_| CoreError::LockPoisoned)?;
         let removed = {
-            let connection = self
+            let mut connection = self
                 .connection
                 .lock()
                 .map_err(|_| CoreError::LockPoisoned)?;
-            connection.execute("DELETE FROM roots WHERE id=?1", [root_id])? > 0
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if crate::operations::is_root_operation_active_on(&transaction, root_id)? {
+                return Err(CoreError::AssetOperation("此目录有进行中的文件操作，暂时不能移除索引".to_owned()));
+            }
+            let active: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM scan_state WHERE root_id=?1 AND status IN ('Discovering','Indexing','Verifying','Relations','Pausing','Cancelling'))
+                 OR EXISTS(SELECT 1 FROM jobs j JOIN assets a ON a.id=j.asset_id WHERE a.root_id=?1 AND j.status IN ('Pending','Parsing','Rendering','Encoding','Cancelling'))",
+                [root_id], |row| row.get(0),
+            )?;
+            if active { return Err(CoreError::InvalidRoot("此目录仍有后台任务占用，请取消任务并等待退出后再移除索引".to_owned())); }
+            let removed = transaction.execute("DELETE FROM roots WHERE id=?1", [root_id])? > 0;
+            transaction.commit()?;
+            removed
         };
         if removed {
             self.rebuild_relations()?;
@@ -1068,9 +1118,9 @@ impl Library {
     }
 
     pub fn scan_root(&self, root_id: &str) -> CoreResult<ScanReport> {
-        let _ = self.enqueue_scan(root_id)?;
+        crate::scan_queue::enqueue_inline(self, root_id)?;
         let work = self.claim_pending_scan(root_id)?
-            .ok_or_else(|| CoreError::InvalidRoot("该目录已有扫描任务；请在扫描队列中管理".to_owned()))?;
+            .ok_or_else(|| CoreError::InvalidRoot("该目录已有扫描任务或文件操作占用；请在任务队列中管理".to_owned()))?;
         self.scan_with_work(root_id, &work)
     }
 
@@ -1204,6 +1254,7 @@ impl Library {
     ) -> CoreResult<Option<crate::types::ScanWork>> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if crate::operations::is_root_operation_active_on(&transaction, root_id)? { return Ok(None); }
         let changed = transaction.execute(
             "UPDATE scan_state SET status='Discovering',claim_owner=?3,updated_at=?2
              WHERE root_id=?1 AND status='Pending'",
@@ -1761,7 +1812,7 @@ impl Library {
                 if !progress("Encoding", 0.95) {
                     return Err(CoreError::ThumbnailCancelled);
                 }
-                return crate::cards::create(self, asset_id, Some(&preview), Some(&report));
+                return crate::cards::create_for_asset(self, &asset, Some(&preview), Some(&report));
             }
             let generated = if let Some(model_path) = motion_preview_model.as_deref() {
                 match extension.map(str::to_ascii_lowercase).as_deref() {
@@ -1787,14 +1838,14 @@ impl Library {
             if !progress("Encoding", 0.99) {
                 return Err(CoreError::ThumbnailCancelled);
             }
-            crate::cards::create(
+            crate::cards::create_for_asset(
                 self,
-                asset_id,
+                &asset,
                 Some(&generated.preview_webp),
                 Some(&generated.report),
             )
         } else {
-            crate::cards::create(self, asset_id, None, None)
+            crate::cards::create_for_asset(self, &asset, None, None)
         }
     }
 
@@ -2321,7 +2372,7 @@ impl Library {
             .lock()
             .map_err(|_| CoreError::LockPoisoned)?;
         let mut statement = connection.prepare("SELECT id,asset_id,kind,priority,status,progress,error_json,created_at,updated_at FROM jobs
-            ORDER BY CASE WHEN status IN ('Parsing','Rendering','Encoding') THEN 0
+            ORDER BY CASE WHEN status IN ('Parsing','Rendering','Encoding','Cancelling') THEN 0
                           WHEN status='Pending' THEN 1 ELSE 2 END,
                      priority DESC,created_at DESC LIMIT 100")?;
         let rows = statement.query_map([], |row| {
@@ -2389,6 +2440,56 @@ impl Library {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn future_database_is_rejected_before_any_schema_or_journal_change() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-future-db-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("future.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch("CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('preserve'); PRAGMA user_version=17;").unwrap();
+        }
+        assert!(matches!(Library::open(&path), Err(CoreError::UnsupportedDatabaseVersion { found: 17, supported: 16 })));
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 17);
+        assert_eq!(connection.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0)).unwrap(), "delete");
+        assert_eq!(connection.query_row("SELECT value FROM sentinel", [], |row| row.get::<_, String>(0)).unwrap(), "preserve");
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn version_fifteen_migration_preserves_existing_task_and_setting() {
+        let library = Library::in_memory().unwrap();
+        library.connection().unwrap().execute_batch(
+            "ALTER TABLE jobs DROP COLUMN claim_owner;
+             INSERT INTO settings(key,value_json,updated_at) VALUES ('fixture','42','now');
+             INSERT INTO jobs(id,kind,status,created_at,updated_at) VALUES ('old','thumbnail','Failed','now','now');
+             PRAGMA user_version=15;"
+        ).unwrap();
+        library.initialize_schema().unwrap();
+        let connection = library.connection().unwrap();
+        assert_eq!(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 16);
+        assert_eq!(connection.query_row("SELECT value_json FROM settings WHERE key='fixture'", [], |row| row.get::<_, String>(0)).unwrap(), "42");
+        assert_eq!(connection.query_row("SELECT status,claim_owner FROM jobs WHERE id='old'", [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))).unwrap(), ("Failed".to_owned(), None));
+    }
+
+    #[test]
+    fn storage_info_uses_the_opened_database_and_its_matching_wal() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-storage-path-{}", Uuid::new_v4()));
+        let path = directory.join("日本語-资源.sqlite3");
+        let library = Library::open(&path).unwrap();
+        let info = library.storage_info().unwrap();
+        assert_eq!(info["path"], std::fs::canonicalize(&path).unwrap().to_string_lossy().as_ref());
+        assert_eq!(info["databaseBytes"].as_u64().unwrap(), std::fs::metadata(&path).unwrap().len());
+        let wal = directory.join("日本語-资源.sqlite3-wal");
+        assert_eq!(info["walBytes"].as_u64().unwrap(), std::fs::metadata(wal).unwrap().len());
+        assert_eq!(Library::in_memory().unwrap().storage_info().unwrap()["path"], ":memory:");
+        drop(library);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn library_browse_filters_and_thumbnail_revision() {

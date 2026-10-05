@@ -9,6 +9,8 @@ import { VirtuosoGrid } from "react-virtuoso";
 import { toUiError } from "./uiError";
 import { LibraryContextMenu } from "./LibraryContextMenu";
 import { useLibraryDialog } from "./LibraryDialog";
+import { readPreference, writePreference } from "./preferences";
+import { activeThumbnailStatuses, readAssetViewState, visibleSelection, type AssetViewState } from "./libraryState";
 import "./virtualized-grid.css";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
@@ -178,25 +180,6 @@ type FilterExpr =
   | { op: "rule"; field: FilterField; operator: FilterOperator; value: string | number | boolean };
 type SavedFilter = { id: string; name: string; expression: FilterExpr; createdAt: string; updatedAt: string };
 type BuilderRule = { field: FilterField; operator: FilterOperator; value: string; negate: boolean };
-type AssetViewState = {
-  activeType: AssetType | "all";
-  activeMotionFormat: MotionFormat;
-  activeRoot: string | null;
-  activeDirectory: string | null;
-  activeSavedFilterId: string | null;
-  favoritesOnly: boolean;
-  query: string;
-  searchText: string;
-  scrollTop: number;
-};
-
-function readLocalJson<T>(key: string, fallback: T): T {
-  try {
-    const stored = window.localStorage.getItem(key);
-    return stored ? { ...fallback as object, ...JSON.parse(stored) as object } as T : fallback;
-  } catch { return fallback; }
-}
-
 const categoryLabels: Record<AssetType, string> = { model: "模型", motion: "动作", scene: "场景" };
 const categoryIcons = { model: Box, motion: Clapperboard, scene: Layers3 };
 function AssetKindIcon({ type, size = 18 }: { type: AssetType; size?: number }) {
@@ -283,7 +266,7 @@ const scanStatusLabels: Record<string, string> = {
 };
 const jobStatusLabels: Record<string, string> = {
   Pending: "排队中", Parsing: "解析中", Rendering: "渲染中", Encoding: "编码中",
-  Completed: "已完成", Failed: "失败", Cancelled: "已取消",
+  Completed: "已完成", Failed: "失败", Cancelled: "已取消", Cancelling: "正在取消",
 };
 
 function isPathWithinRoot(path: string, root: string): boolean {
@@ -330,7 +313,7 @@ export default function App() {
   const [scanQueueOpen, setScanQueueOpen] = useState(false);
   const [previewAsset, setPreviewAsset] = useState<Asset | null>(null);
   const [cardSize, setCardSize] = useState(() => {
-    const saved = Number(window.localStorage.getItem("mmdbridge-card-size"));
+    const saved = Number(readPreference("mmdbridge-card-size"));
     return Number.isFinite(saved) && saved >= 130 && saved <= 300 ? saved : 200;
   });
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
@@ -346,10 +329,10 @@ export default function App() {
   const [viewMode, setViewMode] = useState<"assets" | "folders">("assets");
   const [activeRoot, setActiveRoot] = useState<string | null>(null);
   const [activeDirectory, setActiveDirectory] = useState<string | null>(null);
-  const [recursiveScope, setRecursiveScope] = useState(() => window.localStorage.getItem("mmdbridge-folder-recursive") !== "false");
+  const [recursiveScope, setRecursiveScope] = useState(() => readPreference("mmdbridge-folder-recursive") !== "false");
   const [directoryPage, setDirectoryPage] = useState<DirectoryPage | null>(null);
   const [assetDirectories, setAssetDirectories] = useState<AssetDirectory[]>([]);
-  const folderReturnState = useRef<AssetViewState | null>(readLocalJson("mmdbridge-asset-view-return", null));
+  const folderReturnState = useRef<AssetViewState | null>(readAssetViewState("mmdbridge-asset-view-return"));
   const pendingScrollRestore = useRef<{ top: number; afterRevision: number; retryBlocked?: boolean } | null>(null);
   const [assetPageRevision, setAssetPageRevision] = useState(0);
   const [activeSavedFilterId, setActiveSavedFilterId] = useState<string | null>(null);
@@ -362,7 +345,7 @@ export default function App() {
   const [tagNames, setTagNames] = useState<string[]>([]);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [tagMatch, setTagMatch] = useState<"and" | "or">("and");
-  const [skeletonClass, setSkeletonClass] = useState("all");
+  const [skeletonClass, setSkeletonClass] = useState<AssetViewState["skeletonClass"]>("all");
   const [thumbnailRevisions, setThumbnailRevisions] = useState<Record<string, number>>({});
   const quickExpression = useMemo<FilterExpr | null>(() => {
     const children: FilterExpr[] = [];
@@ -423,19 +406,17 @@ export default function App() {
 
   useEffect(() => { rootsRef.current = roots; }, [roots]);
 
-  useEffect(() => { window.localStorage.setItem("mmdbridge-card-size", String(cardSize)); }, [cardSize]);
-  useEffect(() => { window.localStorage.setItem("mmdbridge-view-mode", viewMode); }, [viewMode]);
+  useEffect(() => { writePreference("mmdbridge-card-size", String(cardSize)); }, [cardSize]);
+  useEffect(() => { writePreference("mmdbridge-view-mode", viewMode); }, [viewMode]);
   useEffect(() => {
     if (viewMode !== "folders") return;
-    if (activeRoot) window.localStorage.setItem("mmdbridge-folder-root", activeRoot);
-    else window.localStorage.removeItem("mmdbridge-folder-root");
+    writePreference("mmdbridge-folder-root", activeRoot);
   }, [activeRoot, viewMode]);
   useEffect(() => {
     if (viewMode !== "folders") return;
-    if (activeDirectory) window.localStorage.setItem("mmdbridge-folder-path", activeDirectory);
-    else window.localStorage.removeItem("mmdbridge-folder-path");
+    writePreference("mmdbridge-folder-path", activeDirectory);
   }, [activeDirectory, viewMode]);
-  useEffect(() => { window.localStorage.setItem("mmdbridge-folder-recursive", String(recursiveScope)); }, [recursiveScope]);
+  useEffect(() => { writePreference("mmdbridge-folder-recursive", String(recursiveScope)); }, [recursiveScope]);
 
   useEffect(() => {
     if (!assetMenu && !rootMenu) return;
@@ -472,7 +453,7 @@ export default function App() {
 
   useEffect(() => {
     setBulkSelectedIds(new Set());
-  }, [activeRoot, activeDirectory, activeSavedFilterId, activeType, activeMotionFormat, favoritesOnly, searchText, quickExpression]);
+  }, [activeRoot, activeDirectory, activeSavedFilterId, activeType, activeMotionFormat, favoritesOnly, searchText, quickExpression, recursiveScope, viewMode]);
 
   const refresh = useCallback(async () => {
     const revision = ++assetQueryRevision.current;
@@ -483,6 +464,8 @@ export default function App() {
     assetPageLoading.current = null;
     setLoadingNextPage(false);
     setNextAssetCursor(null);
+    setAssetMenu(null);
+    setRootMenu(null);
     try {
       const requestDirectory = activeRoot && (viewMode === "folders" || activeDirectory)
         ? activeDirectory ?? rootsRef.current.find((root) => root.id === activeRoot)?.path ?? null
@@ -509,6 +492,9 @@ export default function App() {
       const assetTimeout = assetRequest ? window.setTimeout(() => {
         if (!current() || assetResponseSettled) return;
         assetTimedOut = true;
+        setAssets([]);
+        setSelected(null);
+        setBulkSelectedIds(new Set());
         setIsRefreshing(false);
         setAssetQueryError("资产读取超时，请重新读取。");
         setError("资产读取超时，请点击“重新读取”重试。");
@@ -555,6 +541,7 @@ export default function App() {
           if (!current()) return;
           const visible = page.items.filter((asset) => !activeRoot || asset.rootId === activeRoot);
           setAssets(visible);
+          setBulkSelectedIds((ids) => visibleSelection(ids, visible));
           setNextAssetCursor(page.nextCursor);
           setAssetPageRevision(revision);
           setAssetQueryError("");
@@ -564,6 +551,8 @@ export default function App() {
         }).catch((reason) => {
           if (current()) {
             setAssets([]);
+            setSelected(null);
+            setBulkSelectedIds(new Set());
             setAssetQueryError(toUiError(reason));
             reportError(reason);
           }
@@ -698,7 +687,7 @@ export default function App() {
   }, [refresh]);
 
   useEffect(() => {
-    const active = jobs.some((job) => ["Pending", "Parsing", "Rendering", "Encoding"].includes(job.status));
+    const active = jobs.some((job) => activeThumbnailStatuses.has(job.status));
     if (!active) return;
     let disposed = false;
     const timer = window.setInterval(() => {
@@ -707,12 +696,12 @@ export default function App() {
           if (disposed) return;
           setJobs(nextJobs);
           setJobSummary(nextSummary);
-          if (batchRegeneration.current && !(nextSummary.Pending || nextSummary.Parsing || nextSummary.Rendering || nextSummary.Encoding)) {
+          if (batchRegeneration.current && !(nextSummary.Pending || nextSummary.Parsing || nextSummary.Rendering || nextSummary.Encoding || nextSummary.Cancelling)) {
             batchRegeneration.current = false;
             void refresh();
           }
           for (const job of nextJobs) {
-            if (job.status === "Completed" && jobs.some((previous) => previous.id === job.id && ["Pending", "Parsing", "Rendering", "Encoding"].includes(previous.status)) && job.asset_id) {
+            if (job.status === "Completed" && jobs.some((previous) => previous.id === job.id && activeThumbnailStatuses.has(previous.status)) && job.asset_id) {
               void refreshAsset(job.asset_id).catch((reason) => setError(toUiError(reason)));
             }
           }
@@ -771,12 +760,12 @@ export default function App() {
   }, [selected?.id, selectedDetailsRevision]);
 
   const activeJobs = useMemo(
-    () => jobs.filter((job) => ["Pending", "Parsing", "Rendering", "Encoding"].includes(job.status)),
+    () => jobs.filter((job) => activeThumbnailStatuses.has(job.status)),
     [jobs],
   );
   const activeScans = useMemo(() => scanStates.filter((scan) => activeScanStatuses.has(scan.status)), [scanStates]);
   const activeThumbnailCount = (jobSummary.Pending ?? 0) + (jobSummary.Parsing ?? 0)
-    + (jobSummary.Rendering ?? 0) + (jobSummary.Encoding ?? 0);
+    + (jobSummary.Rendering ?? 0) + (jobSummary.Encoding ?? 0) + (jobSummary.Cancelling ?? 0);
   const totalThumbnailCount = Object.values(jobSummary).reduce((total, count) => total + count, 0);
 
   function selectCategory(type: AssetType | "all", stayInFolders = false) {
@@ -801,15 +790,18 @@ export default function App() {
       const snapshot: AssetViewState = {
         activeType, activeMotionFormat, activeRoot, activeDirectory, activeSavedFilterId,
         favoritesOnly, query, searchText, scrollTop: libraryScrollParent?.scrollTop ?? 0,
+        selectedTags, tagMatch, skeletonClass, recursiveScope,
       };
       folderReturnState.current = snapshot;
-      window.localStorage.setItem("mmdbridge-asset-view-return", JSON.stringify(snapshot));
+      writePreference("mmdbridge-asset-view-return", JSON.stringify(snapshot));
     }
     setViewMode("folders");
     setFavoritesOnly(false);
     setActiveSavedFilterId(null);
     setQuery("");
     setSearchText("");
+    setSelectedTags([]);
+    setSkeletonClass("all");
     setSelected(null);
     setBulkSelectMode(false);
     setBulkSelectedIds(new Set());
@@ -821,8 +813,8 @@ export default function App() {
       return;
     }
     if (!activeRoot) {
-      const savedRoot = window.localStorage.getItem("mmdbridge-folder-root");
-      const savedPath = window.localStorage.getItem("mmdbridge-folder-path");
+      const savedRoot = readPreference("mmdbridge-folder-root");
+      const savedPath = readPreference("mmdbridge-folder-path");
       const root = rootsRef.current.find((item) => item.id === savedRoot);
       if (root) {
         setActiveRoot(root.id);
@@ -838,7 +830,7 @@ export default function App() {
   }
 
   function returnToAssetView() {
-    const saved = folderReturnState.current ?? readLocalJson<AssetViewState | null>("mmdbridge-asset-view-return", null);
+    const saved = folderReturnState.current ?? readAssetViewState("mmdbridge-asset-view-return");
     pendingScrollRestore.current = { top: saved?.scrollTop ?? 0, afterRevision: assetQueryRevision.current + 1, retryBlocked: false };
     setViewMode("assets");
     setSelected(null);
@@ -851,6 +843,10 @@ export default function App() {
     setFavoritesOnly(saved.favoritesOnly);
     setQuery(saved.query);
     setSearchText(saved.searchText);
+    setSelectedTags(saved.selectedTags);
+    setTagMatch(saved.tagMatch);
+    setSkeletonClass(saved.skeletonClass);
+    setRecursiveScope(saved.recursiveScope);
   }
 
   function viewAssetDirectory(asset: Asset) {
@@ -1250,9 +1246,9 @@ export default function App() {
 
   async function cancelJob(jobId: string) {
     try {
-      await invoke("jobs_cancel", { jobId });
+      const changed = await invoke<boolean>("jobs_cancel", { jobId });
       await refresh();
-      setNotice("已取消缩略图任务。");
+      setNotice(changed ? "已请求取消缩略图任务，正在等待工作线程退出。" : "任务已结束或正在取消。");
     } catch (reason) { setError(toUiError(reason)); }
   }
 
@@ -1666,7 +1662,7 @@ export default function App() {
           <div className="quick-filters" aria-label="标签与骨架筛选">
             <MultiSelect className="tag-filter-select" aria-label="标签筛选" placeholder="搜索并选择标签…" data={tagNames} value={selectedTags} onChange={setSelectedTags} searchable clearable hidePickedOptions maxValues={24} limit={80} nothingFoundMessage="没有匹配标签" clearButtonProps={{ "aria-label": "清除标签筛选" }} comboboxProps={{ zIndex: 310 }} size="xs" />
             {selectedTags.length > 1 && <NativeSelect aria-label="标签组合方式" value={tagMatch} onChange={(event) => setTagMatch(event.target.value as "and" | "or")}><option value="and">全部标签</option><option value="or">任一标签</option></NativeSelect>}
-            {(activeType === "all" || activeType === "model") && <NativeSelect aria-label="骨架筛选" value={skeletonClass} onChange={(event) => setSkeletonClass(event.target.value)}><option value="all">全部骨架</option><option value="standard">MMD 标准人形</option><option value="nonstandard">非标准</option><option value="unknown">待分类</option></NativeSelect>}
+            {(activeType === "all" || activeType === "model") && <NativeSelect aria-label="骨架筛选" value={skeletonClass} onChange={(event) => setSkeletonClass(event.target.value as AssetViewState["skeletonClass"])}><option value="all">全部骨架</option><option value="standard">MMD 标准人形</option><option value="nonstandard">非标准</option><option value="unknown">待分类</option></NativeSelect>}
             {quickExpression && <Button onClick={() => { setSelectedTags([]); setSkeletonClass("all"); }}>清除筛选</Button>}
           </div>
           {activeType === "motion" && !activeSavedFilterId && <Tabs value={activeMotionFormat} onChange={(value) => { if (value) selectMotionFormat(value as MotionFormat); }} variant="pills" mb="sm"><Tabs.List aria-label="动作文件格式">
@@ -1775,8 +1771,8 @@ export default function App() {
         {jobsExpanded && <div className="jobs-panel" aria-label="后台任务列表">
           <div className="jobs-panel-heading"><strong>缩略图任务</strong><span>{totalThumbnailCount} 项 · 显示最近 12 项</span></div>
           {jobs.length ? jobs.slice(0, 12).map((job) => <div className="jobs-panel-row" key={job.id}>
-            <div className="jobs-panel-main"><strong title={job.asset_id ?? undefined}>{job.asset_id ? assetsById.get(job.asset_id)?.name ?? job.asset_id : "缩略图"}</strong><span>{jobStatusLabels[job.status] ?? job.status}{["Pending", "Parsing", "Rendering", "Encoding"].includes(job.status) ? ` · ${Math.round(job.progress * 100)}%` : job.error?.message ? ` · ${job.error.message}` : ""}</span></div>
-            {activeJobs.some((activeJob) => activeJob.id === job.id) && <Button onClick={() => void cancelJob(job.id)}>取消</Button>}
+            <div className="jobs-panel-main"><strong title={job.asset_id ?? undefined}>{job.asset_id ? assetsById.get(job.asset_id)?.name ?? job.asset_id : "缩略图"}</strong><span>{jobStatusLabels[job.status] ?? job.status}{activeThumbnailStatuses.has(job.status) ? ` · ${Math.round(job.progress * 100)}%` : job.error?.message ? ` · ${job.error.message}` : ""}</span></div>
+            {activeJobs.some((activeJob) => activeJob.id === job.id) && <Button disabled={job.status === "Cancelling"} onClick={() => void cancelJob(job.id)}>取消</Button>}
             {["Failed", "Cancelled"].includes(job.status) && <Button onClick={() => void retryJob(job.id)}>重试</Button>}
           </div>) : <div className="jobs-panel-empty">没有缩略图任务</div>}
         </div>}

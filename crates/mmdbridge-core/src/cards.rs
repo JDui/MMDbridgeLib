@@ -16,7 +16,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 use crate::{
     CoreError, CoreResult, Library,
     thumbnail::ThumbnailRenderReport,
-    types::{AssetType, CardResult, CardValidation},
+    types::{Asset, AssetType, CardResult, CardValidation},
 };
 
 const CARD_FORMAT: &str = "MMDRCV";
@@ -564,7 +564,38 @@ pub(crate) fn create(
     preview_webp: Option<&[u8]>,
     render_report: Option<&ThumbnailRenderReport>,
 ) -> CoreResult<CardResult> {
+    create_checked(library, asset_id, preview_webp, render_report, None)
+}
+
+pub(crate) fn create_for_asset(
+    library: &Library,
+    asset: &Asset,
+    preview_webp: Option<&[u8]>,
+    render_report: Option<&ThumbnailRenderReport>,
+) -> CoreResult<CardResult> {
+    create_checked(library, &asset.id, preview_webp, render_report, Some(asset))
+}
+
+fn create_checked(
+    library: &Library,
+    asset_id: &str,
+    preview_webp: Option<&[u8]>,
+    render_report: Option<&ThumbnailRenderReport>,
+    expected_asset: Option<&Asset>,
+) -> CoreResult<CardResult> {
+    if crate::operations::is_asset_operation_active(library, asset_id)? {
+        return Err(CoreError::AssetOperation("该资产有进行中或待恢复的文件操作，暂时不能创建资源卡".to_owned()));
+    }
     let context = load_context(library, asset_id)?;
+    if expected_asset.is_some_and(|asset| asset.fingerprint != context.fingerprint || Path::new(&asset.primary_source) != context.source_path) {
+        return Err(CoreError::Card("资产在缩略图生成期间发生变化，请重新生成".to_owned()));
+    }
+    if let Some(report) = render_report {
+        let rendered_revision = format!("{}:{}", report.renderer_version, report.preview_settings_version);
+        if rendered_revision != expected_renderer_revision(library, context.asset_type)? {
+            return Err(CoreError::Card("缩略图预览设置在生成期间发生变化，请重新生成".to_owned()));
+        }
+    }
     if context.fingerprint.is_empty() {
         return Err(CoreError::Card(
             "源文件尚无有效指纹，请先成功扫描并解析资产".to_owned(),
@@ -675,11 +706,11 @@ pub(crate) fn create(
             return Err(error.into());
         }
     };
-    let current_asset: Option<(bool, String, String)> = match transaction
+    let current_asset: Option<(bool, String, String, String)> = match transaction
         .query_row(
-            "SELECT retired_format,visibility,fingerprint FROM assets WHERE id=?1",
+            "SELECT retired_format,visibility,fingerprint,primary_source FROM assets WHERE id=?1",
             [&context.asset_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
     {
@@ -689,7 +720,7 @@ pub(crate) fn create(
             return Err(error.into());
         }
     };
-    let Some((retired_format, visibility, current_fingerprint)) = current_asset else {
+    let Some((retired_format, visibility, current_fingerprint, primary_source)) = current_asset else {
         let _ = fs::remove_file(&temp_path);
         return Err(CoreError::AssetNotFound(context.asset_id));
     };
@@ -706,6 +737,14 @@ pub(crate) fn create(
         return Err(CoreError::Card(
             "源文件在资源卡准备期间发生变化，请先重新扫描".to_owned(),
         ));
+    }
+    let operation_active = match crate::operations::is_asset_operation_active_on(&transaction, asset_id) {
+        Ok(active) => active,
+        Err(error) => { let _ = fs::remove_file(&temp_path); return Err(error); }
+    };
+    if Path::new(&primary_source) != context.source_path || operation_active {
+        let _ = fs::remove_file(&temp_path);
+        return Err(CoreError::Card("资产路径或文件操作状态在资源卡准备期间发生变化，请稍后重试".to_owned()));
     }
 
     let replacing = matches!(target_kind, TargetKind::Replace);
@@ -1369,6 +1408,21 @@ fn is_windows_numbered_device(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_asset_version_cannot_be_published_as_a_newly_scanned_version() {
+        let library = Library::in_memory().unwrap();
+        library.connection().unwrap().execute_batch(
+            "INSERT INTO roots(id,asset_type,path,path_key,display_name,created_at) VALUES ('r','model','/r','/r','Root','now');
+             INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,fingerprint,created_at,updated_at,last_seen_at)
+             VALUES ('a','r','model','A','/r/a/model.pmx','/r/a','before','now','now','now');"
+        ).unwrap();
+        let rendered = library.inspect_asset("a").unwrap();
+        library.connection().unwrap().execute("UPDATE assets SET fingerprint='after' WHERE id='a'", []).unwrap();
+        assert!(matches!(create_for_asset(&library, &rendered, None, None), Err(CoreError::Card(message)) if message.contains("缩略图生成期间")));
+    }
+
     #[test]
     fn card_metadata_small_dimensions_survive_json_roundtrip() {
         let metadata: serde_json::Value = serde_json::from_str(

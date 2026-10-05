@@ -6,6 +6,7 @@ import { OrbitControls } from "./vendor/OrbitControls.js";
 import { parsePreview } from "./ModelViewer";
 import { toUiError } from "./uiError";
 import { loadViewerTextures, setMaterialAlpha, setMaterialCentre, sortTransparentMaterials } from "./viewerRendering";
+import { createFrameRequestQueue, type FrameRequestQueue } from "./frameRequests";
 import "./motion-viewer.css";
 
 type MotionAsset = { id: string; name: string; primarySource: string; metadata: Record<string, unknown> };
@@ -18,8 +19,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
   const host = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<{ renderer: any; scene: any; camera: any; ortho: any; controls: any; mesh: any;
     bones: any[]; textures: any[]; resizeObserver: ResizeObserver } | null>(null);
-  const requestPending = useRef(false);
-  const wantedFrame = useRef<number | null>(null);
+  const frameQueue = useRef<FrameRequestQueue | null>(null);
   const frameRef = useRef(0);
   const maxFrameRef = useRef(0);
   const playingRef = useRef(false);
@@ -78,28 +78,24 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
     setHasPairedCamera(value.hasPairedCamera);
   }
 
-  async function requestFrame(nextFrame: number) {
-    wantedFrame.current = Math.max(0, Math.min(maxFrameRef.current, Math.round(nextFrame)));
-    if (requestPending.current) return;
-    requestPending.current = true;
-    try {
-      while (wantedFrame.current !== null) {
-        const target = wantedFrame.current;
-        wantedFrame.current = null;
-        const value = await invoke<MotionFrame>("motion_preview_frame", { assetId: asset.id, frame: target });
-        if (sceneRef.current) applyFrame(value);
-      }
-    } catch (reason) {
-      playingRef.current = false;
-      setPlaying(false);
-      setError(toUiError(reason));
-    } finally { requestPending.current = false; }
+  function requestFrame(nextFrame: number) {
+    return frameQueue.current?.request(Math.max(0, Math.min(maxFrameRef.current, Math.round(nextFrame))));
   }
 
   useEffect(() => {
     const element = host.current;
     if (!element) return;
     let disposed = false;
+    setLoading(true); setError(""); setPlaying(false); setFrame(0); setMaxFrame(0);
+    setHasOwnCamera(false); setHasPairedCamera(false); setCameraMode("orbit");
+    playingRef.current = false; frameRef.current = 0; maxFrameRef.current = 0;
+    lastCamera.current = null; orbitState.current = null; cameraModeRef.current = "orbit";
+    const queue = createFrameRequestQueue(
+      (frame) => invoke<MotionFrame>("motion_preview_frame", { assetId: asset.id, frame }),
+      applyFrame,
+      (reason) => { playingRef.current = false; setPlaying(false); setError(toUiError(reason)); },
+    );
+    frameQueue.current = queue;
     const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setClearColor(0x10191f, 1);
@@ -131,7 +127,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
     sceneRef.current = { renderer, scene, camera, ortho, controls, mesh: null, bones: [], textures: [], resizeObserver };
     resize();
     renderer.setAnimationLoop((time: number) => {
-      if (playingRef.current && maxFrameRef.current > 0 && !requestPending.current) {
+      if (playingRef.current && maxFrameRef.current > 0 && !queue.pending) {
         if (time - lastTick.current >= 1000 / (30 * speedRef.current)) {
           lastTick.current = time;
           void requestFrame(frameRef.current >= maxFrameRef.current ? 0 : frameRef.current + 1);
@@ -149,6 +145,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
     (async () => {
       try {
         const initial = await invoke<MotionFrame>("motion_preview_frame", { assetId: asset.id, frame: 0 });
+        if (disposed) return;
         const buffer = await invoke<ArrayBuffer>("model_preview_file", { path: initial.modelPath });
         if (disposed) return;
         const parsed = parsePreview(buffer, false);
@@ -235,6 +232,8 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
     })();
     return () => {
       disposed = true; playingRef.current = false;
+      queue.dispose();
+      if (frameQueue.current === queue) frameQueue.current = null;
       renderer.setAnimationLoop(null);
       resizeObserver.disconnect();
       controls.dispose();

@@ -1,10 +1,11 @@
 import { SegmentedControl, Switch, useMantineColorScheme, type MantineColorScheme } from "@mantine/core";
 import { Monitor, Moon, Sun } from "lucide-react";
 import { useEffect, useState } from "react";
+import { readPreference, writePreference } from "./preferences";
 
 function storedBoolean(key: string, fallback: boolean) {
-  try { const stored = localStorage.getItem(key); return stored === null ? fallback : stored !== "false"; }
-  catch { return fallback; }
+  const stored = readPreference(key);
+  return stored === null ? fallback : stored !== "false";
 }
 
 export function applyAppearancePreferences() {
@@ -20,7 +21,7 @@ export function AppearanceSettings() {
 
   function save(key: string, value: boolean, setter: (value: boolean) => void) {
     setter(value);
-    try { localStorage.setItem(key, String(value)); } catch { /* Preferences still apply to the current window. */ }
+    writePreference(key, String(value));
     if (key === "mmdbridge-transparency") document.documentElement.dataset.libraryTransparency = value ? "on" : "off";
     else document.documentElement.dataset.libraryMotion = value ? "on" : "off";
   }

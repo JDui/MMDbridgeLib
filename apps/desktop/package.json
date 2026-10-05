@@ -4,6 +4,7 @@
   "version": "0.1.0-alpha.1",
   "type": "module",
   "scripts": {
+    "test:functional": "node --test scripts/functional-tests.mjs",
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
