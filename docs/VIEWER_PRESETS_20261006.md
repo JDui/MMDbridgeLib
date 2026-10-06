@@ -18,6 +18,10 @@ compatibility_probe 额外生成独立的合成 PMX / PMD 人形、场景和 60 
 
 viewer-review.mjs 在隔离的 headless Chromium 中显示当前前端，使用测试 Tauri 桥提供上述 Core 数据；检查每种预设的实际画布差异、相机与几何保持、暂停帧和骨骼矩阵保持、连续播放、权重模式恢复，以及场景参照 PMX / PMD 加载、原点比例、网格切换、隐藏、重载、缺少设置、读取错误、晚到结果和重新打开不重复。额外载入 Core 生成的透明棋盘贴图，要求原材质与 Matcap 的画布可见轮廓 IoU 大于 0.95。合成人形和房间样例的面朝向与给定法线一致。
 
-首轮提交 `366474a284d1cef2afdd902c9d63d5841f266d80` 的 [查看器 CI](https://github.com/JDui/MMDbridgeLib/actions/runs/37434089176) 已通过四种 Matcap、四种场景效果和参照生命周期检查，页面错误为零；同时既有七项 Core 预览解码、PMD 权重查看、错误恢复与无 GPU 恢复验证通过。最终截图以地面网格独立辅助层修订后的产物为准。
+最终实现提交 `afe1fcc750da3040b23b8cbbd546abeda9043cfb` 的 [查看器 CI](https://github.com/JDui/MMDbridgeLib/actions/runs/37435402814) 全部通过。四种 Matcap 与四种场景效果均改变实际画布，镜头和几何保持；暂停帧 / 骨骼矩阵保持、播放连续、权重颜色恢复、参照生命周期与地面网格切换通过。透明贴图可见轮廓 IoU 为 0.9975155279503105，页面错误为零。既有七项 Core 预览解码、PMD 权重查看、错误恢复与无 GPU 恢复验证同时通过。
+
+同一提交的 [功能回归](https://github.com/JDui/MMDbridgeLib/actions/runs/37435403000) 全部通过：前端 15 项测试及生产构建；Linux / Windows Core 51 项通过、2 项忽略；模型兼容性集成测试 4 项、CLI 测试 4 项；Windows Tauri 检查通过。[Windows 便携版构建](https://github.com/JDui/MMDbridgeLib/actions/runs/37435402980) 使用 `npm run tauri -- build --no-bundle` 成功生成 EXE，不生成安装包、不启动程序。
+
+最终截图为 `MBL_Viewer_Stage1_Character_Matcap.jpg`（白瓷角色）、`MBL_Viewer_Stage2_Motion_Matcap.jpg`（银灰动作）、`MBL_Viewer_Stage3_Scene_Daylight.jpg`（日光与原点参照）和 `MBL_Viewer_Stage4_Scene_Night.jpg`（夜景与原点参照）。记录保留对应 sourceCommit 和 JSON 断言结果。当前执行环境为 Linux，无法写入用户的 `E:\MMD\MBL`；交付便携包供该目录更新，并保留已有 data 数据目录。
 
 截图和状态证据由 Model compatibility and offscreen rendering CI 的 MBL-Model-Compatibility 产物提供。此路径属于 Linux 合成素材、软件 WebGL 验证；Windows 真实素材和实际显卡画面仍须单独确认。
