@@ -24,10 +24,11 @@ const bridge = `${base}
 const agentReview=${JSON.stringify(manifest)};
 const stages=agentReview.snapshots;
 window.__agentState=structuredClone(stages[new URLSearchParams(location.search).get('stage')||'waiting']);
+window.__agentRoots=structuredClone(agentReview.roots);
 window.__agentCalls=[];window.__agentFailScope=false;window.__agentFailOpen=false;window.__assetReads=0;
 const originalInvoke=window.__TAURI_INTERNALS__.invoke;
 window.__TAURI_INTERNALS__.invoke=async(cmd,args={})=>{
- if(cmd==='roots_list')return agentReview.roots;
+ if(cmd==='roots_list')return window.__agentRoots;
  if(cmd==='asset_counts')return {all:1,model:1,motion:0,scene:0,byRoot:{[agentReview.roots[0].id]:1}};
  if(cmd==='assets_page'){window.__assetReads++;return {items:[agentReview.asset],nextCursor:null};}
  if(cmd==='asset_inspect')return agentReview.asset;
@@ -121,8 +122,16 @@ try {
   await page.evaluate(finished=>{window.__agentState=structuredClone(finished);},manifest.snapshots.finished);
   await page.waitForFunction(before=>window.__assetReads>before,reads);
   await tab.click();await page.locator('.agentlink-status').filter({hasText:'已完成 · Codex'}).waitFor();
+  assert.equal(await type.inputValue(),'model');
+  assert.equal(await directory.inputValue(),manifest.roots[0].id);
   assert.equal(await page.locator('.agentlink-progress span').textContent(),'100%');
   await page.screenshot({path:join(output,'MBL_AgentLink_Stage3_Finished.jpg'),type:'jpeg',quality:92,animations:'disabled'});
+  await page.evaluate(()=>{window.__agentRoots[0].enabled=false;});
+  await page.locator('.log-panel').getByRole('button',{name:'刷新资产',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('[aria-label="AgentLink 资产目录"]')?.selectedOptions[0]?.textContent.includes('不可用'));
+  assert.equal(await directory.inputValue(),manifest.roots[0].id);
+  await page.evaluate(()=>{window.__agentRoots[0].enabled=true;});
+  await page.locator('.log-panel').getByRole('button',{name:'刷新资产',exact:true}).click();
   await page.getByRole('button',{name:'新会话',exact:true}).click();
   await page.locator('.agentlink-status').filter({hasText:'等待连接'}).waitFor();
   await page.evaluate(()=>{window.__agentState={...window.__agentState,status:'active',agentName:'Codex',percent:25,revision:window.__agentState.revision+1};});
@@ -156,7 +165,7 @@ try {
   const narrow=await Promise.all(['.prompt-panel','.log-panel'].map(selector=>page.locator(selector).boundingBox()));
   assert.ok(narrow.every(box=>box&&box.width>250));
   assert.deepEqual(errors,[]);
-  await fs.writeFile(join(output,'ui-verification.json'),JSON.stringify({synthetic:true,source:'Actual app frontend, Core snapshots, isolated Tauri presentation bridge',checks:{sideBySidePanels:true,promptClipboard:true,editedPromptPersists:true,scopeRegeneration:true,failedScopePreservesValues:true,activeScopeLocked:true,backgroundConnectionAndCompletionRefresh:true,pollingAfterNewSessionAndCancel:true,connectionRetry:true,logTextEscaped:true,manualScrollPreserved:true,followLatest:true,compactViewport:true},pageErrors:errors},null,2));
+  await fs.writeFile(join(output,'ui-verification.json'),JSON.stringify({synthetic:true,source:'Actual app frontend, Core snapshots, isolated Tauri presentation bridge',checks:{sideBySidePanels:true,promptClipboard:true,editedPromptPersists:true,scopeRegeneration:true,failedScopePreservesValues:true,activeScopeLocked:true,finishedScopePreserved:true,unavailableRootKeepsSelectedScope:true,backgroundConnectionAndCompletionRefresh:true,pollingAfterNewSessionAndCancel:true,connectionRetry:true,logTextEscaped:true,manualScrollPreserved:true,followLatest:true,compactViewport:true},pageErrors:errors},null,2));
 } finally {
   await browser?.close();await new Promise(done=>server.close(done));
 }

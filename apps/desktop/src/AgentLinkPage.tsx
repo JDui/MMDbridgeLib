@@ -78,8 +78,8 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
             const initialValue = { rootId: selectedRoot?.id ?? null, assetType: selectedRoot?.assetType ?? initial.current.assetType };
             next = await invoke<AgentLinkSnapshot>("agentlink_scope_set", { scope: initialValue });
             if (disposed || version !== pollVersion.current) return;
-            scopeApplied.current = true;
           }
+          scopeApplied.current = true;
           accept(next); setConnectionError("");
         }
       } catch (reason) { if (!disposed) setConnectionError(toUiError(reason)); }
@@ -115,6 +115,9 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
   const connected = snapshot?.status === "active";
   const events = snapshot?.events ?? [];
   const progress = snapshot?.percent ?? null;
+  const scopeRoots = roots.filter((root) => root.enabled && (!scope.assetType || root.assetType === scope.assetType));
+  const unavailableRoot = scope.rootId && !scopeRoots.some((root) => root.id === scope.rootId)
+    ? [{value:scope.rootId,label:(roots.find((root) => root.id === scope.rootId)?.displayName ?? "原资产目录") + " · 不可用",disabled:true}] : [];
   return <section className="agentlink-page" hidden={!active} aria-label="AgentLink">
     <div className="agentlink-heading"><div><h1>AgentLink</h1><p>在外部 Agent 中使用 Prompt，进度与操作记录会显示在 Log。</p></div>
       <div className="agentlink-session-controls">
@@ -127,7 +130,7 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
     {snapshot && (!snapshot.cliAvailable || !snapshot.skillAvailable) && <Alert role="alert" color="yellow">便携目录缺少 CLI 或标签 Skill，请使用完整便携包。</Alert>}
     <div className="agentlink-scope">
       <NativeSelect label="资产类型" aria-label="AgentLink 资产类型" value={scope.assetType ?? "all"} disabled={busy || connected || !snapshot} data={[{value:"all",label:"全部资产"},{value:"model",label:"模型"},{value:"motion",label:"动作"},{value:"scene",label:"场景"}]} onChange={(event) => void changeScope({assetType:event.target.value === "all" ? null : event.target.value as AssetType,rootId:null})} />
-      <NativeSelect label="资产目录" aria-label="AgentLink 资产目录" value={scope.rootId ?? "all"} disabled={busy || connected || !snapshot} data={[{value:"all",label:"全部已启用目录"},...roots.filter((root) => root.enabled && (!scope.assetType || root.assetType === scope.assetType)).map((root) => ({value:root.id,label:root.displayName}))]} onChange={(event) => void changeScope({...scope,rootId:event.target.value === "all" ? null : event.target.value})} />
+      <NativeSelect label="资产目录" aria-label="AgentLink 资产目录" value={scope.rootId ?? "all"} disabled={busy || connected || !snapshot} data={[{value:"all",label:"全部已启用目录"},...scopeRoots.map((root) => ({value:root.id,label:root.displayName})),...unavailableRoot]} onChange={(event) => void changeScope({...scope,rootId:event.target.value === "all" ? null : event.target.value})} />
       {connected && <span className="agentlink-scope-note">接管期间范围已固定</span>}
     </div>
     <div className="agentlink-panels">
