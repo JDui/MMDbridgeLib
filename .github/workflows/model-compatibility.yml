@@ -5,10 +5,13 @@ on:
     branches: [main]
     paths:
       - 'crates/mmdbridge-core/**'
+      - 'crates/mmdbridge-cli/**'
       - 'apps/desktop/src/**'
       - 'scripts/model-review*'
       - 'scripts/viewer-review*'
       - 'scripts/tagging-review*'
+      - 'scripts/agentlink-review*'
+      - 'skills/mmdbridge-card-manager/**'
       - '.github/workflows/model-compatibility.yml'
   workflow_dispatch:
 
@@ -36,6 +39,10 @@ jobs:
         run: cargo run --locked -p mmdbridge-core --example compatibility_probe -- "$MBL_MODEL_REVIEW"
       - name: Verify scan tagging and colour analysis
         run: cargo run --locked -p mmdbridge-core --example tagging_probe -- "$MBL_MODEL_REVIEW/tagging"
+      - name: Build and verify the live AgentLink CLI
+        run: |
+          cargo build --locked -p mmdbridge-cli
+          cargo run --locked -p mmdbridge-core --example agentlink_probe -- "$RUNNER_TEMP/mbl-agentlink-session" "$MBL_MODEL_REVIEW/agentlink" target/debug/mmdbridge
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -54,6 +61,8 @@ jobs:
         run: node scripts/viewer-review.mjs
       - name: Verify automatic tag controls and capture tagging stages
         run: node scripts/tagging-review.mjs
+      - name: Verify AgentLink navigation and capture session stages
+        run: node scripts/agentlink-review.mjs
       - uses: actions/upload-artifact@v7
         if: always()
         with:

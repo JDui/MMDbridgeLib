@@ -45,6 +45,9 @@ impl LibraryOpenProgress {
 }
 
 impl Library {
+    pub(crate) fn backing_database_path(&self) -> Option<PathBuf> {
+        self.database_path.as_deref().map(|path| path.to_path_buf())
+    }
     const SCHEMA_VERSION: i64 = 16;
 
     fn check_schema_version(connection: &Connection) -> CoreResult<i64> {
@@ -2105,6 +2108,41 @@ impl Library {
         }
         transaction.commit()?;
         Ok(mutations)
+    }
+
+    pub(crate) fn add_missing_agent_tags(
+        &self, asset_ids: &[String], name: &str, confidence: f64,
+        root_id: Option<&str>, asset_type: Option<AssetType>,
+    ) -> CoreResult<Vec<TagMutation>> {
+        let name = validate_tag(name)?;
+        validate_tag_request("agent", Some(confidence))?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut records = Vec::new();
+        let mut seen = HashSet::new();
+        for asset_id in asset_ids.iter().filter(|id| seen.insert(id.as_str())) {
+            Self::ensure_active_asset_in_transaction(&transaction, asset_id)?;
+            let (current_root, current_type, enabled): (String, String, bool) = transaction.query_row(
+                "SELECT a.root_id,a.asset_type,r.enabled FROM assets a JOIN roots r ON r.id=a.root_id WHERE a.id=?1",
+                [asset_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            if !enabled || root_id.is_some_and(|id| id != current_root)
+                || asset_type.is_some_and(|kind| kind.as_str() != current_type) {
+                return Err(CoreError::AgentLink("资产不在当前接管范围内".to_owned()));
+            }
+            let existing: Option<(String, String)> = transaction.query_row(
+                "SELECT t.name,at.source FROM asset_tags at JOIN tags t ON t.id=at.tag_id
+                 WHERE at.asset_id=?1 AND t.name=?2 COLLATE NOCASE",
+                params![asset_id,name], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).optional()?;
+            records.push(if let Some((name, source)) = existing {
+                TagMutation { asset_id: asset_id.clone(),name,source,changed:false,blocked_by_user:false }
+            } else {
+                Self::add_asset_tag_in_transaction(&transaction,asset_id,&name,"agent",Some(confidence))?
+            });
+        }
+        transaction.commit()?;
+        Ok(records)
     }
 
     pub(crate) fn add_asset_tag_in_transaction(

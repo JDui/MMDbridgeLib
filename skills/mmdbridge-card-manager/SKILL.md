@@ -11,7 +11,13 @@ Read [the responsibility split and visual taxonomy](references/tag-taxonomy.md) 
 
 ## Scope and inventory
 
-1. Resolve the requested asset types and enabled configured roots with `mmdbridge roots list --json`. For an all-library request, include enabled model, motion, and scene roots. List each requested type with `mmdbridge assets list --type <model|motion|scene> --limit 50000 --json`, then retain only assets in the selected roots. The Core list limit is 50,000 per type; if a result contains exactly 50,000 items, stop that type and report that coverage may be truncated instead of claiming a full-library run. Do not scan for a tag-only request. Scan only when explicitly requested, using the queue and waiting for `Completed`; do not use `--full-check` unless explicitly requested.
+When the user supplies the running software's AgentLink Prompt, the live workflow in
+**Writing and manifest sync** takes precedence over ordinary inventory and write
+commands below. Identify through `agent-link identify --live`, read the authoritative
+scope and all `nextCursor` pages through `agent-link inspect --live`, and keep all
+tag writes and manifest sync on that live bridge. Never widen the software scope.
+
+1. For an ordinary offline task, resolve the requested asset types and enabled configured roots with `mmdbridge roots list --json`. For an all-library request, include enabled model, motion, and scene roots. List each requested type with `mmdbridge assets list --type <model|motion|scene> --limit 50000 --json`, then retain only assets in the selected roots. The Core list limit is 50,000 per type; if a result contains exactly 50,000 items, stop that type and report that coverage may be truncated instead of claiming a full-library run. Do not scan for a tag-only request. Scan only when explicitly requested, using the queue and waiting for `Completed`; do not use `--full-check` unless explicitly requested.
 2. Use only normal, supported assets. Pure-Camera VMD rows are auxiliary and must not be retrieved or tagged by internal ID. Existing unsupported/retired X rows are out of scope.
 3. For each eligible asset, inspect parsed metadata, existing tag assignments (`name`, `source`, `confidence`), and removal overrides with `tags list <id> --include-overrides --json` or bounded `tags audit-batch --asset-id <id>... --json`. The Core batch-add response reports `blockedByUser` when a removal override blocks a candidate; do not bypass it or inspect SQLite. Preserve user, parser, and old unprefixed tags; do not rename, merge, or delete them. If a legacy tag already expresses the same fact, avoid adding a duplicate prefixed synonym. If an old agent or parser color tag conflicts with current evidence, leave it in place and report the conflict for review; `tags remove` records a user removal override and is not a cleanup tool.
 
@@ -43,6 +49,33 @@ For a complete, clearly visible role model, aim for 8–16 distinct, useful tags
 Confidence is a heuristic, not a calibrated probability. Core writes parser facts with `1.0` and overall-color estimates with `0.78`; these do not prove garment regions. Use `0.75–0.9` for clear visual facts; require at least `0.8` and visible construction for skirt subtypes. Omit weaker visual impressions or report them for review rather than writing confirmed tags. User additions, edits, and removals always take precedence. Do not promote an old agent tag to user source.
 
 ## Writing and manifest sync
+
+When the user supplies an AgentLink Prompt from the running software, use the
+bundled CLI's live bridge: first `agent-link identify --live --name <actual-agent-name>`;
+use `agent-link inspect --live` and its `nextCursor` for a bounded inventory and
+`--asset-id` for cards, tags and overrides. The scope in the software is authoritative.
+Use `--limit 100` and pass the entire returned cursor unchanged through
+`--cursor '<nextCursor JSON>'` (escape quoting for the current shell). Continue even
+if `items` is empty when `nextCursor` is non-null; stop only at a null cursor.
+If a cursor repeats, stop and report incomplete coverage rather than looping.
+Single-asset inspection returns `asset`, `tags`, `suppressedTags` and `card`.
+Use `agent-link tags --live --name <tag> --asset-id <id...> --confidence <value>`
+instead of ordinary batch-add, and `agent-link sync-cards --live --asset-id <id...>`
+for manifest updates. Tag responses contain `records`, `changed` and `blockedByUser`;
+sync responses contain `completed`, `failed` and `partialFailure`. Re-inspect affected
+IDs through the live bridge and require `card.status=CardValid` and
+`card.hasThumbnail=true` before reporting a synchronized result.
+Report progress with `agent-link log --live --message <text>
+--percent <0-100>`. Check partial failures, finish only after changed cards are
+current, then `agent-link finish --live --summary <counts-and-omissions>`.
+Stop after cancellation, session expiry or replacement; do not silently fall back
+to offline writes or send further log, sync or finish requests. Report any confirmed
+writes whose sync remains unverified. If the user later supplies a new software
+session, inspect that session's scope and reconcile its stale cards through live
+sync before claiming those prior writes are complete. Do not start another Agent
+or restart the GUI. Existing preview
+exports remain `cards thumbnail`; the bridge never scans or renders for a tag-only
+task. The following ordinary commands apply when no live session was requested.
 
 1. Group assets that share the same evidence-supported tag. Write bounded batches through the Core-backed CLI, for example:
    `mmdbridge tags batch-add --name "配色:蓝白" --asset-id <id-1> <id-2> --source agent --confidence 0.85 --json`

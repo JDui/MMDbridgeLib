@@ -6,12 +6,46 @@ use mmdbridge_core::{
     Asset, AssetCursor, AssetOperationJournalEntry, AssetOperationPlan, AssetPage,
     AssetRelation, AssetTag, AssetType, CoreError, FilterExpr, Library, RelationRefreshReport,
     Root, SavedFilter, ScanState, TagMutation,
-    ThumbnailConcurrencySettings, AutoTagSettings,
+    ThumbnailConcurrencySettings, AutoTagSettings, AgentLinkServer, AgentLinkScope, AgentLinkSnapshot,
 };
 use serde::Serialize;
 use tauri::{Manager, State, ipc::Response};
 
-struct CoreState(Library, std::sync::atomic::AtomicBool);
+struct CoreState(Library, std::sync::atomic::AtomicBool, std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<AgentLinkServer>>>>);
+
+async fn agent_link_action(
+    state: State<'_, CoreState>, action: impl FnOnce(&AgentLinkServer) -> Result<AgentLinkSnapshot,CoreError> + Send + 'static,
+) -> Result<AgentLinkSnapshot,ApiError> {
+    let library=state.0.clone();let bridge=state.2.clone();
+    read_core(library,move |library| {
+        let server={
+            let mut slot=bridge.lock().map_err(|_| CoreError::LockPoisoned)?;
+            if slot.is_none() { *slot=Some(std::sync::Arc::new(library.start_agent_link()?)); }
+            slot.as_ref().expect("server initialized").clone()
+        };
+        action(&server)
+    }).await
+}
+
+#[tauri::command]
+async fn agentlink_open(state: State<'_, CoreState>) -> Result<AgentLinkSnapshot,ApiError> {
+    agent_link_action(state,|server|server.snapshot()).await
+}
+
+#[tauri::command]
+async fn agentlink_scope_set(state: State<'_, CoreState>,scope: AgentLinkScope) -> Result<AgentLinkSnapshot,ApiError> {
+    agent_link_action(state,move |server|server.set_scope(scope)).await
+}
+
+#[tauri::command]
+async fn agentlink_cancel(state: State<'_, CoreState>) -> Result<AgentLinkSnapshot,ApiError> {
+    agent_link_action(state,|server|server.cancel()).await
+}
+
+#[tauri::command]
+async fn agentlink_new_session(state: State<'_, CoreState>) -> Result<AgentLinkSnapshot,ApiError> {
+    agent_link_action(state,|server|server.new_session()).await
+}
 
 #[derive(Clone, Serialize)]
 struct StartupStatus {
@@ -112,6 +146,7 @@ impl From<CoreError> for ApiError {
             CoreError::Card(_) => "CardError",
             CoreError::InvalidTag(_) => "InvalidTag",
             CoreError::InvalidFilter(_) => "InvalidFilter",
+            CoreError::AgentLink(_) => "AgentLinkError",
             CoreError::Json(_) => "SerializationError",
             CoreError::LockPoisoned => "CoreLockPoisoned",
         };
@@ -794,7 +829,7 @@ fn main() {
                     });
                     match result {
                         Ok(library) => {
-                            app_handle.manage(CoreState(library, std::sync::atomic::AtomicBool::new(false)));
+                            app_handle.manage(CoreState(library, std::sync::atomic::AtomicBool::new(false),std::sync::Arc::new(std::sync::Mutex::new(None))));
                             if let Ok(mut status) = status.lock() {
                                 status.ready = true;
                                 status.phase = "资产库已准备好".to_owned();
@@ -814,6 +849,10 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             startup_status,
+            agentlink_open,
+            agentlink_scope_set,
+            agentlink_cancel,
+            agentlink_new_session,
             library_background_start,
             tags_list,
             thumbnail_regenerate,

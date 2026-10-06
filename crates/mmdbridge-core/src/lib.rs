@@ -1,5 +1,6 @@
 mod cards;
 mod auto_tags;
+mod agent_link;
 mod database;
 mod error;
 mod filters;
@@ -20,6 +21,7 @@ mod types;
 
 pub use database::{Library, LibraryOpenProgress};
 pub use auto_tags::{AutoTagSettings, SubjectColor, SubjectPalette};
+pub use agent_link::{AgentLinkServer, AgentLinkScope, AgentLinkSnapshot, AgentLinkEvent, agent_link_request};
 pub use error::{CoreError, CoreResult};
 pub use operations::{
     AssetOperationAsset, AssetOperationDependencySnapshot, AssetOperationJournalEntry,

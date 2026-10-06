@@ -19,6 +19,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    AgentLink {
+        #[arg(long, global = true)]
+        live: bool,
+        #[command(subcommand)]
+        command: AgentLinkCommand,
+    },
     Roots {
         #[command(subcommand)]
         command: RootCommand,
@@ -74,6 +80,50 @@ enum Command {
         #[command(subcommand)]
         command: JobCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentLinkCommand {
+    Identify { #[arg(long)] name: String },
+    Inspect {
+        #[arg(long)] asset_id: Option<String>,
+        #[arg(long, default_value_t=100, value_parser=clap::value_parser!(u16).range(1..=500))] limit: u16,
+        #[arg(long)] cursor: Option<String>,
+    },
+    Log {
+        #[arg(long)] message: String,
+        #[arg(long, value_parser=clap::value_parser!(u8).range(0..=100))] percent: Option<u8>,
+    },
+    Tags {
+        #[arg(long)] name: String,
+        #[arg(long="asset-id", required=true, num_args=1..=100)] asset_ids: Vec<String>,
+        #[arg(long, default_value_t=0.85)] confidence: f64,
+    },
+    SyncCards { #[arg(long="asset-id", required=true, num_args=1..=100)] asset_ids: Vec<String> },
+    Finish { #[arg(long)] summary: String },
+    Cancel,
+}
+
+fn run_agent_link(command: AgentLinkCommand) -> Result<CommandOutput, CoreError> {
+    let (name,payload)=match command {
+        AgentLinkCommand::Identify {name}=>("agent-identify",json!({"name":name})),
+        AgentLinkCommand::Inspect {asset_id,limit,cursor}=>{
+            let cursor=cursor.map(|value|serde_json::from_str::<mmdbridge_core::AssetCursor>(&value)).transpose()?;
+            ("agent-inspect",json!({"assetId":asset_id,"limit":limit,"cursor":cursor}))
+        },
+        AgentLinkCommand::Log {message,percent}=>{
+            let mut payload=json!({"message":message});
+            if let Some(percent)=percent {payload["percent"]=json!(percent);}
+            ("agent-log",payload)
+        },
+        AgentLinkCommand::Tags {name,asset_ids,confidence}=>("agent-tags",json!({"name":name,"assetIds":asset_ids,"confidence":confidence})),
+        AgentLinkCommand::SyncCards {asset_ids}=>("agent-sync-cards",json!({"assetIds":asset_ids})),
+        AgentLinkCommand::Finish {summary}=>("agent-finish",json!({"summary":summary})),
+        AgentLinkCommand::Cancel=>("agent-cancel",json!({})),
+    };
+    let value=mmdbridge_core::agent_link_request(&Library::portable_database_path()?,name,payload,Duration::from_secs(60))?;
+    let failed=value["partialFailure"]==true;
+    Ok(CommandOutput {value,failed})
 }
 
 #[derive(Debug, Subcommand)]
@@ -323,15 +373,21 @@ fn main() -> ExitCode {
 fn run() -> Result<CommandOutput, CoreError> {
     let cli = Cli::parse();
     let _json_output = cli.json;
+    let command=match cli.command {
+        Command::AgentLink {live:true,command}=>return run_agent_link(command),
+        Command::AgentLink {live:false,..}=>return Err(CoreError::AgentLink("AgentLink 命令需要 --live".to_owned())),
+        command=>command,
+    };
     let library = Library::open(Library::portable_database_path()?)?;
     let checks_job_outcome = matches!(
-        &cli.command,
+        &command,
         Command::Thumbnail { .. }
             | Command::Cards {
                 command: CardCommand::Generate { .. } | CardCommand::SyncManifest { .. }
             }
     );
-    let value = match cli.command {
+    let value = match command {
+        Command::AgentLink {..}=>unreachable!("live commands are handled before opening SQLite"),
         Command::Roots {
             command: RootCommand::List,
         } => Ok(json!(library.list_roots()?)),
@@ -742,6 +798,7 @@ fn error_code(error: &CoreError) -> &'static str {
         CoreError::Card(_) => "CardError",
         CoreError::InvalidTag(_) => "InvalidTag",
         CoreError::InvalidFilter(_) => "InvalidFilter",
+        CoreError::AgentLink(_) => "AgentLinkError",
         CoreError::Json(_) => "SerializationError",
         CoreError::LockPoisoned => "CoreLockPoisoned",
     }

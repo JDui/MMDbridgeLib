@@ -8,6 +8,7 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'skills/mmdbridge-card-manager/**'
       - '.github/workflows/portable-windows.yml'
   workflow_dispatch:
 
@@ -33,14 +34,19 @@ jobs:
         working-directory: apps/desktop
       - run: npm run tauri -- build --no-bundle
         working-directory: apps/desktop
+      - name: Build AgentLink CLI
+        run: cargo build --release --locked -p mmdbridge-cli
       - name: Prepare portable EXE
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path artifacts/MBL -Force | Out-Null
           Copy-Item -LiteralPath target/release/mmdbridge-desktop.exe -Destination artifacts/MBL/MMDbridgeLib.exe
-          Get-Item artifacts/MBL/MMDbridgeLib.exe | Select-Object Name, Length
+          Copy-Item -LiteralPath target/release/mmdbridge.exe -Destination artifacts/MBL/mmdbridge.exe
+          New-Item -ItemType Directory -Path artifacts/MBL/skills -Force | Out-Null
+          Copy-Item -LiteralPath skills/mmdbridge-card-manager -Destination artifacts/MBL/skills/mmdbridge-card-manager -Recurse
+          Get-Item artifacts/MBL/*.exe | Select-Object Name, Length
       - uses: actions/upload-artifact@v7
         with:
           name: MBL-Portable-Windows
-          path: artifacts/MBL/MMDbridgeLib.exe
+          path: artifacts/MBL
           if-no-files-found: error

@@ -1,7 +1,8 @@
 import { ActionIcon, Button, Checkbox, NativeSelect, Slider, TextInput, UnstyledButton, Alert, AppShell, Badge, Menu, Modal, MultiSelect, Progress, Tabs } from "@mantine/core";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUpRight, Box, Boxes, Camera, Check, ChevronDown, ChevronRight, ChevronUp, Clapperboard, FileText, Folder, FolderOpen, Grid2X2, History, Layers3, ListTodo, Minus, MoreHorizontal, PanelRight, Play, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, Star, X } from "lucide-react";
+import { ArrowUpRight, Box, Boxes, Camera, Check, ChevronDown, ChevronRight, ChevronUp, Clapperboard, FileText, Folder, FolderOpen, Grid2X2, History, Layers3, Link2, ListTodo, Minus, MoreHorizontal, PanelRight, Play, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, Star, X } from "lucide-react";
 import { AppearanceSettings } from "./AppearanceSettings";
+import { AgentLinkPage } from "./AgentLinkPage";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -327,6 +328,8 @@ export default function App() {
   const [activeType, setActiveType] = useState<AssetType | "all">("all");
   const [activeMotionFormat, setActiveMotionFormat] = useState<MotionFormat>("all");
   const [viewMode, setViewMode] = useState<"assets" | "folders">("assets");
+  const [agentLinkOpen, setAgentLinkOpen] = useState(false);
+  const [agentLinkMounted, setAgentLinkMounted] = useState(false);
   const [activeRoot, setActiveRoot] = useState<string | null>(null);
   const [activeDirectory, setActiveDirectory] = useState<string | null>(null);
   const [recursiveScope, setRecursiveScope] = useState(() => readPreference("mmdbridge-folder-recursive") !== "false");
@@ -774,6 +777,7 @@ export default function App() {
   const totalThumbnailCount = Object.values(jobSummary).reduce((total, count) => total + count, 0);
 
   function selectCategory(type: AssetType | "all", stayInFolders = false) {
+    setAgentLinkOpen(false);
     setFavoritesOnly(false);
     setActiveSavedFilterId(null);
     setActiveType(type);
@@ -789,6 +793,7 @@ export default function App() {
   }
 
   function enterFolderView(asset?: Asset) {
+    setAgentLinkOpen(false);
     pendingScrollRestore.current = null;
     setFolderBrowserCollapse(Math.min(1, Math.max(0, (libraryScrollParent?.scrollTop ?? 0) / 240)));
     if (viewMode === "assets") {
@@ -1454,6 +1459,7 @@ export default function App() {
   }
 
   function selectSavedFilter(filter: SavedFilter) {
+    setAgentLinkOpen(false);
     if (hasRetiredFilterCondition(filter.expression)) {
       setError(`智能集合“${filter.name}”包含已停用的条件，未应用。原条件已保留；请新建替代智能集合。`);
       return;
@@ -1565,7 +1571,7 @@ export default function App() {
   const activeTitle = viewMode === "folders"
     ? folderRoot?.displayName ?? "文件夹"
     : favoritesOnly ? "收藏" : savedFilters.find((filter) => filter.id === activeSavedFilterId)?.name ?? (activeRoot ? roots.find((root) => root.id === activeRoot)?.displayName ?? "资产库" : activeType === "all" ? "全部资产" : categoryLabels[activeType]);
-  const libraryHomeActive = viewMode === "assets" && activeType === "all" && !activeRoot && !favoritesOnly && !activeSavedFilterId;
+  const libraryHomeActive = !agentLinkOpen && viewMode === "assets" && activeType === "all" && !activeRoot && !favoritesOnly && !activeSavedFilterId;
   const hasQueryFilters = !!(searchText || quickExpression || activeSavedFilterId || (activeType === "motion" && activeMotionFormat !== "all"));
   const emptyKind = assetQueryError ? "error" : !roots.length ? "no-roots" : hasQueryFilters ? "filter" : favoritesOnly ? "favorite"
     : (activeDirectory || (viewMode === "folders" && activeRoot)) && (activeRoot ? (counts.byRoot[activeRoot] ?? 0) > 0 : counts.all > 0) ? "folder" : "collection";
@@ -1594,7 +1600,7 @@ export default function App() {
   }
 
   return (
-    <AppShell className="app-shell" navbar={{ width: { base: 212, sm: 212, md: 224, lg: 236 }, breakpoint: 0 }} aside={{ width: { base: 268, sm: 268, md: 288, lg: 312 }, breakpoint: 0, collapsed: { desktop: !inspectorOpen } }} padding={0} withBorder={false} transitionDuration={0}>
+    <AppShell className="app-shell" navbar={{ width: { base: 212, sm: 212, md: 224, lg: 236 }, breakpoint: 0 }} aside={{ width: { base: 268, sm: 268, md: 288, lg: 312 }, breakpoint: 0, collapsed: { desktop: !inspectorOpen || agentLinkOpen } }} padding={0} withBorder={false} transitionDuration={0}>
       <AppShell.Navbar className="sidebar">
         <div className="brand-row">
           <div className="brand-mark"><Boxes size={25} strokeWidth={1.5} aria-hidden="true" /></div>
@@ -1604,20 +1610,21 @@ export default function App() {
         <UnstyledButton className={`nav-item library-home ${libraryHomeActive ? "active" : ""}`} aria-current={libraryHomeActive ? "page" : undefined} onClick={() => selectCategory("all")}>
           <Grid2X2 className="nav-icon" size={18} strokeWidth={1.6} aria-hidden="true" /><span>资产库</span><span className="count">{counts.all}</span>
         </UnstyledButton>
-        <UnstyledButton className={`nav-item folder-home ${viewMode === "folders" ? "active" : ""}`} aria-current={viewMode === "folders" && !activeRoot ? "page" : undefined} onClick={() => enterFolderView()}>
+        <UnstyledButton className={`nav-item folder-home ${!agentLinkOpen && viewMode === "folders" ? "active" : ""}`} aria-current={!agentLinkOpen && viewMode === "folders" && !activeRoot ? "page" : undefined} onClick={() => enterFolderView()}>
           <Folder className="nav-icon" size={18} strokeWidth={1.6} aria-hidden="true" /><span>文件夹</span>
         </UnstyledButton>
+        <UnstyledButton className={`nav-item agentlink-navigation ${agentLinkOpen ? "active" : ""}`} aria-current={agentLinkOpen ? "page" : undefined} onClick={() => { setAssetMenu(null); setRootMenu(null); setFilterBuilderOpen(false); setAgentLinkMounted(true); setAgentLinkOpen(true); }}><Link2 className="nav-icon" size={18} strokeWidth={1.6} aria-hidden="true" /><span>AgentLink</span></UnstyledButton>
         <div className="sidebar-section-heading"><span>资产类型</span><ActionIcon variant="subtle" size="sm" aria-label="添加资产根目录" className="icon-button tiny" onClick={addAnyRoot}><Plus size={15} aria-hidden="true" /></ActionIcon></div>
         {(Object.keys(categoryLabels) as AssetType[]).map((type) => (
           <div className={`type-block ${activeType === type ? "type-selected" : ""}`} key={type}>
-            <UnstyledButton className="nav-item type-item" aria-current={viewMode === "assets" && activeType === type && !activeRoot && !favoritesOnly && !activeSavedFilterId ? "page" : undefined} onClick={() => selectCategory(type)}>
+            <UnstyledButton className="nav-item type-item" aria-current={!agentLinkOpen && viewMode === "assets" && activeType === type && !activeRoot && !favoritesOnly && !activeSavedFilterId ? "page" : undefined} onClick={() => selectCategory(type)}>
               <span className={`type-icon ${type}`}><AssetKindIcon type={type} /></span><span>{categoryLabels[type]}</span><span className="count">{counts[type]}</span>
             </UnstyledButton>
             {(activeType === type || activeType === "all") && <div className="root-list">
               {roots.filter((root) => root.assetType === type).map((root) => {
                 const rootScan = scanStates.find((scan) => scan.rootId === root.id);
                 return <div className={`root-row ${activeRoot === root.id ? "selected" : ""}`} key={root.id}>
-                  <UnstyledButton className="root-name" title={root.path} aria-current={activeRoot === root.id ? "page" : undefined} onClick={() => { setActiveType(type); setActiveRoot(root.id); setActiveDirectory(null); setActiveSavedFilterId(null); setFavoritesOnly(false); if (viewMode === "folders") { setQuery(""); setSearchText(""); } setSelected(null); }}>
+                  <UnstyledButton className="root-name" title={root.path} aria-current={!agentLinkOpen && activeRoot === root.id ? "page" : undefined} onClick={() => { setAgentLinkOpen(false); setActiveType(type); setActiveRoot(root.id); setActiveDirectory(null); setActiveSavedFilterId(null); setFavoritesOnly(false); if (viewMode === "folders") { setQuery(""); setSearchText(""); } setSelected(null); }}>
                     <span className={`root-dot ${root.enabled ? "" : "paused"}`} /><span className="root-label">{root.displayName}</span><span className="count">{counts.byRoot[root.id] ?? 0}</span>
                   </UnstyledButton>
                   {rootScan && activeScanStatuses.has(rootScan.status) &&
@@ -1631,12 +1638,12 @@ export default function App() {
         ))}
 
         <div className="sidebar-divider" />
-        <UnstyledButton className={`nav-item subdued ${favoritesOnly ? "active" : ""}`} aria-current={favoritesOnly ? "page" : undefined} onClick={() => { setFavoritesOnly(true); setActiveSavedFilterId(null); setActiveType("all"); setViewMode("assets"); setActiveRoot(null); setActiveDirectory(null); setSelected(null); setQuery(""); setSearchText(""); }}><Star className="nav-icon" size={18} strokeWidth={1.6} aria-hidden="true" /><span>收藏</span><span className="count">{favoritesOnly ? assets.length : ""}</span></UnstyledButton>
+        <UnstyledButton className={`nav-item subdued ${!agentLinkOpen && favoritesOnly ? "active" : ""}`} aria-current={!agentLinkOpen && favoritesOnly ? "page" : undefined} onClick={() => { setAgentLinkOpen(false); setFavoritesOnly(true); setActiveSavedFilterId(null); setActiveType("all"); setViewMode("assets"); setActiveRoot(null); setActiveDirectory(null); setSelected(null); setQuery(""); setSearchText(""); }}><Star className="nav-icon" size={18} strokeWidth={1.6} aria-hidden="true" /><span>收藏</span><span className="count">{favoritesOnly ? assets.length : ""}</span></UnstyledButton>
         <div className="sidebar-section-heading smart-filter-heading"><span>智能集合</span><ActionIcon variant="subtle" size="sm" aria-label="新建智能集合" className="icon-button tiny" onClick={() => setFilterBuilderOpen((open) => !open)}><Plus size={15} aria-hidden="true" /></ActionIcon></div>
         {savedFilters.map((filter) => {
           const retired = hasRetiredFilterCondition(filter.expression);
           return <div className={`smart-filter-row ${retired ? "retired-filter" : ""} ${activeSavedFilterId === filter.id ? "selected" : ""}`} key={filter.id}>
-            <UnstyledButton className="nav-item smart-filter-item" aria-current={activeSavedFilterId === filter.id ? "page" : undefined} title={retired ? `${filter.name} · 条件已停用，需要编辑` : filter.name} onClick={() => selectSavedFilter(filter)}><SlidersHorizontal className="nav-icon" size={17} strokeWidth={1.6} aria-hidden="true" /><span>{filter.name}{retired && <small className="smart-filter-warning">条件已停用，需要编辑</small>}</span></UnstyledButton>
+            <UnstyledButton className="nav-item smart-filter-item" aria-current={!agentLinkOpen && activeSavedFilterId === filter.id ? "page" : undefined} title={retired ? `${filter.name} · 条件已停用，需要编辑` : filter.name} onClick={() => selectSavedFilter(filter)}><SlidersHorizontal className="nav-icon" size={17} strokeWidth={1.6} aria-hidden="true" /><span>{filter.name}{retired && <small className="smart-filter-warning">条件已停用，需要编辑</small>}</span></UnstyledButton>
             <ActionIcon variant="subtle" size="sm" className="smart-filter-remove" aria-label={`删除智能集合 ${filter.name}`} title="删除智能集合" onClick={() => void removeSmartFilter(filter)}><X size={14} aria-hidden="true" /></ActionIcon>
           </div>;
         })}
@@ -1649,6 +1656,8 @@ export default function App() {
       </AppShell.Navbar>
 
       <AppShell.Main className="main-area">
+        {agentLinkMounted && <AgentLinkPage active={agentLinkOpen} initialScope={{rootId:activeRoot,assetType:activeType === "all" ? null : activeType}} roots={roots} onLibraryChanged={refresh} />}
+        <div className="library-page" hidden={agentLinkOpen}>
         <header className="topbar">
           <form className="search-box" onSubmit={submitSearch}>
             <Search size={17} strokeWidth={1.8} aria-hidden="true" /><TextInput value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、文件名、路径或标签（空格分词）…" aria-label="搜索资产" />
@@ -1799,9 +1808,10 @@ export default function App() {
           </div>) : <div className="jobs-panel-empty">没有缩略图任务</div>}
         </div>}
       </footer>
+        </div>
       </AppShell.Main>
 
-      <AppShell.Aside className={`inspector ${selected ? "has-selection" : ""}`} aria-hidden={!inspectorOpen}>
+      <AppShell.Aside className={`inspector ${selected ? "has-selection" : ""}`} aria-hidden={!inspectorOpen || agentLinkOpen}>
         <div className="inspector-top"><div><div className="eyebrow">当前选择</div><h2>资产详情</h2></div><ActionIcon variant="subtle" size="sm" className="icon-button" aria-label="关闭资产详情" onClick={() => setInspectorOpen(false)}><X size={17} aria-hidden="true" /></ActionIcon></div>
         {selected ? <>
           <UnstyledButton className={`inspector-preview ${selected.assetType} ${selected.hasThumbnail ? "has-thumbnail" : ""}`} title="查看缩略图" onClick={() => setPreviewAsset(selected)}>{selected.hasThumbnail && <CardThumbnail revision={thumbnailRevisions[selected.id]} assetId={selected.id} alt={`${selected.name} 缩略图`} />}{!selected.hasThumbnail && <div className="asset-placeholder"><AssetKindIcon type={selected.assetType} size={38} /><span>尚未生成预览</span></div>}<span className="preview-badge">{selected.metadata.is_pose ? "姿势" : categoryLabels[selected.assetType]}</span></UnstyledButton>

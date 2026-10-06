@@ -46,6 +46,8 @@ pub enum CoreError {
     InvalidTag(String),
     #[error("invalid filter: {0}")]
     InvalidFilter(String),
+    #[error("AgentLink: {0}")]
+    AgentLink(String),
     #[error("metadata serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("library lock is poisoned")]
@@ -80,6 +82,7 @@ impl CoreError {
                     | Self::InvalidAssetType(_)
                     | Self::InvalidTag(_)
                     | Self::InvalidFilter(_)
+                    | Self::AgentLink(_)
                     | Self::LockPoisoned
             ),
         }
