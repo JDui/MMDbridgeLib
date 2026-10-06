@@ -37,7 +37,9 @@ Skill 将裙装分成 garment、长度、轮廓、褶饰、腰型、结构等维
 
 - 本地前端 15 项功能检查、TypeScript/Vite 构建、脚本语法及 Skill 格式检查通过。
 - 独立 Skill 前向检查查看两张实际 Core 合成缩略图，保留手动红色标签，报告颜色冲突，拒绝仅凭文件名生成校园/Lolita/百褶裙标签，并将嵌入的指令文字视为数据。没有 CLI 可执行文件，该检查只输出候选与命令，没有数据库写入。
-- Rust/CLI 的重扫、用户覆盖、颜色、缓存和 Windows 编译由 CI 验证；结果待运行后补录。
-- `tagging_probe` 使用独立临时目录中的合成 PMX 和蓝色纹理，验证扫描标签、缩略图颜色、缺失贴图跳过、移除覆盖、手动色系、原图复用及卡片有效性；`tagging-review.mjs` 使用该 Core 输出拍摄扫描、颜色完成和设置三个阶段，验证开关持久化及失败保存。
+- 运行代码 `2ca7756` 的 [Functional regression](https://github.com/JDui/MMDbridgeLib/actions/runs/37458050394) 通过：Windows/Linux 各有 Core 单元 54 项、CLI 4 项、模型加载 6 项通过，前端 15 项及构建通过，Windows Tauri 检查通过。另 2 个需要外部真实素材或数据库副本的探针按原有规则跳过。
+- [Model compatibility and offscreen rendering](https://github.com/JDui/MMDbridgeLib/actions/runs/37458050352) 通过。`tagging_probe` 的 11 项检查覆盖扫描技术标签、缩略图颜色、缺失贴图跳过、移除覆盖、手动色系、原图复用、卡片有效性、无变更重扫、队列扫描自动安排预览、关闭颜色不安排队列，以及重新开启后补色。`tagging-review.mjs` 的 4 项检查覆盖扫描阶段标签、缩略图完成后的颜色、开关持久化与保存失败保留已存设置，页面错误为空。
+- [Portable Windows build](https://github.com/JDui/MMDbridgeLib/actions/runs/37458050368) 通过 `--no-bundle` 构建，输出 24,478,720 字节的 Windows x64 `MMDbridgeLib.exe`。便携包只包含 EXE 和使用说明，不包含数据库、素材或安装器。当前环境无法把 EXE 安放到用户的 `E:\MMD\MBL`，由下载包提供此次构建。
+- 三张截图使用独立临时目录中的合成 PMX 和实际 Core 缩略图，展示扫描、颜色完成和设置三个阶段。截图脚本随后滚动详情栏，使新增标签进入画面；这项调整未修改运行代码。[截图版本 `72cccda` 的离屏检查](https://github.com/JDui/MMDbridgeLib/actions/runs/37458667392) 也通过全部检查，页面错误为空。
 
 截图仅证明隔离浏览器中前端和 Core 合成数据的结合效果，不代表 Windows 实机、真实角色或真实裙型识别准确率。
