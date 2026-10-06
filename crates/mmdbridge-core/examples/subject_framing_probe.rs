@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (base_vertices, base_indices) = character();
     let cases = [("normal", "标准角色"), ("huge-rig", "巨大控制骨架"), ("unreferenced", "未使用远处顶点"),
         ("detached", "远处碎片"), ("flying", "面片顶点飞远"), ("transparent", "透明远处几何"),
-        ("hair-wings", "长发裙摆与翅膀"), ("pmd-flying", "PMD 顶点飞远"), ("dense-prop", "高密度远处配件"),
+        ("hair-wings", "长发裙摆与翅膀"), ("pmd-flying", "PMD 飛点"), ("dense-prop", "高密度远处配件"),
         ("tiny", "极小比例角色"), ("large", "极大比例角色")];
     for (id, name) in cases {
         let mut vertices = base_vertices.clone(); let mut indices = base_indices.clone();
@@ -128,6 +128,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         fs::write(output.join("after").join(format!("{id}.webp")), &thumbnail.preview_webp)?;
         library.create_card_with_thumbnail(&asset.id)?; assert_eq!(library.verify_card(&asset.id)?.status, "CardValid");
         let mut display = serde_json::to_value(&asset)?; display["hasThumbnail"] = json!(true);
+        assert!(!asset.name.contains("&#"), "fixture title must be representable in its source encoding");
         display["primarySource"] = json!(format!("E:\\MMD\\FramingTests\\{}", path.file_name().unwrap().to_string_lossy()));
         display["assetDirectory"] = json!("E:\\MMD\\FramingTests");
         entries.push(json!({"case":id, "modelFile":path.file_name().unwrap().to_string_lossy(), "asset":display,

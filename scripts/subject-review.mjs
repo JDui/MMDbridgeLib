@@ -104,15 +104,23 @@ try {
   await page.goto(`${url}/comparison?cases=huge-rig,hair-wings,transparent,tiny`);
   await page.waitForFunction(() => [...document.images].every(image => image.complete && image.naturalWidth === 1024));
   await page.screenshot({path: join(output, 'MBL_Subject_Stage2_Preservation.jpg'), fullPage: true, type: 'jpeg', quality: 92, animations: 'disabled'});
+  const imageBoxes = [];
   for (const [variant, file] of [['before', 'MBL_Subject_Stage3_Library_Before.jpg'], ['after', 'MBL_Subject_Stage4_Library_After.jpg']]) {
     await page.goto(`${url}/?scheme=dark&variant=${variant}`);
     await page.waitForFunction(() => document.querySelectorAll('.asset-card img').length === 8 && [...document.querySelectorAll('.asset-card img')].every(image => image.complete && image.naturalWidth === 1024));
+    const boxes = await page.locator('.asset-card img').evaluateAll(images => images.map(image => {
+      const imageRect = image.getBoundingClientRect(); const slot = image.parentElement.getBoundingClientRect();
+      return {name: image.alt, width: imageRect.width, height: imageRect.height, slotWidth: slot.width, slotHeight: slot.height};
+    }));
+    assert.ok(boxes.every(box => Math.abs(box.width - box.slotWidth) < 1 && Math.abs(box.height - box.slotHeight) < 1),
+      'thumbnail element fits the slot so contain preserves the full square image');
+    imageBoxes.push({variant, boxes});
     await page.screenshot({path: join(output, file), type: 'jpeg', quality: 92, animations: 'disabled'});
   }
   assert.deepEqual(errors, []);
   await fs.writeFile(join(output, 'verification.json'), JSON.stringify({sourceCommit: manifest.sourceCommit,
     baselineCommit: manifest.baselineCommit, synthetic: true, headless: true, metrics, subjectChecksPassed: true,
-    uiImageCount: 8, pageErrors: errors}, null, 2));
+    uiImageCount: 8, imageBoxes, pageErrors: errors}, null, 2));
   console.log(JSON.stringify({synthetic: true, comparisons: 11, subjectChecksPassed: true, screenshots: 4, pageErrors: errors}));
 } catch (error) {
   await page.screenshot({path: join(output, 'failure.jpg'), fullPage: true});

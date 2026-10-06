@@ -7,6 +7,7 @@ on:
       - 'crates/mmdbridge-core/src/thumbnail*'
       - 'crates/mmdbridge-core/examples/subject_framing_probe.rs'
       - 'scripts/subject-review.mjs'
+      - 'apps/desktop/src/styles.css'
       - '.github/workflows/subject-framing.yml'
   workflow_dispatch:
 
