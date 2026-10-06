@@ -27,6 +27,8 @@ fn scan_tags_are_repeatable_replace_old_facts_and_respect_user_removals() {
     assert_eq!(library.scan_root(&root.id).unwrap().assets_unchanged, 1);
     assert_eq!(serde_json::to_value(&tags).unwrap(), serde_json::to_value(library.list_asset_tags(&asset.id).unwrap()).unwrap());
     library.remove_asset_tag(&asset.id, "技术:含SDEF").unwrap();
+    assert_eq!(library.scan_root(&root.id).unwrap().assets_unchanged, 1);
+    assert!(!library.list_asset_tags(&asset.id).unwrap().iter().any(|tag| tag.name == "技术:含SDEF"));
     library.add_asset_tag(&asset.id, "服装:半身裙", "agent", Some(0.85)).unwrap();
     std::fs::write(&path, fixtures::pmx(false,1,0,true)).unwrap();
     library.scan_root(&root.id).unwrap();

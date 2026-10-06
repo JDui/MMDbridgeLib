@@ -41,6 +41,8 @@ struct OwnedTags {
     revision: u32,
     fingerprint: String,
     names: Vec<String>,
+    #[serde(default)]
+    requested: Vec<String>,
 }
 
 impl Library {
@@ -123,7 +125,7 @@ pub(crate) fn reconcile(
         changed |= mutation.changed;
         if !mutation.blocked_by_user { names.push(name.clone()); }
     }
-    let state = OwnedTags { revision: REVISION, fingerprint: fingerprint.to_owned(), names };
+    let state = OwnedTags { revision: REVISION, fingerprint: fingerprint.to_owned(), names, requested: candidates.to_vec() };
     if previous.as_ref() != Some(&state) {
         transaction.execute(
             "INSERT INTO metadata(asset_id,key,value_json) VALUES (?1,?2,?3)
@@ -139,9 +141,19 @@ pub(crate) fn reconcile(
 
 pub(crate) fn backfill(library: &Library, asset_id: &str, asset_type: AssetType, metadata: &Value, fingerprint: &str) -> CoreResult<bool> {
     if !library.auto_tag_settings()?.technical || metadata["is_camera_only"] == true { return Ok(false); }
+    let candidates = technical_tags(asset_type, metadata);
+    let cached: Option<String> = library.connection()?.query_row(
+        "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='auto_tags_technical'", [asset_id], |row| row.get(0),
+    ).optional()?;
+    let cached = cached.as_deref().map(serde_json::from_str::<OwnedTags>).transpose()?;
+    if cached.as_ref().is_some_and(|state| state.revision == REVISION && state.fingerprint == fingerprint && state.requested == candidates) {
+        // User additions/removals already update their assignments/overrides through
+        // Core. An unchanged asset needs neither a write transaction nor per-tag SQL.
+        return Ok(false);
+    }
     let mut connection = library.connection()?;
     let transaction = connection.transaction()?;
-    let changed = reconcile(&transaction, asset_id, "technical", fingerprint, &technical_tags(asset_type, metadata), 1.0)?;
+    let changed = reconcile(&transaction, asset_id, "technical", fingerprint, &candidates, 1.0)?;
     transaction.commit()?;
     Ok(changed)
 }
@@ -244,7 +256,7 @@ mod tests {
     #[test]
     fn reconciliation_is_idempotent_and_keeps_user_and_agent_assignments() {
         let library = Library::in_memory().unwrap();
-        library.connection().unwrap().execute_batch("INSERT INTO roots(id,asset_type,path,display_name,created_at) VALUES ('r','model','/test','test','now'); INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,fingerprint,statuses_json,created_at,updated_at,last_seen_at) VALUES ('a','r','model','test','/test/a.pmx','/test','f','[]','now','now','now');").unwrap();
+        library.connection().unwrap().execute_batch("INSERT INTO roots(id,asset_type,path,path_key,display_name,created_at) VALUES ('r','model','/test','/test','test','now'); INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,fingerprint,statuses_json,created_at,updated_at,last_seen_at) VALUES ('a','r','model','test','/test/a.pmx','/test','f','[]','now','now','now');").unwrap();
         let run = |names: &[&str]| {
             let mut connection = library.connection().unwrap(); let tx = connection.transaction().unwrap();
             let changed = reconcile(&tx, "a", "technical", "f", &names.iter().map(|name| name.to_string()).collect::<Vec<_>>(), 1.0).unwrap();
