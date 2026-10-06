@@ -44,7 +44,7 @@ window.__TAURI_INTERNALS__.invoke=async(cmd,args={})=>{
   if(window.__agentFailScope)throw new Error('隔离测试：范围无法保存');
   if(window.__agentState.status==='active')throw new Error('接管期间不能更改范围');
   const template=args.scope.rootId?stages.scopedWaiting:args.scope.assetType==='model'?stages.modelWaiting:stages.waiting;
-  window.__agentState={...window.__agentState,scope:args.scope,prompt:template.prompt,revision:window.__agentState.revision+1};
+  window.__agentState={...window.__agentState,scope:args.scope,prompt:template.prompt.replaceAll(template.sessionId,window.__agentState.sessionId),revision:window.__agentState.revision+1};
   return structuredClone(window.__agentState);
  }
  if(cmd==='agentlink_cancel'){
@@ -52,7 +52,8 @@ window.__TAURI_INTERNALS__.invoke=async(cmd,args={})=>{
   return structuredClone(window.__agentState);
  }
  if(cmd==='agentlink_new_session'){
-  window.__agentCalls.push(cmd);window.__agentState={...window.__agentState,status:'waiting',agentName:'',percent:null,sessionId:stages.renewed.sessionId,revision:window.__agentState.revision+1};
+  window.__agentCalls.push(cmd);const nextId=crypto.randomUUID();
+  window.__agentState={...window.__agentState,status:'waiting',agentName:'',percent:null,prompt:window.__agentState.prompt.replaceAll(window.__agentState.sessionId,nextId),sessionId:nextId,revision:window.__agentState.revision+1};
   return structuredClone(window.__agentState);
  }
  return originalInvoke(cmd,args);
@@ -93,7 +94,7 @@ try {
   assert.equal(await page.locator('.library-page').isVisible(),true);await tab.click();
   assert.equal(await prompt.inputValue(),generated+'\n优先检查模型预览。');
   await type.selectOption('model');
-  await page.getByRole('status').filter({hasText:'范围已变化'}).waitFor();
+  await page.getByRole('status').filter({hasText:'范围或会话已变化'}).waitFor();
   assert.equal(await page.locator('.prompt-panel').getByRole('button',{name:'复制',exact:true}).isDisabled(),true);
   await page.getByRole('button',{name:'重新生成',exact:true}).click();
   await page.waitForFunction(()=>!document.querySelector('.agentlink-prompt-warning'));
@@ -132,8 +133,16 @@ try {
   assert.equal(await directory.inputValue(),manifest.roots[0].id);
   await page.evaluate(()=>{window.__agentRoots[0].enabled=true;});
   await page.locator('.log-panel').getByRole('button',{name:'刷新资产',exact:true}).click();
+  const oldPrompt=await prompt.inputValue();
+  await prompt.fill(oldPrompt+'\n继续检查可见标签。');
   await page.getByRole('button',{name:'新会话',exact:true}).click();
   await page.locator('.agentlink-status').filter({hasText:'等待连接'}).waitFor();
+  await page.getByRole('status').filter({hasText:'范围或会话已变化'}).waitFor();
+  assert.equal(await page.locator('.prompt-panel').getByRole('button',{name:'复制',exact:true}).isDisabled(),true);
+  await page.getByRole('button',{name:'重新生成',exact:true}).click();
+  const renewedId=await page.evaluate(()=>window.__agentState.sessionId);
+  await page.waitForFunction(id=>document.querySelector('.agentlink-prompt')?.value.includes('--session '+id),renewedId);
+  assert.equal((await prompt.inputValue()).includes('--session '+manifest.snapshots.finished.sessionId),false);
   await page.evaluate(()=>{window.__agentState={...window.__agentState,status:'active',agentName:'Codex',percent:25,revision:window.__agentState.revision+1};});
   await page.locator('.agentlink-status').filter({hasText:'正在接管 · Codex'}).waitFor();
   await page.getByRole('button',{name:'取消接管',exact:true}).click();
@@ -165,7 +174,7 @@ try {
   const narrow=await Promise.all(['.prompt-panel','.log-panel'].map(selector=>page.locator(selector).boundingBox()));
   assert.ok(narrow.every(box=>box&&box.width>250));
   assert.deepEqual(errors,[]);
-  await fs.writeFile(join(output,'ui-verification.json'),JSON.stringify({synthetic:true,source:'Actual app frontend, Core snapshots, isolated Tauri presentation bridge',checks:{sideBySidePanels:true,promptClipboard:true,editedPromptPersists:true,scopeRegeneration:true,failedScopePreservesValues:true,activeScopeLocked:true,finishedScopePreserved:true,unavailableRootKeepsSelectedScope:true,backgroundConnectionAndCompletionRefresh:true,pollingAfterNewSessionAndCancel:true,connectionRetry:true,logTextEscaped:true,manualScrollPreserved:true,followLatest:true,compactViewport:true},pageErrors:errors},null,2));
+  await fs.writeFile(join(output,'ui-verification.json'),JSON.stringify({synthetic:true,source:'Actual app frontend, Core snapshots, isolated Tauri presentation bridge',checks:{sideBySidePanels:true,promptClipboard:true,editedPromptPersists:true,scopeRegeneration:true,failedScopePreservesValues:true,activeScopeLocked:true,finishedScopePreserved:true,unavailableRootKeepsSelectedScope:true,editedOldSessionPromptBlocked:true,backgroundConnectionAndCompletionRefresh:true,pollingAfterNewSessionAndCancel:true,connectionRetry:true,logTextEscaped:true,manualScrollPreserved:true,followLatest:true,compactViewport:true},pageErrors:errors},null,2));
 } finally {
   await browser?.close();await new Promise(done=>server.close(done));
 }

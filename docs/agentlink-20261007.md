@@ -16,6 +16,9 @@ listener or arbitrary command execution is added. Opening the page creates the
 bridge lazily. During takeover, scope changes are rejected. Cancellation blocks
 further work; an already committing operation may finish and its changes remain.
 Starting a new session invalidates queued requests from the old session.
+Each live CLI command includes the Prompt's `--session` ID. Old Prompt commands
+cannot reconnect or write into a replacement session, even if its Agent name and
+asset scope are identical. Edited Prompts must be regenerated after session changes.
 
 Live tag writes preserve existing sources/confidence and manual removals. Current
 previews are required, the bridge never scans or renders, and completion checks

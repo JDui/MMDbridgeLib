@@ -59,6 +59,7 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
       && next.skillAvailable === previous.skillAvailable && next.error === previous.error) return;
     current.current = next; setSnapshot(next); setScope(next.scope);
     if (replacePrompt || !dirtyRef.current) { setPrompt(next.prompt); setDirty(false); dirtyRef.current = false; setStalePrompt(false); }
+    else if (previous && (previous.sessionId !== next.sessionId || JSON.stringify(previous.scope) !== JSON.stringify(next.scope))) setStalePrompt(true);
     if (previous && (next.libraryRevision !== previous.libraryRevision || (next.status === "finished" && previous.status !== "finished"))) {
       void onChanged.current().catch((reason) => setError(toUiError(reason)));
     }
@@ -136,7 +137,7 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
     <div className="agentlink-panels">
       <div className="agentlink-panel prompt-panel">
         <div className="agentlink-panel-header"><h2>Prompt</h2><div><Button size="compact-xs" variant="subtle" leftSection={<RefreshCw size={14} />} disabled={busy || !snapshot} onClick={() => void action("agentlink_open", {}, true)}>重新生成</Button><Button size="compact-xs" variant="light" leftSection={copied === "prompt" ? <Check size={14} /> : <Copy size={14} />} disabled={!prompt || stalePrompt} onClick={() => void copy("prompt")}>{copied === "prompt" ? "已复制" : "复制"}</Button></div></div>
-        {stalePrompt && <div className="agentlink-prompt-warning" role="status">范围已变化，请重新生成 Prompt。</div>}
+        {stalePrompt && <div className="agentlink-prompt-warning" role="status">范围或会话已变化，请重新生成 Prompt。</div>}
         <textarea className="agentlink-prompt" aria-label="AgentLink Prompt" spellCheck={false} value={prompt} placeholder="正在生成当前资产范围的 Prompt…" onChange={(event) => {setPrompt(event.target.value);setDirty(true);dirtyRef.current=true;}} />
         <div className="agentlink-panel-footer"><span>{dirty ? "已编辑" : "当前资产范围"}</span><span>{prompt.length.toLocaleString()} 字符</span></div>
       </div>

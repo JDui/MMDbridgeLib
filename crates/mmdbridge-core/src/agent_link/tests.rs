@@ -39,7 +39,8 @@ impl Fixture {
     }
     fn database(&self) -> PathBuf {self.directory.join("data/library.sqlite3")}
     fn rpc(&self,command:&str,payload:Value) -> Result<Value,CoreError> {
-        agent_link_request(&self.database(),command,payload,Duration::from_secs(5))
+        let session=self.server.as_ref().and_then(|server|server.snapshot().ok()).map(|snapshot|snapshot.session_id).unwrap_or_default();
+        agent_link_request(&self.database(),&session,command,payload,Duration::from_secs(5))
     }
     fn connect(&self) {self.rpc("agent-identify",json!({"name":"Codex"})).unwrap();}
 }
@@ -104,6 +105,21 @@ fn unverified_preview_is_skipped_without_writes_or_render_jobs() {
     assert!(!library.list_asset_tags(&f.asset).unwrap().iter().any(|tag|tag.name=="服装:制服"));
     assert_eq!(library.list_jobs().unwrap(),jobs);
     f.rpc("agent-finish",json!({"summary":"跳过 1 项：预览未验证，未添加标签"})).unwrap();
+}
+
+#[test]
+fn old_prompt_cannot_join_or_write_to_a_replacement_session() {
+    let f=Fixture::new();let server=f.server.as_ref().unwrap();f.connect();
+    let old=server.snapshot().unwrap().session_id;
+    server.cancel().unwrap();server.new_session().unwrap();f.connect();
+    for (command,payload) in [
+        ("agent-identify",json!({"name":"Codex"})),
+        ("agent-tags",json!({"assetIds":[f.asset],"name":"服装:制服","confidence":0.85})),
+    ] {
+        assert!(agent_link_request(&f.database(),&old,command,payload,Duration::from_secs(5)).is_err());
+    }
+    assert!(!f.library.as_ref().unwrap().list_asset_tags(&f.asset).unwrap().iter().any(|tag|tag.name=="服装:制服"));
+    assert_eq!(server.snapshot().unwrap().status,"active");
 }
 
 #[test]

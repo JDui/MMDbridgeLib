@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 #[path = "../tests/fixtures/mod.rs"]
 mod fixtures;
 
-fn cli(binary: &Path, arguments: &[&str], success: bool) -> Result<Value, Box<dyn Error>> {
-    let output = Command::new(binary).args(arguments).output()?;
+fn cli(binary: &Path, session: &str, arguments: &[&str], success: bool) -> Result<Value, Box<dyn Error>> {
+    let output = Command::new(binary).args(arguments).args(["--session",session]).output()?;
     assert_eq!(output.status.success(), success, "{}", String::from_utf8_lossy(&output.stderr));
     let bytes = if output.stdout.is_empty() { &output.stderr } else { &output.stdout };
     Ok(serde_json::from_slice(bytes)?)
@@ -44,34 +44,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(output.join("preview.webp"), &preview)?;
     let server = library.start_agent_link()?;
     let waiting = server.snapshot()?;
+    let mut session = waiting.session_id.clone();
     assert!(waiting.cli_available && waiting.skill_available);
     let model_waiting = server.set_scope(AgentLinkScope {root_id:None,asset_type:Some(AssetType::Model)})?;
     let scoped_waiting = server.set_scope(AgentLinkScope {root_id:Some(root.id.clone()),asset_type:Some(AssetType::Model)})?;
-    let identity = cli(&binary, &["agent-link", "identify", "--live", "--name", "Codex", "--json"], true)?;
+    let identity = cli(&binary, &session, &["agent-link", "identify", "--live", "--name", "Codex", "--json"], true)?;
     assert_eq!(identity["scope"]["rootId"], root.id);
-    let inventory = cli(&binary, &["agent-link", "inspect", "--live", "--limit", "1", "--json"], true)?;
+    let inventory = cli(&binary, &session, &["agent-link", "inspect", "--live", "--limit", "1", "--json"], true)?;
     assert_eq!(inventory["items"].as_array().ok_or("inventory absent")?.len(), 1);
     assert_eq!(inventory["items"][0]["id"], asset.id);
     assert!(inventory["nextCursor"].is_null());
-    cli(&binary, &["agent-link", "log", "--live", "--message", "已检查 1 项模型，正在保留现有标签", "--percent", "30", "--json"], true)?;
+    cli(&binary, &session, &["agent-link", "log", "--live", "--message", "已检查 1 项模型，正在保留现有标签", "--percent", "30", "--json"], true)?;
     for name in ["用途:参考模型", "格式:PMX"] {
-        assert_eq!(cli(&binary, &["agent-link", "tags", "--live", "--name", name, "--asset-id", &asset.id, "--confidence", "0.85", "--json"], true)?["changed"], 0);
+        assert_eq!(cli(&binary, &session, &["agent-link", "tags", "--live", "--name", name, "--asset-id", &asset.id, "--confidence", "0.85", "--json"], true)?["changed"], 0);
     }
-    let blocked = cli(&binary, &["agent-link", "tags", "--live", "--name", "造型:像素风", "--asset-id", &asset.id, "--confidence", "0.85", "--json"], true)?;
+    let blocked = cli(&binary, &session, &["agent-link", "tags", "--live", "--name", "造型:像素风", "--asset-id", &asset.id, "--confidence", "0.85", "--json"], true)?;
     assert_eq!(blocked["blockedByUser"], 1);
-    let added = cli(&binary, &["agent-link", "tags", "--live", "--name", "造型:低多边形", "--asset-id", &asset.id, "--confidence", "0.85", "--json"], true)?;
+    let added = cli(&binary, &session, &["agent-link", "tags", "--live", "--name", "造型:低多边形", "--asset-id", &asset.id, "--confidence", "0.85", "--json"], true)?;
     assert_eq!(added["changed"], 1);
-    cli(&binary, &["agent-link", "log", "--live", "--message", "已追加 1 个标签，下一步同步资源卡", "--percent", "60", "--json"], true)?;
+    cli(&binary, &session, &["agent-link", "log", "--live", "--message", "已追加 1 个标签，下一步同步资源卡", "--percent", "60", "--json"], true)?;
     let active = server.snapshot()?;
-    let premature = cli(&binary, &["agent-link", "finish", "--live", "--summary", "尝试提前结束", "--json"], false)?;
+    let premature = cli(&binary, &session, &["agent-link", "finish", "--live", "--summary", "尝试提前结束", "--json"], false)?;
     assert_eq!(premature["error_code"], "AgentLinkError");
-    let synced = cli(&binary, &["agent-link", "sync-cards", "--live", "--asset-id", &asset.id, "--json"], true)?;
+    let synced = cli(&binary, &session, &["agent-link", "sync-cards", "--live", "--asset-id", &asset.id, "--json"], true)?;
     assert_eq!(synced["partialFailure"], false);
     assert_eq!(synced["completed"].as_array().unwrap().len(), 1);
     assert_eq!(library.card_thumbnail(&asset.id)?.unwrap(), preview);
-    let inspected = cli(&binary, &["agent-link", "inspect", "--live", "--asset-id", &asset.id, "--json"], true)?;
+    let inspected = cli(&binary, &session, &["agent-link", "inspect", "--live", "--asset-id", &asset.id, "--json"], true)?;
     assert_eq!(inspected["card"]["status"], "CardValid");
-    cli(&binary, &["agent-link", "finish", "--live", "--summary", "检查 1 项，新增 1 个标签；保留手动标签与预览，尊重 1 项移除覆盖", "--json"], true)?;
+    cli(&binary, &session, &["agent-link", "finish", "--live", "--summary", "检查 1 项，新增 1 个标签；保留手动标签与预览，尊重 1 项移除覆盖", "--json"], true)?;
     let finished = server.snapshot()?;
     assert_eq!(finished.status, "finished"); assert_eq!(finished.percent, Some(100));
     assert!(finished.library_revision > active.library_revision);
@@ -80,22 +81,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     assert!(tags.iter().any(|tag| tag.name == "用途:参考模型" && tag.source == "user"));
     assert!(tags.iter().any(|tag| tag.name == "格式:PMX" && tag.source == "parser"));
     assert!(!tags.iter().any(|tag| tag.name == "造型:像素风"));
-    server.new_session()?;
-    cli(&binary, &["agent-link", "identify", "--live", "--name", "Codex", "--json"], true)?;
+    session=server.new_session()?.session_id;
+    cli(&binary, &session, &["agent-link", "identify", "--live", "--name", "Codex", "--json"], true)?;
     let cancelled = server.cancel()?;
-    let after_cancel = cli(&binary, &["agent-link", "log", "--live", "--message", "旧任务不应继续", "--json"], false)?;
+    let after_cancel = cli(&binary, &session, &["agent-link", "log", "--live", "--message", "旧任务不应继续", "--json"], false)?;
     assert_eq!(after_cancel["error_code"], "AgentLinkError");
     let renewed = server.new_session()?;
+    let old_session = session.clone();session=renewed.session_id.clone();
+    cli(&binary, &session, &["agent-link","identify","--live","--name","Codex","--json"], true)?;
+    let stale=cli(&binary, &old_session, &["agent-link","tags","--live","--name","服装:制服","--asset-id",&asset.id,"--confidence","0.85","--json"], false)?;
+    assert_eq!(stale["error_code"],"AgentLinkError");
+    assert!(!library.list_asset_tags(&asset.id)?.iter().any(|tag|tag.name=="服装:制服"));
     assert_ne!(renewed.session_id, cancelled.session_id);
     let report = json!({"synthetic":true,"source":"Core agentlink_probe with an actual CLI child process and software-rendered PMX preview",
         "roots":[root],"asset":library.inspect_asset(&asset.id)?,"tags":tags,
         "snapshots":{"waiting":waiting,"modelWaiting":model_waiting,"scopedWaiting":scoped_waiting,"active":active,"finished":finished,"cancelled":cancelled,"renewed":renewed},
-        "checks":{"portableCliAndSkill":true,"liveCliIdentity":true,"scopedInventory":true,"manualAndParserTagsPreserved":true,"userRemovalHonored":true,"tagWrittenThroughCore":true,"finishRequiresSync":true,"previewUnchanged":true,"cardValid":true,"completionRefreshRevision":true,"cancelBlocksFurtherRequests":true,"newSessionRotatesIdentity":true}});
+        "checks":{"portableCliAndSkill":true,"liveCliIdentity":true,"scopedInventory":true,"manualAndParserTagsPreserved":true,"userRemovalHonored":true,"tagWrittenThroughCore":true,"finishRequiresSync":true,"previewUnchanged":true,"cardValid":true,"completionRefreshRevision":true,"cancelBlocksFurtherRequests":true,"newSessionRotatesIdentity":true,"oldPromptCannotCrossSessions":true}});
     assert!(!serde_json::to_string(&report)?.contains("\"token\""));
     fs::write(output.join("manifest.json"), serde_json::to_vec_pretty(&report)?)?;
     drop(server);
     assert!(!fixture.join("data/library.sqlite3.agentlink/session.json").exists());
-    let disconnected = cli(&binary, &["agent-link", "inspect", "--live", "--json"], false)?;
+    let disconnected = cli(&binary, &session, &["agent-link", "inspect", "--live", "--json"], false)?;
     assert_eq!(disconnected["error_code"], "AgentLinkError");
     Ok(())
 }

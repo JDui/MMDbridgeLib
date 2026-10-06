@@ -22,6 +22,8 @@ enum Command {
     AgentLink {
         #[arg(long, global = true)]
         live: bool,
+        #[arg(long, global = true)]
+        session: Option<String>,
         #[command(subcommand)]
         command: AgentLinkCommand,
     },
@@ -104,7 +106,7 @@ enum AgentLinkCommand {
     Cancel,
 }
 
-fn run_agent_link(command: AgentLinkCommand) -> Result<CommandOutput, CoreError> {
+fn run_agent_link(session: String,command: AgentLinkCommand) -> Result<CommandOutput, CoreError> {
     let (name,payload)=match command {
         AgentLinkCommand::Identify {name}=>("agent-identify",json!({"name":name})),
         AgentLinkCommand::Inspect {asset_id,limit,cursor}=>{
@@ -121,7 +123,7 @@ fn run_agent_link(command: AgentLinkCommand) -> Result<CommandOutput, CoreError>
         AgentLinkCommand::Finish {summary}=>("agent-finish",json!({"summary":summary})),
         AgentLinkCommand::Cancel=>("agent-cancel",json!({})),
     };
-    let value=mmdbridge_core::agent_link_request(&Library::portable_database_path()?,name,payload,Duration::from_secs(60))?;
+    let value=mmdbridge_core::agent_link_request(&Library::portable_database_path()?,&session,name,payload,Duration::from_secs(60))?;
     let failed=value["partialFailure"]==true;
     Ok(CommandOutput {value,failed})
 }
@@ -374,7 +376,8 @@ fn run() -> Result<CommandOutput, CoreError> {
     let cli = Cli::parse();
     let _json_output = cli.json;
     let command=match cli.command {
-        Command::AgentLink {live:true,command}=>return run_agent_link(command),
+        Command::AgentLink {live:true,session:Some(session),command}=>return run_agent_link(session,command),
+        Command::AgentLink {live:true,session:None,..}=>return Err(CoreError::AgentLink("请使用 Prompt 中的 --session 会话 ID".to_owned())),
         Command::AgentLink {live:false,..}=>return Err(CoreError::AgentLink("AgentLink 命令需要 --live".to_owned())),
         command=>command,
     };

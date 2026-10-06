@@ -13,7 +13,7 @@ Read [the responsibility split and visual taxonomy](references/tag-taxonomy.md) 
 
 When the user supplies the running software's AgentLink Prompt, the live workflow in
 **Writing and manifest sync** takes precedence over ordinary inventory and write
-commands below. Identify through `agent-link identify --live`, read the authoritative
+commands below. Identify through `agent-link identify --live --session <prompt-session-id>`, read the authoritative
 scope and all `nextCursor` pages through `agent-link inspect --live`, and keep all
 tag writes and manifest sync on that live bridge. Never widen the software scope.
 
@@ -51,24 +51,27 @@ Confidence is a heuristic, not a calibrated probability. Core writes parser fact
 ## Writing and manifest sync
 
 When the user supplies an AgentLink Prompt from the running software, use the
-bundled CLI's live bridge: first `agent-link identify --live --name <actual-agent-name>`;
-use `agent-link inspect --live` and its `nextCursor` for a bounded inventory and
+bundled CLI's live bridge: first `agent-link identify --live --session <prompt-session-id> --name <actual-agent-name>`;
+Every live command must also include `--session <session-id-from-the-Prompt>`.
+Keep that ID fixed for this task. Do not read the session file to switch to a newer
+ID or reuse old work after replacement; wait for the user to supply a new Prompt.
+Use `agent-link inspect --live --session <prompt-session-id>` and its `nextCursor` for a bounded inventory and
 `--asset-id` for cards, tags and overrides. The scope in the software is authoritative.
 Use `--limit 100` and pass the entire returned cursor unchanged through
 `--cursor '<nextCursor JSON>'` (escape quoting for the current shell). Continue even
 if `items` is empty when `nextCursor` is non-null; stop only at a null cursor.
 If a cursor repeats, stop and report incomplete coverage rather than looping.
 Single-asset inspection returns `asset`, `tags`, `suppressedTags` and `card`.
-Use `agent-link tags --live --name <tag> --asset-id <id...> --confidence <value>`
-instead of ordinary batch-add, and `agent-link sync-cards --live --asset-id <id...>`
+Use `agent-link tags --live --session <prompt-session-id> --name <tag> --asset-id <id...> --confidence <value>`
+instead of ordinary batch-add, and `agent-link sync-cards --live --session <prompt-session-id> --asset-id <id...>`
 for manifest updates. Tag responses contain `records`, `changed` and `blockedByUser`;
 sync responses contain `completed`, `failed` and `partialFailure`. Re-inspect affected
 IDs through the live bridge and require `card.status=CardValid` and
 `card.hasThumbnail=true` before reporting a synchronized result.
-Report progress with `agent-link log --live --message <text>
+Report progress with `agent-link log --live --session <prompt-session-id> --message <text>
 --percent <0-100>`. Check partial failures, finish only after changed cards are
-current, then `agent-link finish --live --summary <counts-and-omissions>`.
-Stop after cancellation, session expiry or replacement; do not silently fall back
+current, then `agent-link finish --live --session <prompt-session-id> --summary <counts-and-omissions>`.
+Stop after cancellation, session expiry or replacement (including a session-ID mismatch); do not silently fall back
 to offline writes or send further log, sync or finish requests. Report any confirmed
 writes whose sync remains unverified. If the user later supplies a new software
 session, inspect that session's scope and reconcile its stale cards through live
