@@ -6,7 +6,7 @@ import { OrbitControls } from "./vendor/OrbitControls.js";
 import { toUiError } from "./uiError";
 import { sphereCameraDistance } from "./previewCamera";
 import { loadViewerTextures, setMaterialAlpha, setMaterialCentre, sortTransparentMaterials } from "./viewerRendering";
-import { writePreference } from "./preferences";
+import { readPreference, writePreference } from "./preferences";
 import { MATCAP_PRESETS, SCENE_PRESETS, MATCAP_PREFERENCE, SCENE_PREFERENCE, readViewerPreset,
   createMatcapAppearance, applyScenePreset, type MatcapAppearance, type MatcapPreset, type ScenePreset, type SceneLighting } from "./viewerPresets";
 import "./model-viewer.css";
@@ -251,6 +251,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
   const [scenePreset, setScenePreset] = useState<ScenePreset>(() => readViewerPreset(SCENE_PREFERENCE, SCENE_PRESETS));
   const scenePresetRef = useRef(scenePreset);
   const [showReference, setShowReference] = useState(true);
+  const [showSceneGrid, setShowSceneGrid] = useState(() => readPreference("mmdbridge-scene-grid-v1") === "true");
   const [referenceReload, setReferenceReload] = useState(0);
   const [referenceStatus, setReferenceStatus] = useState("");
   const [referenceError, setReferenceError] = useState(false);
@@ -291,6 +292,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       rimLight.position.set(0, -14, 20);
       scene.add(rimLight);
       const grid = new THREE.GridHelper(60, 60, 0x344b52, 0x24363e);
+      grid.visible = asset.assetType !== "scene" || showSceneGrid;
       scene.add(grid);
       const modelRoot = new THREE.Group();
       scene.add(modelRoot);
@@ -683,6 +685,10 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
   }, [scenePreset, isScene]);
 
   useEffect(() => {
+    if (isScene && handles.current) handles.current.grid.visible = showSceneGrid;
+  }, [showSceneGrid, isScene]);
+
+  useEffect(() => {
     const view = handles.current;
     if (!isScene || !showReference || !view) { setReferenceStatus(""); return; }
     let active = true;
@@ -992,7 +998,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
           {error && <div className="model-viewer-message model-viewer-error">模型无法预览：{error}</div>}
           {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls">{asset.assetType === "scene" ? <><span>WASD 移动</span><span>Q 降 / E 升</span><span>Shift 加速 / Ctrl 慢速</span><span>左键 / 右键拖动朝向</span><span>滚轮调整 FOV</span><Button onClick={() => handles.current?.viewOrigin()}>查看原点</Button></> : <><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span></>}<Button onClick={resetCamera}>重置视角</Button></div></>}
         </main>
-      </div><footer className="model-viewer-footer">{isScene ? <div className="scene-reference-controls"><Checkbox size="xs" label="原点参照角色" checked={showReference} disabled={!!error} onChange={(event) => setShowReference(event.currentTarget.checked)} /><span role="status" className={referenceError ? "scene-reference-error" : ""} title={referenceStatus}>{showReference ? referenceStatus : "参照角色已隐藏"}</span><Button size="xs" variant="subtle" disabled={!showReference || !!error} onClick={() => setReferenceReload((count) => count + 1)}>重载角色</Button></div> : "已解析模型权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer></Modal.Body></Modal.Content></Modal.Root>;
+      </div><footer className="model-viewer-footer">{isScene ? <div className="scene-reference-controls"><Checkbox size="xs" label="原点参照角色" checked={showReference} disabled={!!error} onChange={(event) => setShowReference(event.currentTarget.checked)} /><Checkbox size="xs" label="地面网格" checked={showSceneGrid} disabled={!!error} onChange={(event) => { const visible = event.currentTarget.checked; setShowSceneGrid(visible); writePreference("mmdbridge-scene-grid-v1", String(visible)); }} /><span role="status" className={referenceError ? "scene-reference-error" : ""} title={referenceStatus}>{showReference ? referenceStatus : "参照角色已隐藏"}</span><Button size="xs" variant="subtle" disabled={!showReference || !!error || referenceStatus === "正在加载参照角色…"} onClick={() => setReferenceReload((count) => count + 1)}>重载角色</Button></div> : "已解析模型权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer></Modal.Body></Modal.Content></Modal.Root>;
 }
 
 function disposeModelObjects(objects: ModelObjects, handles: SceneHandles | null) {

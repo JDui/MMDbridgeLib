@@ -14,6 +14,7 @@ const { chromium } = require(process.env.MBL_PLAYWRIGHT_MODULE);
 const fixtures = JSON.parse(await fs.readFile(join(output,'viewer-fixtures.json'),'utf8'));
 const compatibility = JSON.parse(await fs.readFile(join(output,'manifest.json'),'utf8'));
 assert.equal(fixtures.synthetic,true);
+const cutout = compatibility.entries.find(({asset})=>asset.name==='PMX-Cutout');assert.ok(cutout);
 const actor = { ...compatibility.entries[0].asset, id:'viewer-character', name:'角色与 Matcap',
   primarySource:fixtures.referencePmx, assetType:'model' };
 const assets = [actor,fixtures.scene,fixtures.motion].map(asset=>({...asset,rootId:`root-${asset.assetType==='model'?0:asset.assetType==='motion'?1:2}`,
@@ -37,13 +38,15 @@ const viewerAssets=${JSON.stringify(assets)};
 const viewerFixtures=${JSON.stringify(fixtures)};
 window.__reviewCalls=[];
 window.__referencePath=viewerFixtures.referencePmx;
+window.__actorPreview='viewer-character-pmx.bin';
 const originalInvoke=window.__TAURI_INTERNALS__.invoke;
 window.__TAURI_INTERNALS__.invoke=async(cmd,args={})=>{
  window.__reviewCalls.push({cmd,args});
  if(cmd==='asset_counts')return {all:3,model:1,motion:1,scene:1,byRoot:{'root-0':1,'root-1':1,'root-2':1}};
  if(cmd==='assets_page')return {items:viewerAssets.filter(a=>(!args.assetType||a.assetType===args.assetType)&&(!args.rootId||a.rootId===args.rootId)),nextCursor:null};
  if(cmd==='asset_inspect')return viewerAssets.find(a=>a.id===args.assetId);
- if(cmd==='model_preview')return (await fetch('/viewer-character-pmx.bin')).arrayBuffer();
+ if(cmd==='model_preview')return (await fetch('/'+window.__actorPreview)).arrayBuffer();
+ if(cmd==='model_preview_texture_file')return (await fetch('/viewer-cutout-texture.bin')).arrayBuffer();
  if(cmd==='scene_preview')return (await fetch('/viewer-scene.bin')).arrayBuffer();
  if(cmd==='motion_preview_model_get')return window.__referencePath;
  if(cmd==='model_preview_file'){
@@ -56,7 +59,7 @@ window.__TAURI_INTERNALS__.invoke=async(cmd,args={})=>{
 };`;
 const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>MBL</title><style id="library-style-nonce"></style><style>${css}</style></head><body><div id="root"></div><script>${bridge}</script><script type="module">${js.replaceAll('</script','<\\/script')}</script></body></html>`;
 const files = new Map();
-for(const name of ['viewer-character-pmx.bin','viewer-character-pmd.bin','viewer-scene.bin']) {
+for(const name of ['viewer-character-pmx.bin','viewer-character-pmd.bin','viewer-scene.bin','viewer-cutout-texture.bin',`${cutout.asset.id}.bin`]) {
   files.set('/'+name,await fs.readFile(join(output,name)));
 }
 const server = http.createServer((request,response)=>{
@@ -119,6 +122,21 @@ try {
   checks.character={finishes,geometryAndCameraPreserved:true,weightColoursPreserved:true,originalRestored:true};
   await page.getByRole('button',{name:'关闭 3D 预览',exact:true}).click();
 
+  await page.evaluate(name=>{window.__actorPreview=name;},`${cutout.asset.id}.bin`);
+  await openAsset(actor.name);await page.getByText('已加载贴图 1 / 1',{exact:true}).waitFor();
+  await page.evaluate(()=>window.__reviewScene.traverse(node=>{if(node.type==='GridHelper')node.visible=false;}));
+  const cutoutBefore=await pixels();
+  await actorSelect.selectOption('ceramic');const cutoutAfter=await pixels();
+  const foreground = rgba => Array.from({length:rgba.length/4},(_,index)=>
+    Math.abs(rgba[index*4]-rgba[0])+Math.abs(rgba[index*4+1]-rgba[1])+Math.abs(rgba[index*4+2]-rgba[2])>50);
+  const beforeMask=foreground(cutoutBefore),afterMask=foreground(cutoutAfter);
+  let overlap=0,union=0;
+  beforeMask.forEach((visible,index)=>{if(visible&&afterMask[index])overlap++;if(visible||afterMask[index])union++;});
+  assert.ok(union>300&&union<6000);assert.ok(overlap/union>0.95,'Matcap changed the cutout silhouette');
+  checks.character.cutoutSilhouetteIoU=overlap/union;
+  await page.getByRole('button',{name:'关闭 3D 预览',exact:true}).click();
+  await page.evaluate(()=>{window.__actorPreview='viewer-character-pmx.bin';});
+
   await openAsset(fixtures.motion.name);
   const motionSelect=page.getByRole('combobox',{name:'动作 Matcap 预设'});
   await page.waitForFunction(()=>!document.querySelector('[aria-label="动作 Matcap 预设"]').disabled);
@@ -145,6 +163,9 @@ try {
   await page.getByRole('status').filter({hasText:'原点 (0, 0, 0)'}).waitFor();
   await page.getByRole('button',{name:'查看原点',exact:true}).click();
   const originalScene=await snapshot();const originalScenePixels=await pixels();
+  const gridToggle=page.getByRole('checkbox',{name:'地面网格'});assert.equal(await gridToggle.isChecked(),false);
+  await gridToggle.check();const withGrid=await pixels();assert.ok(difference(originalScenePixels,withGrid)>5000);
+  await gridToggle.uncheck();
   const reference=originalScene.meshes.find(mesh=>mesh.name==='场景原点参照角色');assert.ok(reference);
   assert.deepEqual(reference.position,[0,0,0]);assert.deepEqual(reference.scale,[1,1,1]);
   const looks={};
@@ -176,6 +197,7 @@ try {
   const previousLoads=await page.evaluate(()=>window.__reviewCalls.filter(call=>call.cmd==='model_preview_file').length);
   await page.getByRole('button',{name:'重载角色',exact:true}).click();
   await page.getByRole('status').filter({hasText:'正在加载参照角色'}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'重载角色',exact:true}).isDisabled(),true);
   await page.waitForFunction(count=>window.__reviewCalls.filter(call=>call.cmd==='model_preview_file').length>count,previousLoads);
   await referenceToggle.uncheck();
   await page.waitForTimeout(450);
@@ -185,7 +207,7 @@ try {
   await openAsset(fixtures.scene.name);await page.getByRole('status').filter({hasText:'原点 (0, 0, 0)'}).waitFor();
   assert.equal(await sceneSelect.inputValue(),'warm');assert.equal((await snapshot()).meshes.filter(mesh=>mesh.name==='场景原点参照角色').length,1);
   checks.scene={looks,origin:[0,0,0],scale:[1,1,1],pmxAndPmdLoaded:true,hiddenAndReloaded:true,
-    missingSettingAndReadFailureRecovered:true,lateLoadDiscarded:true,reopenedWithoutDuplicates:true,presetRemembered:true};
+    missingSettingAndReadFailureRecovered:true,lateLoadDiscarded:true,reopenedWithoutDuplicates:true,presetRemembered:true,gridToggleVerified:true};
   await page.getByRole('button',{name:'关闭 3D 预览',exact:true}).click();
   assert.deepEqual(errors,[]);
   await fs.writeFile(join(output,'viewer-verification.json'),JSON.stringify({sourceCommit:process.env.GITHUB_SHA,

@@ -100,6 +100,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let png = library.model_preview_texture_file(&pmd_path,"tex.png")?.ok_or("PMD texture absent")?;
     fs::write(output.join("preview-texture.png"),png.0)?;
+    let (cutout_png,alpha) = library.model_preview_texture_file(&models.join("PMX-Cutout.pmx"),"cutout.png")?.ok_or("cutout texture absent")?;
+    let mut texture_bytes = vec![alpha]; texture_bytes.extend(cutout_png);
+    fs::write(output.join("viewer-cutout-texture.bin"),texture_bytes)?;
     fs::write(output.join("manifest.json"),serde_json::to_vec_pretty(&json!({"synthetic":true,"entries":manifest}))?)?;
     write_viewer_fixtures(&output, &vertices, &indices)?;
     println!("{}",serde_json::to_string(&json!({"synthetic":true,"rendered":manifest.len(),"models":5,"pmdMotionPreviews":2}))?);
@@ -125,7 +128,7 @@ fn write_viewer_fixtures(output: &std::path::Path,
             transformed.iter_mut().for_each(|value| *value /= length);
             vertices.push((position, transformed, *uv));
         }
-        indices.extend(sphere_indices.iter().map(|index| index + offset));
+        for face in sphere_indices.chunks_exact(3) { indices.extend([face[0]+offset,face[2]+offset,face[1]+offset]); }
     }
     let pmx_path = folder.join("参照角色.pmx");
     let mut pmx = mmd_anim_format::parse_pmx_model(&fixtures::pmx_mesh(false,2,0,false,&vertices,&indices))?;
@@ -152,7 +155,7 @@ fn write_viewer_fixtures(output: &std::path::Path,
         for (position,uv) in points.into_iter().zip([[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0]]) {
             room_vertices.push((position,normal,uv));
         }
-        room_indices.extend([offset,offset+1,offset+2,offset,offset+2,offset+3]);
+        room_indices.extend([offset,offset+2,offset+1,offset,offset+3,offset+2]);
     };
     quad([[-32.0,-0.1,-60.0],[32.0,-0.1,-60.0],[32.0,-0.1,32.0],[-32.0,-0.1,32.0]],[0.0,1.0,0.0]);
     quad([[-32.0,0.0,32.0],[32.0,0.0,32.0],[32.0,36.0,32.0],[-32.0,36.0,32.0]],[0.0,0.0,-1.0]);
