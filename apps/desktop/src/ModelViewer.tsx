@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "./vendor/three.module.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
 import { toUiError } from "./uiError";
+import { sphereCameraDistance } from "./previewCamera";
 import { loadViewerTextures, setMaterialAlpha, setMaterialCentre, sortTransparentMaterials } from "./viewerRendering";
 import "./model-viewer.css";
 
@@ -400,12 +401,11 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
         geometry.computeBoundingSphere();
         const sphere = geometry.boundingSphere;
         const radius = Math.max(sphere.radius, 0.001);
-        const halfFov = (camera.fov * Math.PI / 180) / 2;
-        const homeDistance = radius / Math.sin(halfFov) * 0.85;
+        const homeDistance = sphereCameraDistance(radius, camera.fov, camera.aspect);
         controls.target.copy(sphere.center);
         camera.position.set(sphere.center.x, sphere.center.y + radius * 0.12, sphere.center.z - homeDistance);
         controls.minDistance = Math.max(radius * 0.35, 0.01);
-        controls.maxDistance = radius * 4.5;
+        controls.maxDistance = Math.max(radius * 4.5, homeDistance * 2);
         camera.near = Math.max(radius * 0.01, 0.001);
         camera.far = controls.maxDistance + radius * 4;
         camera.updateProjectionMatrix();
@@ -876,7 +876,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
           {error && <div className="model-viewer-message model-viewer-error">模型无法预览：{error}</div>}
           {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls">{asset.assetType === "scene" ? <><span>WASD 移动</span><span>Q 降 / E 升</span><span>Shift 加速 / Ctrl 慢速</span><span>左键 / 右键拖动朝向</span><span>滚轮调整 FOV</span></> : <><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span></>}<Button onClick={resetCamera}>重置视角</Button></div></>}
         </main>
-      </div><footer className="model-viewer-footer">{asset.assetType === "scene" ? "场景以源文件的世界坐标和材质显示。" : "已解析 PMX 权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer></Modal.Body></Modal.Content></Modal.Root>;
+      </div><footer className="model-viewer-footer">{asset.assetType === "scene" ? "场景以源文件的世界坐标和材质显示。" : "已解析模型权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer></Modal.Body></Modal.Content></Modal.Root>;
 }
 
 function disposeModelObjects(objects: ModelObjects, handles: SceneHandles | null) {

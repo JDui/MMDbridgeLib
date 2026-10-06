@@ -74,7 +74,7 @@ try {
   await page.screenshot({path:join(output,'MBL_Model_Stage3_Library_Light.jpg'),type:'jpeg',quality:92,animations:'disabled'});
   await page.goto(`${url}/?scheme=dark&corrupt=1`);
   await page.getByRole('button',{name:new RegExp(pmd.asset.name)}).first().dblclick();
-  await page.getByText('模型数据截断或区段长度无效',{exact:true}).waitFor();
+  await page.locator('.model-viewer-error').filter({hasText:'模型数据截断或区段长度无效'}).waitFor();
   await page.screenshot({path:join(output,'MBL_Model_Stage4_Load_Error.jpg'),type:'jpeg',quality:92,animations:'disabled'});
   await page.getByRole('button',{name:'关闭 3D 预览',exact:true}).click();
   assert.equal(await page.locator('.asset-card').count(),7);

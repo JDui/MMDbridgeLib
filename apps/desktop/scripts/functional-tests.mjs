@@ -10,12 +10,22 @@ const app = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const temporary = await mkdtemp(join(tmpdir(), "mmdbridge-functional-"));
 after(async () => { await rm(temporary, { recursive: true }); });
 const bundle = await build({
-  stdin: { contents: 'export * from "./src/preferences"; export * from "./src/libraryState"; export * from "./src/frameRequests";', resolveDir: app, loader: "ts" },
+  stdin: { contents: 'export * from "./src/preferences"; export * from "./src/libraryState"; export * from "./src/frameRequests"; export * from "./src/previewCamera";', resolveDir: app, loader: "ts" },
   bundle: true, platform: "node", format: "esm", write: false,
 });
 const modulePath = join(temporary, "functions.mjs");
 await writeFile(modulePath, bundle.outputFiles[0].text);
-const { readPreference, writePreference, readAssetViewState, visibleSelection, activeThumbnailStatuses, createFrameRequestQueue } = await import(pathToFileURL(modulePath).href);
+const { readPreference, writePreference, readAssetViewState, visibleSelection, activeThumbnailStatuses, createFrameRequestQueue, sphereCameraDistance } = await import(pathToFileURL(modulePath).href);
+
+test("initial camera fits a whole sphere in wide and narrow viewports", () => {
+  for (const aspect of [0.35,0.55,1,1.3,2.1]) {
+    const distance = sphereCameraDistance(4,42,aspect);
+    const objectHalfAngle = Math.asin(4 / distance);
+    const verticalHalf = 42 * Math.PI / 360;
+    const horizontalHalf = Math.atan(Math.tan(verticalHalf) * aspect);
+    assert.ok(objectHalfAngle < verticalHalf && objectHalfAngle < horizontalHalf, `clipped at aspect ${aspect}`);
+  }
+});
 
 const storage = new Map();
 function workingStorage() {
