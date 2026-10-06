@@ -97,7 +97,16 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
       (reason) => { playingRef.current = false; setPlaying(false); setError(toUiError(reason)); },
     );
     frameQueue.current = queue;
-    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    let renderer: any;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    } catch (reason) {
+      queue.dispose();
+      if (frameQueue.current === queue) frameQueue.current = null;
+      setError(`3D 渲染初始化失败：${toUiError(reason)}`);
+      setLoading(false);
+      return;
+    }
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setClearColor(0x10191f, 1);
     renderer.outputColorSpace = THREE.SRGBColorSpace;

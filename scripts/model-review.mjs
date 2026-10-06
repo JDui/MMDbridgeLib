@@ -53,6 +53,13 @@ let browser;
 try {
   browser=await chromium.launch({headless:true,args:['--use-angle=swiftshader','--enable-unsafe-swiftshader']});
   const page=await browser.newPage({viewport:{width:1480,height:960},locale:'zh-CN',reducedMotion:'reduce'});
+  await page.addInitScript(()=>{
+    const getContext=HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext=function(type,...args){
+      if(new URLSearchParams(location.search).has('nogpu')&&/^(webgl2?|experimental-webgl)$/.test(type))return null;
+      return getContext.call(this,type,...args);
+    };
+  });
   page.setDefaultTimeout(20000);const errors=[];page.on('pageerror',error=>errors.push(error.message));
   const url=`http://127.0.0.1:${server.address().port}`;
   await page.goto(`${url}/?scheme=dark`);
@@ -91,7 +98,14 @@ try {
     });
   });
   assert.equal(decoded.length,7);assert.ok(decoded.every(image=>image.nonBackgroundPixels>10000));
+  await page.goto(`${url}/?scheme=dark&nogpu=1`);
+  const motion=manifest.entries.find(entry=>entry.asset.primarySource.toLowerCase().endsWith('.vmd'));assert.ok(motion);
+  await page.getByRole('button',{name:new RegExp(motion.asset.name)}).first().dblclick();
+  await page.locator('.model-viewer-error').filter({hasText:'3D 渲染初始化失败'}).waitFor();
+  await page.screenshot({path:join(output,'MBL_Model_Stage5_No_GPU.jpg'),type:'jpeg',quality:92,animations:'disabled'});
+  await page.getByRole('button',{name:'关闭动作预览',exact:true}).click();
+  assert.equal(await page.locator('.asset-card').count(),7);assert.deepEqual(errors,[]);
   await fs.writeFile(join(output,'ui-verification.json'),JSON.stringify({sourceCommit:process.env.GITHUB_SHA,synthetic:true,headless:true,
-    decoded,pmdViewerLoaded:true,loadErrorClosed:true,pageErrors:errors},null,2));
-  console.log('Seven Core-generated previews decoded; PMD weights loaded; load-error recovery verified.');
+    decoded,pmdViewerLoaded:true,loadErrorClosed:true,noGpuErrorClosed:true,pageErrors:errors},null,2));
+  console.log('Seven Core-generated previews decoded; PMD weights loaded; load-error and no-GPU recovery verified.');
 } finally {await browser?.close();await new Promise(resolve=>server.close(resolve));}
