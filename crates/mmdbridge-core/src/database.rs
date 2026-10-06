@@ -1121,7 +1121,7 @@ impl Library {
         crate::scan_queue::enqueue_inline(self, root_id)?;
         let work = self.claim_pending_scan(root_id)?
             .ok_or_else(|| CoreError::InvalidRoot("该目录已有扫描任务或文件操作占用；请在任务队列中管理".to_owned()))?;
-        self.scan_with_work(root_id, &work)
+        self.scan_with_work(root_id, &work, false)
     }
 
     pub(crate) fn scan_queued_root(
@@ -1129,13 +1129,14 @@ impl Library {
         root_id: &str,
         work: &crate::types::ScanWork,
     ) -> CoreResult<ScanReport> {
-        self.scan_with_work(root_id, work)
+        self.scan_with_work(root_id, work, true)
     }
 
     fn scan_with_work(
         &self,
         root_id: &str,
         work: &crate::types::ScanWork,
+        queue_color_previews: bool,
     ) -> CoreResult<ScanReport> {
         let _scan_guard = self.scan_lock.lock().map_err(|_| CoreError::LockPoisoned)?;
         let root = {
@@ -1156,7 +1157,15 @@ impl Library {
         if !root.enabled {
             return Err(CoreError::RootDisabled(root_id.to_owned()));
         }
-        let result = scanner::scan(self, &root, work);
+        let result = scanner::scan(self, &root, work).and_then(|report| {
+            if queue_color_previews && root.asset_type == AssetType::Model && self.auto_tag_settings()?.colors {
+                self.update_scan_progress(root_id, "Verifying", 0.98, report.files_seen, report.files_seen)?;
+                self.queue_pending_cards_with_progress(root_id, &mut || {
+                    self.update_scan_progress(root_id, "Verifying", 0.98, report.files_seen, report.files_seen)
+                })?;
+            }
+            Ok(report)
+        });
         self.finish_scan(root_id, work, &result)?;
         result
     }
@@ -1883,6 +1892,12 @@ impl Library {
     }
 
     pub fn queue_pending_cards(&self, root_id: &str) -> CoreResult<Vec<String>> {
+        self.queue_pending_cards_with_progress(root_id, &mut || Ok(()))
+    }
+
+    fn queue_pending_cards_with_progress(
+        &self, root_id: &str, progress: &mut dyn FnMut() -> CoreResult<()>,
+    ) -> CoreResult<Vec<String>> {
         let root = self.list_roots()?.into_iter()
             .find(|root| root.id == root_id)
             .ok_or_else(|| CoreError::RootNotFound(root_id.to_owned()))?;
@@ -1896,7 +1911,8 @@ impl Library {
         let mut job_ids = Vec::new();
         loop {
             let page = self.list_asset_page(Some(root.asset_type), None, Some(root_id), false, cursor.as_ref(), 500, None, None, true)?;
-            for asset in page.items {
+            for (index, asset) in page.items.into_iter().enumerate() {
+                if index % 16 == 0 { progress()?; }
                 if asset.statuses.iter().any(|status| matches!(status.as_str(),
                     "MissingSource" | "ParseFailed" | "Unsupported")) { continue; }
                 let extension = Path::new(&asset.primary_source).extension().and_then(|value| value.to_str());

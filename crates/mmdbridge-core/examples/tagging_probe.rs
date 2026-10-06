@@ -1,4 +1,4 @@
-use std::{error::Error, fs, path::PathBuf};
+use std::{error::Error, fs, path::PathBuf, thread, time::{Duration, Instant}};
 use mmdbridge_core::{AssetType, Library};
 use serde_json::json;
 
@@ -64,8 +64,45 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     assert_eq!(library.scan_root(&root.id)?.assets_unchanged, 2);
+    // Desktop and CLI queue scans must schedule colour previews automatically.
+    let queued = output.join("queued-models"); fs::create_dir(&queued)?;
+    fs::copy(models.join("蓝色材质测试.pmx"), queued.join("queued.pmx"))?;
+    fs::copy(models.join("blue.png"), queued.join("blue.png"))?;
+    let queued_root = library.add_root(AssetType::Model, queued.to_str().ok_or("invalid path")?, None)?;
+    library.enqueue_scan(&queued_root.id)?;
+    wait_scan(&library, &queued_root.id)?;
+    let queued_asset = library.list_assets(Some(AssetType::Model), None, 10)?.into_iter().find(|asset| asset.root_id == queued_root.id).ok_or("queued asset absent")?;
+    let job = library.list_jobs()?.into_iter().find(|job| job["asset_id"] == queued_asset.id).ok_or("scan did not enqueue thumbnail")?;
+    let terminal = library.wait_for_job(job["id"].as_str().ok_or("job id absent")?, Duration::from_secs(30))?;
+    assert_eq!(terminal["status"], "Completed", "{terminal}");
+    assert!(library.list_asset_tags(&queued_asset.id)?.iter().any(|tag| tag.name == "整体色:蓝色"));
+    library.set_auto_tag_settings(&mmdbridge_core::AutoTagSettings { technical:true, colors:false })?;
+    let paused = output.join("disabled-models"); fs::create_dir(&paused)?;
+    fs::copy(models.join("蓝色材质测试.pmx"), paused.join("disabled.pmx"))?;
+    fs::copy(models.join("blue.png"), paused.join("blue.png"))?;
+    let paused_root = library.add_root(AssetType::Model, paused.to_str().ok_or("invalid path")?, None)?;
+    library.enqueue_scan(&paused_root.id)?; wait_scan(&library, &paused_root.id)?;
+    let paused_asset = library.list_assets(Some(AssetType::Model), None, 10)?.into_iter().find(|asset| asset.root_id == paused_root.id).ok_or("disabled asset absent")?;
+    assert!(!library.list_jobs()?.iter().any(|job| job["asset_id"] == paused_asset.id));
+    assert!(library.list_asset_tags(&paused_asset.id)?.iter().any(|tag| tag.name == "技术:含SDEF"));
+    library.set_auto_tag_settings(&mmdbridge_core::AutoTagSettings::default())?;
+    library.enqueue_scan(&paused_root.id)?; wait_scan(&library, &paused_root.id)?;
+    let job = library.list_jobs()?.into_iter().find(|job| job["asset_id"] == paused_asset.id).ok_or("reenabling did not schedule preview")?;
+    assert_eq!(library.wait_for_job(job["id"].as_str().ok_or("job id absent")?, Duration::from_secs(30))?["status"], "Completed");
+    assert!(library.list_asset_tags(&paused_asset.id)?.iter().any(|tag| tag.name == "整体色:蓝色"));
     fs::write(output.join("manifest.json"), serde_json::to_vec_pretty(&json!({
-        "synthetic":true,"entries":entries,"checks":{"technicalAtScan":true,"coloursAfterThumbnail":true,"missingTextureSkipped":true,"userRemovalRespected":true,"userPalettePreserved":true,"previewReusedForTagChanges":true,"cardValid":true,"unchangedRescan":true}
+        "synthetic":true,"entries":entries,"checks":{"technicalAtScan":true,"coloursAfterThumbnail":true,"missingTextureSkipped":true,"userRemovalRespected":true,"userPalettePreserved":true,"previewReusedForTagChanges":true,"cardValid":true,"unchangedRescan":true,"queuedScanSchedulesPreview":true,"disabledColoursSkipQueue":true,"reenabledColoursResume":true}
     }))?)?;
     Ok(())
+}
+
+fn wait_scan(library: &Library, root_id: &str) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = library.list_scan_states()?.into_iter().find(|state| state.root_id == root_id).ok_or("scan absent")?;
+        if state.status == "Completed" { return Ok(()); }
+        if matches!(state.status.as_str(), "Failed" | "Cancelled" | "Paused") { return Err(format!("scan stopped: {:?}", state).into()); }
+        if Instant::now() >= deadline { return Err("scan timed out".into()); }
+        thread::sleep(Duration::from_millis(25));
+    }
 }

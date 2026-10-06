@@ -55,11 +55,23 @@ impl Library {
     }
 
     pub fn set_auto_tag_settings(&self, settings: &AutoTagSettings) -> CoreResult<AutoTagSettings> {
-        self.connection()?.execute(
+        let previous = self.auto_tag_settings()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT INTO settings(key,value_json,updated_at) VALUES ('auto_tags',?1,?2)
              ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
             params![serde_json::to_string(settings)?, Utc::now().to_rfc3339()],
         )?;
+        if settings.colors && !previous.colors {
+            // A subsequent queued scan can analyse existing previews through the
+            // cache even when their technical facts were already up to date.
+            transaction.execute(
+                "UPDATE cards SET status='CardStale' WHERE status='CardValid' AND asset_id IN
+                 (SELECT id FROM assets WHERE asset_type='model' AND visibility='normal' AND retired_format=0)", [],
+            )?;
+        }
+        transaction.commit()?;
         Ok(settings.clone())
     }
 }
