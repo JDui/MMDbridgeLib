@@ -19,9 +19,6 @@ jobs:
     timeout-minutes: 20
     env:
       CARGO_BUILD_JOBS: 2
-      MBL_MODEL_REVIEW: ${{ runner.temp }}/mbl-model-review
-      MBL_PLAYWRIGHT_MODULE: ${{ runner.temp }}/mbl-browser-test/node_modules/playwright
-      XDG_RUNTIME_DIR: ${{ runner.temp }}/mbl-xdg
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -29,7 +26,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y mesa-vulkan-drivers fonts-noto-cjk
-          mkdir -m 700 "$XDG_RUNTIME_DIR"
+          mkdir -m 700 "$RUNNER_TEMP/mbl-xdg"
+          echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/mbl-xdg" >> "$GITHUB_ENV"
+          echo "MBL_MODEL_REVIEW=$RUNNER_TEMP/mbl-model-review" >> "$GITHUB_ENV"
+          echo "MBL_PLAYWRIGHT_MODULE=$RUNNER_TEMP/mbl-browser-test/node_modules/playwright" >> "$GITHUB_ENV"
       - name: Parse and render synthetic PMX and PMD fixtures
         run: cargo run --locked -p mmdbridge-core --example compatibility_probe -- "$MBL_MODEL_REVIEW"
       - uses: actions/setup-node@v5
@@ -50,5 +50,5 @@ jobs:
         if: always()
         with:
           name: MBL-Model-Compatibility
-          path: ${{ runner.temp }}/mbl-model-review
+          path: ${{ env.MBL_MODEL_REVIEW }}
           if-no-files-found: warn
