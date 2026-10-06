@@ -961,7 +961,7 @@ export default function App() {
     const path = await open({
       multiple: false,
       title: "选择 Motion Preview Model",
-      filters: [{ name: "PMX 模型", extensions: ["pmx"] }],
+      filters: [{ name: "PMX / PMD 模型", extensions: ["pmx", "pmd"] }],
     });
     if (typeof path !== "string" || !path.trim()) return;
     setSettingsBusy(true);
@@ -1651,7 +1651,7 @@ export default function App() {
         }}>
           <div className="page-heading">
             <div className="heading-copy"><h1>{activeTitle}<span className="heading-count">{(showIndexedTotal ? indexedTotal : visibleAssets.length).toLocaleString()}{!showIndexedTotal && nextAssetCursor ? "+" : ""}</span></h1></div>
-            <div className="view-controls"><Button variant="filled" className="open-model-button" leftSection={<Plus size={16} aria-hidden="true" />} onClick={() => void openModelPreview()}>打开 PMX</Button><label className="card-size-control">视图大小 <Slider  min={130} max={300} step={10} value={cardSize} thumbLabel="资产卡片大小" onChange={(value) => setCardSize(value)} /></label></div>
+            <div className="view-controls"><Button variant="filled" className="open-model-button" leftSection={<Plus size={16} aria-hidden="true" />} onClick={() => void openModelPreview()}>打开模型</Button><label className="card-size-control">视图大小 <Slider  min={130} max={300} step={10} value={cardSize} thumbLabel="资产卡片大小" onChange={(value) => setCardSize(value)} /></label></div>
           </div>
 
           <Tabs value={activeType} onChange={(value) => { if (value) selectCategory(value as AssetType | "all", viewMode === "folders"); }}>
@@ -1847,7 +1847,7 @@ export default function App() {
           </div>}
           {entry.status === "RecoveryNeeded" && <Button className="journal-resolve-button" onClick={() => void resolveJournalEntry(entry)}>已人工恢复并重扫，标记已核对</Button>}
         </article>) : <div className="jobs-panel-empty">暂无资产文件操作记录</div>}</div></Modal>}
-      {settingsOpen && <Modal opened onClose={() => { setSettingsOpen(false); }} title={<div><strong id="settings-title">外观与设置</strong></div>} size={620} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "settings-modal" }}><AppearanceSettings />{settingsError && <Alert color="red" role="alert" mb="sm">{settingsError}</Alert>}<div className="settings-field"><label>动作预览模型</label><p>选择用于动作和姿势缩略图的 PMX 模型。VMD 使用首帧或第一关键帧；包含镜头轨道时按镜头取景。</p><div className="settings-model-path" title={motionPreviewModel ?? "尚未设置"}>{motionPreviewModel ?? "尚未设置模型"}</div><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void chooseMotionPreviewModel()}>{settingsBusy ? "正在保存…" : "选择 PMX 模型"}</Button><Button disabled={settingsBusy || !motionPreviewModel} onClick={() => void clearMotionPreviewModel()}>清除</Button></div></div><div className="settings-field"><label>缩略图</label><p>重新生成在后台执行，可取消或重试。尚未设置预览模型时会跳过动作。</p><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void regenerateAllThumbnails()}>{settingsBusy ? "正在加入队列…" : "重新生成全部缩略图"}</Button></div>{notice && <p role="status">{notice}</p>}</div><div className="settings-field concurrency-settings"><label>缩略图阶段并发上限</label><p>分别限制解析、GPU 渲染和 WebP 编码。自动模式会按设备资源选择；每阶段可设 1–8 路，渲染自动模式为 1 路。</p>
+      {settingsOpen && <Modal opened onClose={() => { setSettingsOpen(false); }} title={<div><strong id="settings-title">外观与设置</strong></div>} size={620} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "settings-modal" }}><AppearanceSettings />{settingsError && <Alert color="red" role="alert" mb="sm">{settingsError}</Alert>}<div className="settings-field"><label>动作预览模型</label><p>选择用于动作和姿势缩略图的 PMX 或 PMD 模型。VMD 使用首帧或第一关键帧；包含镜头轨道时按镜头取景。</p><div className="settings-model-path" title={motionPreviewModel ?? "尚未设置"}>{motionPreviewModel ?? "尚未设置模型"}</div><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void chooseMotionPreviewModel()}>{settingsBusy ? "正在保存…" : "选择模型"}</Button><Button disabled={settingsBusy || !motionPreviewModel} onClick={() => void clearMotionPreviewModel()}>清除</Button></div></div><div className="settings-field"><label>缩略图</label><p>重新生成在后台执行，可取消或重试。尚未设置预览模型时会跳过动作。</p><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void regenerateAllThumbnails()}>{settingsBusy ? "正在加入队列…" : "重新生成全部缩略图"}</Button></div>{notice && <p role="status">{notice}</p>}</div><div className="settings-field concurrency-settings"><label>缩略图阶段并发上限</label><p>分别限制解析、GPU 渲染和 WebP 编码。自动模式会按设备资源选择；每阶段可设 1–8 路，渲染自动模式为 1 路。</p>
           {(["parse", "render", "encode"] as const).map((stage) => {
             const value = thumbnailConcurrencyDraft[stage];
             const selection = value === null ? "auto" : ([1, 2, 4, 8].includes(value) ? String(value) : "custom");

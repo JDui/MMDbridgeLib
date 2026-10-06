@@ -57,3 +57,17 @@ fn truncated_legacy_models_and_oversized_counts_fail_without_allocating_declared
     let path = directory.0.join("損坏.pmx"); let mut pmx = fixtures::pmx(false,1,0,false); pmx[10] = 255;
     std::fs::write(&path, pmx).unwrap(); assert!(library.model_preview_file(&path).is_err());
 }
+
+#[test]
+fn legacy_pmd_can_be_selected_for_motion_but_an_unusable_runtime_cannot() {
+    let directory = FixtureDirectory::new(); let library = Library::in_memory().unwrap();
+    let path = directory.0.join("旧模型.pmd"); std::fs::write(&path, fixtures::pmd(false, "")).unwrap();
+    assert!(library.set_motion_preview_model(Some(path.to_str().unwrap())).unwrap().is_some());
+    let saved = library.motion_preview_model().unwrap();
+    let path = directory.0.join("循环骨架.pmx");
+    let mut parsed = mmd_anim_format::parse_pmx_model(&fixtures::pmx(false,1,0,false)).unwrap();
+    parsed.skeleton.bones[0].parent_index = 1;
+    std::fs::write(&path, mmd_anim_format::export_pmx_model(&parsed)).unwrap();
+    assert!(library.set_motion_preview_model(Some(path.to_str().unwrap())).is_err());
+    assert_eq!(library.motion_preview_model().unwrap(), saved);
+}

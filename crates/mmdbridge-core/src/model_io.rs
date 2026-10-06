@@ -1,6 +1,8 @@
 use std::{fs::File, io::Read, path::Path};
 
 use mmd_anim_format::{PmdParsedModel, PmxParsedModel, pmx};
+use mmd_anim_runtime::{BoneIndex, ModelArena, MorphIndex};
+use std::collections::HashMap;
 
 pub(crate) const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -32,6 +34,26 @@ pub(crate) fn parse_pmd_model(bytes: &[u8]) -> Result<PmdParsedModel, String> {
 pub(crate) fn is_model_path(path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("pmx") || value.eq_ignore_ascii_case("pmd"))
+}
+
+pub(crate) struct ModelRuntime {
+    pub model: ModelArena,
+    pub bone_name_to_index: HashMap<Vec<u8>, BoneIndex>,
+    pub morph_name_to_index: HashMap<Vec<u8>, MorphIndex>,
+    pub ik_solver_bone_name_to_index: HashMap<Vec<u8>, usize>,
+}
+
+pub(crate) fn import_model_runtime(bytes: &[u8]) -> Result<ModelRuntime, String> {
+    if bytes.starts_with(b"Pmd") {
+        validate_pmd(bytes)?;
+        let value = mmd_anim_format::import_pmd_runtime(bytes).map_err(|error| error.to_string())?;
+        Ok(ModelRuntime { model: value.model, bone_name_to_index: value.bone_name_to_index,
+            morph_name_to_index: value.morph_name_to_index, ik_solver_bone_name_to_index: value.ik_solver_bone_name_to_index })
+    } else {
+        let (value, _) = crate::pmx_runtime::import_pmx_runtime_compatible(bytes).map_err(|error| error.to_string())?;
+        Ok(ModelRuntime { model: value.model, bone_name_to_index: value.bone_name_to_index,
+            morph_name_to_index: value.morph_name_to_index, ik_solver_bone_name_to_index: value.ik_solver_bone_name_to_index })
+    }
 }
 
 struct Layout<'a> { bytes: &'a [u8], position: usize }

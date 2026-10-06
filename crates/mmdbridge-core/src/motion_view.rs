@@ -6,7 +6,7 @@ use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
 use crate::{AssetType, CoreError, CoreResult, Library};
-use crate::pmx_runtime::import_pmx_runtime_compatible;
+use crate::model_io::import_model_runtime;
 
 const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 static SESSION: OnceLock<Mutex<Option<MotionViewSession>>> = OnceLock::new();
@@ -69,8 +69,8 @@ fn create_session(motion_path: PathBuf, model_path: PathBuf, paired_path: Option
         .chain(own_camera.iter().map(|frame| frame.frame))
         .chain(paired_camera.iter().map(|frame| frame.frame))
         .max().unwrap_or(0);
-    let (imported, _) = import_pmx_runtime_compatible(&read_limited(&model_path)?)
-        .map_err(|error| CoreError::ModelPreview(format!("PMX 骨架解析失败：{error}")))?;
+    let imported = import_model_runtime(&read_limited(&model_path)?)
+        .map_err(|error| CoreError::ModelPreview(format!("模型骨架解析失败：{error}")))?;
     let clip = vmd::build_pair_clip(
         &animation,
         &imported.bone_name_to_index,
@@ -90,7 +90,7 @@ pub(crate) fn frame(library: &Library, asset_id: &str, requested_frame: u32) -> 
         return Err(CoreError::ModelPreview("3D 动作预览需要 VMD 资产".to_owned()));
     }
     let model_path = library.motion_preview_model()?.ok_or_else(||
-        CoreError::ModelPreview("请先设置动作预览模型 PMX".to_owned()))?;
+        CoreError::ModelPreview("请先设置动作预览模型 PMX / PMD".to_owned()))?;
     let motion_path = PathBuf::from(&asset.primary_source);
     let model_path = PathBuf::from(model_path);
     let paired_path = paired_camera_path(library, asset_id)?;

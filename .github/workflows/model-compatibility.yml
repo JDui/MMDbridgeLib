@@ -1,0 +1,54 @@
+name: Model compatibility and offscreen rendering
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/mmdbridge-core/**'
+      - 'apps/desktop/src/**'
+      - 'scripts/model-review*'
+      - '.github/workflows/model-compatibility.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      MBL_MODEL_REVIEW: ${{ runner.temp }}/mbl-model-review
+      MBL_PLAYWRIGHT_MODULE: ${{ runner.temp }}/mbl-browser-test/node_modules/playwright
+      XDG_RUNTIME_DIR: ${{ runner.temp }}/mbl-xdg
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare software Vulkan
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mesa-vulkan-drivers fonts-noto-cjk
+          mkdir -m 700 "$XDG_RUNTIME_DIR"
+      - name: Parse and render synthetic PMX and PMD fixtures
+        run: cargo run --locked -p mmdbridge-core --example compatibility_probe -- "$MBL_MODEL_REVIEW"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+        working-directory: apps/desktop
+      - name: Prepare isolated headless browser
+        run: |
+          mkdir -p "$RUNNER_TEMP/mbl-browser-test"
+          npm install --prefix "$RUNNER_TEMP/mbl-browser-test" --no-save --no-package-lock playwright@1.62.1
+          "$RUNNER_TEMP/mbl-browser-test/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Verify image decoding and model UI loading
+        run: node scripts/model-review.mjs
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: MBL-Model-Compatibility
+          path: ${{ runner.temp }}/mbl-model-review
+          if-no-files-found: warn

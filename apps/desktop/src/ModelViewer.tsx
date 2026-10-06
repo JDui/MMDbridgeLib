@@ -800,7 +800,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
   const totalWarnings = model?.stats.warnings.length ?? 0;
   const modeHelp: Record<ViewerMode, string> = {
     texture: "显示模型材质贴图；贴图会在网格出现后逐张加载。",
-    materials: "按 PMX 漫反射色查看各材质分区。",
+    materials: "按模型漫反射色查看各材质分区。",
     types: "按 BDEF / SDEF / QDEF 类型着色；点击图例可淡化或恢复对应类型。",
     bone: "选择骨骼后显示该骨骼在每个顶点上的权重，0 到 1 使用热力色阶。",
     anomaly: "高亮权重和偏离 1、零半径 SDEF 和无效多骨骼绑定。",

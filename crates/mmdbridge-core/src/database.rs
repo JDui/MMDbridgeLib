@@ -1438,7 +1438,7 @@ impl Library {
         let bytes = read_source(path)?;
         let parsed =
             parse_pmx_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?;
-        crate::thumbnail::remember_preview_textures(path, &metadata, parsed.materials.iter().map(|material| material.texture_path.clone()));
+        crate::thumbnail::remember_preview_textures(path, &metadata, parsed.materials.iter().flat_map(|material| [material.texture_path.clone(), material.sphere_texture_path.clone(), material.toon_texture_path.clone()]));
         let geometry = parsed.geometry;
         let vertex_count = geometry.positions.len() / 3;
         if geometry.positions.len() != vertex_count * 3
@@ -1662,13 +1662,10 @@ impl Library {
     pub fn set_motion_preview_model(&self, path: Option<&str>) -> CoreResult<Option<String>> {
         let normalized_path = if let Some(path) = path.filter(|path| !path.trim().is_empty()) {
             let source = Path::new(path);
-            if !source
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("pmx"))
+            if !crate::model_io::is_model_path(source)
             {
                 return Err(CoreError::ThumbnailRender(
-                    "动作预览模型必须是 PMX 文件".to_owned(),
+                    "动作预览模型必须是 PMX 或 PMD 文件".to_owned(),
                 ));
             }
             let metadata = std::fs::metadata(source)?;
@@ -1677,9 +1674,14 @@ impl Library {
                     "动作预览模型超过 512 MiB 解析上限".to_owned(),
                 ));
             }
-            let bytes = std::fs::read(source)?;
-            parse_pmx_model(&bytes).map_err(|error| {
-                CoreError::ThumbnailRender(format!("动作预览模型 PMX 解析失败：{error}"))
+            let bytes = read_source(source)?;
+            if source.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("pmd")) {
+                crate::model_io::parse_pmd_model(&bytes).map_err(CoreError::ThumbnailRender)?;
+            } else {
+                parse_pmx_model(&bytes).map_err(CoreError::ThumbnailRender)?;
+            }
+            crate::model_io::import_model_runtime(&bytes).map_err(|error| {
+                CoreError::ThumbnailRender(format!("动作预览模型骨架不可用：{error}"))
             })?;
             Some(
                 std::fs::canonicalize(source)?
@@ -1797,7 +1799,7 @@ impl Library {
             let motion_preview_model = if asset.asset_type == AssetType::Motion {
                 Some(self.motion_preview_model()?.ok_or_else(|| {
                     CoreError::ThumbnailRender(
-                        "请先在设置中指定 Motion Preview Model（PMX）".to_owned(),
+                        "请先在设置中指定 动作预览模型（PMX / PMD）".to_owned(),
                     )
                 })?)
             } else {
@@ -1886,7 +1888,7 @@ impl Library {
             .ok_or_else(|| CoreError::RootNotFound(root_id.to_owned()))?;
         if root.asset_type == AssetType::Motion && self.motion_preview_model()?.is_none() {
             return Err(CoreError::ThumbnailRender(
-                "请先在设置中指定 Motion Preview Model（PMX）".to_owned(),
+                "请先在设置中指定 动作预览模型（PMX / PMD）".to_owned(),
             ));
         }
         let renderer_revision = crate::cards::expected_renderer_revision(self, root.asset_type)?;
@@ -1944,13 +1946,13 @@ impl Library {
             .is_some_and(|extension| asset.asset_type.supports_thumbnail_extension(extension));
         if !supported {
             return Err(CoreError::ThumbnailRender(
-                "当前渲染器支持 PMX 模型/场景、PMD 场景，以及配置了 Motion Preview Model 的 VMD/VPD 动作".to_owned(),
+                "当前渲染器支持 PMX / PMD 模型和场景，以及配置了 Motion Preview Model 的 VMD/VPD 动作".to_owned(),
             ));
         }
         if asset.asset_type == AssetType::Motion {
             let model_path = self.motion_preview_model()?.ok_or_else(|| {
                 CoreError::ThumbnailRender(
-                    "请先在设置中指定 Motion Preview Model（PMX）".to_owned(),
+                    "请先在设置中指定 动作预览模型（PMX / PMD）".to_owned(),
                 )
             })?;
             match extension.map(str::to_ascii_lowercase).as_deref() {

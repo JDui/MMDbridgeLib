@@ -23,14 +23,22 @@ use crate::{CoreError, CoreResult};
 const WIDTH: u32 = 1024;
 const HEIGHT: u32 = 1024;
 const QUALITY: f32 = 50.0;
-pub(crate) const RENDERER_VERSION: &str = "0.5.2";
-pub(crate) const PREVIEW_SETTINGS_VERSION: &str = "front-minus-z-down5-min-bounds-soft-matcap-v8";
-pub(crate) const SCENE_PREVIEW_SETTINGS_VERSION: &str = "scene-center-165cm-down5-wide-camera-soft-matcap-v4";
+pub(crate) const RENDERER_VERSION: &str = "0.6.0";
+pub(crate) const PREVIEW_SETTINGS_VERSION: &str = "front-minus-z-down5-indexed-bounds-msaa-v9";
+pub(crate) const SCENE_PREVIEW_SETTINGS_VERSION: &str = "scene-center-165cm-down5-wide-camera-msaa-v5";
 const MAX_TEXTURE_DIMENSION: u32 = 4096;
 const MAX_TEXTURE_DECODE_DIMENSION: u32 = 8192;
 const MAX_TEXTURE_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 
-static RENDERER: OnceLock<Result<GpuRenderer, String>> = OnceLock::new();
+static RENDERER: OnceLock<Mutex<Option<Arc<GpuRenderer>>>> = OnceLock::new();
+
+fn renderer() -> CoreResult<Arc<GpuRenderer>> {
+    let mut cached = RENDERER.get_or_init(|| Mutex::new(None)).lock().map_err(|_| CoreError::LockPoisoned)?;
+    if let Some(renderer) = cached.as_ref() { return Ok(Arc::clone(renderer)); }
+    // Do not cache an initialization failure: a later retry may find a usable adapter.
+    let renderer = Arc::new(pollster::block_on(GpuRenderer::new()).map_err(CoreError::ThumbnailRender)?);
+    *cached = Some(Arc::clone(&renderer)); Ok(renderer)
+}
 
 struct PreviewTextureReferences {
     size: u64,
@@ -61,9 +69,9 @@ pub(crate) fn check_preview_texture(path: &Path, texture_path: &str) -> CoreResu
         let paths: Vec<String> = if path.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("pmx")) {
             let bytes = read_source(path)?;
             parse_pmx_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?
-                .materials.into_iter().map(|material| material.texture_path).collect()
+                .materials.into_iter().flat_map(|material| [material.texture_path, material.sphere_texture_path, material.toon_texture_path]).collect()
         } else {
-            scene_view_input(path)?.materials.into_iter().map(|material| material.texture_path).collect()
+            scene_view_input(path)?.materials.into_iter().flat_map(|material| [material.texture_path, material.sphere_texture_path, material.toon_texture_path]).collect()
         };
         let referenced = paths.iter().any(|value| value == texture_path);
         remember_preview_textures(path, &metadata, paths.into_iter());
@@ -86,6 +94,8 @@ pub struct ThumbnailRenderReport {
     pub height: u32,
     pub format: String,
     pub quality: u8,
+    #[serde(default = "single_sample")]
+    pub antialiasing_samples: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_frame: Option<u32>,
     pub vertex_count: usize,
@@ -94,6 +104,8 @@ pub struct ThumbnailRenderReport {
     pub texture_count: usize,
     pub diagnostics: Vec<String>,
 }
+
+fn single_sample() -> u32 { 1 }
 
 #[derive(Debug, Clone)]
 pub struct GeneratedThumbnail {
@@ -115,6 +127,7 @@ struct GpuVertex {
     normal: [f32; 3],
     uv: [f32; 2],
     color: [f32; 4],
+    sphere_uv: [f32; 2],
 }
 
 #[repr(C)]
@@ -139,6 +152,21 @@ struct TextureData {
     height: u32,
     rgba: Vec<u8>,
     alpha: TextureAlpha,
+}
+
+struct TextureBudget { used: usize }
+impl TextureBudget {
+    const LIMIT: usize = 256 * 1024 * 1024;
+    fn new() -> Self { Self { used: 0 } }
+    fn dimension(&self, device_limit: u32) -> Option<u32> {
+        let remaining = Self::LIMIT.saturating_sub(self.used);
+        let dimension = ((remaining / 4) as f64).sqrt().floor() as u32;
+        (dimension >= 256).then_some(dimension.min(device_limit))
+    }
+    fn reserve(&mut self, bytes: usize) -> bool {
+        if bytes > Self::LIMIT.saturating_sub(self.used) { return false; }
+        self.used += bytes; true
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -181,6 +209,7 @@ struct RenderMaterial {
 struct RenderInput {
     vertices: Vec<SkinnedVertex>,
     uvs: Vec<[f32; 2]>,
+    sphere_uvs: Vec<[f32; 2]>,
     indices: Vec<u32>,
     material_ranges: Vec<MaterialRange>,
     materials: Vec<RenderMaterial>,
@@ -194,12 +223,14 @@ struct RenderTargets {
     target: wgpu::Texture,
     depth: wgpu::Texture,
     readback: wgpu::Buffer,
+    multisampled: Option<wgpu::Texture>,
 }
 
 struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     adapter_name: String,
+    sample_count: u32,
     opaque_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
     material_layout: wgpu::BindGroupLayout,
@@ -262,10 +293,7 @@ pub(crate) fn render_file_with_progress(
     if !progress("Rendering", 0.40) {
         return Err(CoreError::ThumbnailCancelled);
     }
-    let renderer = RENDERER
-        .get_or_init(|| pollster::block_on(GpuRenderer::new()).map_err(|error| error.to_string()))
-        .as_ref()
-        .map_err(|error| CoreError::ThumbnailRender(error.clone()))?;
+    let renderer = renderer()?;
     renderer.render(path, input, progress)
 }
 
@@ -276,10 +304,40 @@ pub(crate) fn motion_preview_settings_version(model_path: &Path) -> CoreResult<S
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    let references = PREVIEW_TEXTURE_REFERENCES.get_or_init(|| Mutex::new(HashMap::new())).lock()
+        .map_err(|_| CoreError::LockPoisoned)?.get(model_path)
+        .filter(|entry| entry.size == metadata.len() && metadata.modified().ok() == Some(entry.modified))
+        .map(|entry| entry.paths.clone());
+    let references = if let Some(references) = references { references } else {
+        let bytes = read_source(model_path)?;
+        let paths = if bytes.starts_with(b"Pmd") {
+            let model = parse_pmd_model(&bytes).map_err(CoreError::ThumbnailRender)?;
+            model.materials.iter().flat_map(|material| {
+                material.texture_name.split('*').map(str::trim).map(str::to_owned)
+                    .chain(model.toon_textures.get(usize::from(material.toon_index)).cloned())
+            }).collect::<HashSet<_>>()
+        } else {
+            let model = parse_pmx_model(&bytes).map_err(CoreError::ThumbnailRender)?;
+            model.materials.into_iter().flat_map(|material| [material.texture_path, material.sphere_texture_path, material.toon_texture_path]).collect()
+        };
+        remember_preview_textures(model_path, &metadata, paths.iter().cloned()); paths
+    };
+    let mut references = references.into_iter().filter(|value| !value.is_empty()).collect::<Vec<_>>(); references.sort();
+    let mut textures = blake3::Hasher::new();
+    for reference in references {
+        textures.update(&(reference.len() as u64).to_le_bytes()); textures.update(reference.as_bytes());
+        let stamp = texture_candidates(model_path.parent().unwrap_or_else(|| Path::new(".")), &reference)
+            .into_iter().find_map(|path| std::fs::metadata(path).ok().filter(|value| value.is_file()));
+        if let Some(stamp) = stamp {
+            textures.update(&stamp.len().to_le_bytes());
+            textures.update(&stamp.modified().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |value| value.as_nanos()).to_le_bytes());
+        } else { textures.update(b"missing"); }
+    }
     Ok(format!(
-        "{PREVIEW_SETTINGS_VERSION}:motion-camera-v3:{}:{}:{modified}",
+        "{PREVIEW_SETTINGS_VERSION}:motion-camera-v4:{}:{}:{modified}:{}",
         model_path.to_string_lossy(),
-        metadata.len()
+        metadata.len(), textures.finalize().to_hex()
     ))
 }
 
@@ -314,7 +372,7 @@ pub(crate) fn pmd_preview_file(path: &Path) -> CoreResult<Vec<u8>> {
 
 fn encode_preview_input(path: &Path, input: RenderInput, pmd: Option<&PmdParsedModel>) -> CoreResult<Vec<u8>> {
     let metadata = std::fs::metadata(path)?;
-    remember_preview_textures(path, &metadata, input.materials.iter().map(|material| material.texture_path.clone()));
+    remember_preview_textures(path, &metadata, input.materials.iter().flat_map(|material| [material.texture_path.clone(), material.sphere_texture_path.clone(), material.toon_texture_path.clone()]));
     let vertex_count = input.vertices.len();
     let group_count = input.material_ranges.len();
     let texture_paths = input.material_ranges.iter().map(|group| {
@@ -391,13 +449,10 @@ pub(crate) fn render_vpd_motion_file_with_progress(
             "VPD 动作预览只支持 .vpd 姿势文件".to_owned(),
         ));
     }
-    if !preview_model_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("pmx"))
+    if !crate::model_io::is_model_path(preview_model_path)
     {
         return Err(CoreError::ThumbnailRender(
-            "动作预览模型必须是 PMX 文件".to_owned(),
+            "动作预览模型必须是 PMX 或 PMD 文件".to_owned(),
         ));
     }
     let parse_permit =
@@ -417,12 +472,14 @@ pub(crate) fn render_vpd_motion_file_with_progress(
     let model_bytes = read_source(preview_model_path)?;
     let pose = parse_vpd_pose(&motion_bytes)
         .map_err(|error| CoreError::ThumbnailRender(format!("VPD 解析失败：{error}")))?;
-    let model = parse_pmx_model(&model_bytes)
-        .map_err(|error| CoreError::ThumbnailRender(format!("PMX 解析失败：{error}")))?;
-    if !progress("Parsing", 0.20) {
-        return Err(CoreError::ThumbnailCancelled);
-    }
-    let mut input = render_input_from_pmx_with_pose(&model_bytes, &model, Some(&pose), None, None)?;
+    if !progress("Parsing", 0.20) { return Err(CoreError::ThumbnailCancelled); }
+    let mut input = if model_bytes.starts_with(b"Pmd") {
+        let model = parse_pmd_model(&model_bytes).map_err(CoreError::ThumbnailRender)?;
+        render_input_from_pmd_with_pose(&model_bytes, &model, Some(&pose), None, None)?
+    } else {
+        let model = parse_pmx_model(&model_bytes).map_err(CoreError::ThumbnailRender)?;
+        render_input_from_pmx_with_pose(&model_bytes, &model, Some(&pose), None, None)?
+    };
     input.framing_bounds = None;
     input.diagnostics.push("MotionPreview:VPD".to_owned());
     drop(parse_permit);
@@ -443,13 +500,10 @@ pub(crate) fn render_vmd_motion_file_with_progress(
             "VMD 动作预览只支持 .vmd 动画文件".to_owned(),
         ));
     }
-    if !preview_model_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("pmx"))
+    if !crate::model_io::is_model_path(preview_model_path)
     {
         return Err(CoreError::ThumbnailRender(
-            "动作预览模型必须是 PMX 文件".to_owned(),
+            "动作预览模型必须是 PMX 或 PMD 文件".to_owned(),
         ));
     }
     let parse_permit =
@@ -470,17 +524,8 @@ pub(crate) fn render_vmd_motion_file_with_progress(
     let vmd = mmd_anim_format::vmd::parse_vmd_shared_context(&motion_bytes)
         .map_err(|error| CoreError::ThumbnailRender(format!("VMD 解析失败：{error}")))?;
     let mut animation = vmd.import_result().clone();
-    let model = parse_pmx_model(&model_bytes)
-        .map_err(|error| CoreError::ThumbnailRender(format!("PMX 解析失败：{error}")))?;
-    let (imported, _) = import_pmx_runtime_compatible(&model_bytes)
-        .map_err(|error| CoreError::ThumbnailRender(format!("PMX 骨架解析失败：{error}")))?;
-    if imported.model.bone_count() != model.skeleton.bones.len() {
-        return Err(CoreError::ThumbnailRender(format!(
-            "PMX 骨架数量不一致：解析器 {}，运行时 {}",
-            model.skeleton.bones.len(),
-            imported.model.bone_count()
-        )));
-    }
+    let imported = crate::model_io::import_model_runtime(&model_bytes)
+        .map_err(|error| CoreError::ThumbnailRender(format!("模型骨架解析失败：{error}")))?;
     let total_bone_frames = animation.bone_keyframes.len();
     let total_morph_frames = animation.morph_keyframes.len();
     let bone_is_mapped = |frame: &mmd_anim_format::vmd::VmdBoneKeyframeRaw| match &frame.bone_mode {
@@ -543,8 +588,13 @@ pub(crate) fn render_vmd_motion_file_with_progress(
     if !progress("Parsing", 0.20) {
         return Err(CoreError::ThumbnailCancelled);
     }
-    let mut input =
-        render_input_from_pmx_with_pose(&model_bytes, &model, None, Some(&sample), camera)?;
+    let mut input = if model_bytes.starts_with(b"Pmd") {
+        let model = parse_pmd_model(&model_bytes).map_err(CoreError::ThumbnailRender)?;
+        render_input_from_pmd_with_pose(&model_bytes, &model, None, Some(&sample), camera)?
+    } else {
+        let model = parse_pmx_model(&model_bytes).map_err(CoreError::ThumbnailRender)?;
+        render_input_from_pmx_with_pose(&model_bytes, &model, None, Some(&sample), camera)?
+    };
     input.framing_bounds = None;
     input
         .diagnostics
@@ -585,10 +635,7 @@ fn render_motion_input_with_progress(
     if !progress("Rendering", 0.40) {
         return Err(CoreError::ThumbnailCancelled);
     }
-    let renderer = RENDERER
-        .get_or_init(|| pollster::block_on(GpuRenderer::new()).map_err(|error| error.to_string()))
-        .as_ref()
-        .map_err(|error| CoreError::ThumbnailRender(error.clone()))?;
+    let renderer = renderer()?;
     let mut generated = renderer.render(preview_model_path, input, progress)?;
     generated.report.preview_settings_version =
         motion_preview_settings_version(preview_model_path)?;
@@ -643,6 +690,7 @@ fn render_input_from_pmx_with_pose(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| vec![[1.0; 4]; uvs.len()]);
+    let mut sphere_uvs = vertex_colors.iter().map(|value| [value[0], value[1]]).collect::<Vec<_>>();
     let material_ranges = geometry
         .material_groups
         .iter()
@@ -692,6 +740,7 @@ fn render_input_from_pmx_with_pose(
         vmd_pose,
         &mut uvs,
         &mut vertex_colors,
+        &mut sphere_uvs,
         &mut materials,
         &mut diagnostics,
     )?;
@@ -708,9 +757,15 @@ fn render_input_from_pmx_with_pose(
             diagnostics.push(format!("UnsupportedNonTriangleStyle:{}", material.name));
         }
     }
+    if geometry.additional_uvs.is_empty() {
+        for material in materials.iter_mut().filter(|material| material.sphere_mode == 3) {
+            diagnostics.push(format!("MissingSubTextureUv:{}", material.name)); material.sphere_mode = 0;
+        }
+    }
     Ok(RenderInput {
         vertices,
         uvs,
+        sphere_uvs,
         indices: geometry.indices.clone(),
         material_ranges,
         materials,
@@ -900,6 +955,7 @@ fn render_input_from_pmd(model: &PmdParsedModel) -> CoreResult<RenderInput> {
         diagnostics.push("MissingMaterial: using fallback material".to_owned());
     }
     Ok(RenderInput {
+        sphere_uvs: uvs.clone(),
         vertices,
         uvs,
         indices,
@@ -912,6 +968,77 @@ fn render_input_from_pmd(model: &PmdParsedModel) -> CoreResult<RenderInput> {
     })
 }
 
+fn render_input_from_pmd_with_pose(
+    bytes: &[u8], model: &PmdParsedModel, pose: Option<&VpdParsedPose>, sample: Option<&ClipSample>,
+    camera: Option<mmd_anim_format::vmd::VmdCameraState>,
+) -> CoreResult<RenderInput> {
+    let mut input = render_input_from_pmd(model)?;
+    let imported = crate::model_io::import_model_runtime(bytes).map_err(CoreError::ThumbnailRender)?;
+    let mut runtime = RuntimeInstance::new(Arc::new(imported.model));
+    runtime.evaluate_rest_pose();
+    if let Some(pose) = pose {
+        for bone in &pose.bones {
+            let matches = model.skeleton.bones.iter().enumerate()
+                .filter(|(_, candidate)| candidate.name == bone.name || candidate.english_name == bone.name)
+                .map(|(index, _)| index).collect::<Vec<_>>();
+            if matches.len() != 1 {
+                input.diagnostics.push(format!("UnmappedOrAmbiguousVpdBone:{}", bone.name)); continue;
+            }
+            let rotation = Quat::from_array(bone.rotation);
+            let translation = Vec3::from_array(bone.translation);
+            if !rotation.is_finite() || rotation.length_squared() <= f32::EPSILON || !translation.is_finite() {
+                input.diagnostics.push(format!("InvalidVpdBonePose:{}", bone.name)); continue;
+            }
+            let index = BoneIndex(matches[0] as u32);
+            runtime.pose_mut().set_local_position_offset(index, translation.into());
+            runtime.pose_mut().set_local_rotation(index, rotation.normalize());
+        }
+        runtime.evaluate_current_pose();
+    }
+    let mut positions = input.vertices.iter().map(|vertex| vertex.position).collect::<Vec<_>>();
+    let mut morphed = false;
+    if let Some(sample) = sample {
+        sample.apply_to_pose(runtime.pose_mut()); runtime.expand_morphs(); runtime.evaluate_current_pose();
+        // PMD morph indices address the base morph table, not the mesh directly.
+        let base = model.morphs.iter().find(|morph| morph.kind == "base");
+        let mut applied = 0usize;
+        for (index, morph) in model.morphs.iter().enumerate().filter(|(_, morph)| morph.kind != "base") {
+            let weight = runtime.morph_weights().get(index).copied().unwrap_or_default();
+            if !weight.is_finite() || weight == 0.0 { continue; }
+            for offset in &morph.vertex_offsets {
+                let target = base.and_then(|base| base.vertex_offsets.get(offset.vertex_index as usize))
+                    .map(|offset| offset.vertex_index as usize);
+                let delta = Vec3::from_array(offset.position);
+                if let Some(position) = target.and_then(|index| positions.get_mut(index)).filter(|_| delta.is_finite()) {
+                    *position += delta * weight; applied += 1;
+                } else { input.diagnostics.push(format!("InvalidPmdMorphOffset:{index}:{}", offset.vertex_index)); }
+            }
+        }
+        if applied > 0 {
+            morphed = true;
+            input.diagnostics.push(format!("AppliedPmdVertexMorphOffsets:{applied}"));
+        }
+    }
+    let matrices = runtime.pose().world_matrices().iter().enumerate()
+        .map(|(index, matrix)| *matrix * runtime.model().inverse_bind_matrix(BoneIndex(index as u32))).collect::<Vec<_>>();
+    let authored_normals = input.vertices.iter().map(|vertex| vertex.normal).collect::<Vec<_>>();
+    let normals = if morphed { recalculated_vertex_normals(&positions, &input.indices, &authored_normals) }
+        else { authored_normals };
+    for (index, vertex) in input.vertices.iter_mut().enumerate() {
+        let source = &model.geometry.vertices[index];
+        let weight = (source.bone_weight as f32 / 100.0).clamp(0.0, 1.0);
+        let weights = [if source.bone_indices[0] >= 0 { weight } else { 0.0 },
+            if source.bone_indices[1] >= 0 { 1.0 - weight } else { 0.0 }];
+        let bones = source.bone_indices.map(|value| value.max(0) as u32);
+        if let Some(skinned) = skin_linear(positions[index], normals[index], &weights, &bones, &matrices, 2) {
+            *vertex = skinned;
+        } else { return Err(CoreError::ThumbnailRender(format!("PMD 顶点 {index} 的骨骼引用无效"))); }
+    }
+    input.camera = camera;
+    input.diagnostics.push("PmdMotionPreview:Bones:IK:VertexMorphs:NoPhysics".to_owned());
+    Ok(input)
+}
+
 fn skin_vertices(
     bytes: &[u8],
     model: &PmxParsedModel,
@@ -919,6 +1046,7 @@ fn skin_vertices(
     vmd_pose: Option<&ClipSample>,
     uvs: &mut [[f32; 2]],
     vertex_colors: &mut [[f32; 4]],
+    sphere_uvs: &mut [[f32; 2]],
     materials: &mut [RenderMaterial],
     diagnostics: &mut Vec<String>,
 ) -> CoreResult<Vec<SkinnedVertex>> {
@@ -946,8 +1074,23 @@ fn skin_vertices(
         ));
     }
 
-    let (imported, corrections) = import_pmx_runtime_compatible(bytes)
-        .map_err(|error| CoreError::ThumbnailRender(format!("PMX 骨架解析失败：{error}")))?;
+    if geometry.positions.iter().any(|value| !value.is_finite()) {
+        return Err(CoreError::ThumbnailRender("PMX 顶点包含非有限坐标".to_owned()));
+    }
+    let (imported, corrections) = match import_pmx_runtime_compatible(bytes) {
+        Ok(value) => value,
+        Err(error) if vpd_pose.is_none() && vmd_pose.is_none() => {
+            diagnostics.push(format!("RestPoseFallback:RuntimeUnavailable:{error}"));
+            return Ok(geometry.positions.chunks_exact(3).zip(geometry.normals.chunks_exact(3))
+                .enumerate().map(|(index, (position, normal))| {
+                    let normal = Vec3::from_array([normal[0], normal[1], normal[2]]).normalize_or_zero();
+                    SkinnedVertex { position: Vec3::new(position[0],position[1],position[2]),
+                        normal: if normal.is_finite() && normal != Vec3::ZERO { normal } else { Vec3::Y },
+                        color: vertex_colors.get(index).copied().unwrap_or([1.0;4]) }
+                }).collect());
+        }
+        Err(error) => return Err(CoreError::ThumbnailRender(format!("PMX 骨架解析失败：{error}"))),
+    };
     if corrections.zero_rotations > 0 {
         diagnostics.push(format!("ZeroBoneMorphQuaternionAsIdentity:{}", corrections.zero_rotations));
     }
@@ -1154,6 +1297,9 @@ fn skin_vertices(
                 if offset.uv.iter().any(|value| !value.is_finite()) {
                     diagnostics.push(format!("InvalidAdditionalUvMorphOffset:{morph_index}"));
                     continue;
+                }
+                if let Some(uv) = sphere_uvs.get_mut(offset.vertex_index as usize) {
+                    uv[0] += offset.uv[0] * weight; uv[1] += offset.uv[1] * weight;
                 }
                 for (channel, delta) in color.iter_mut().zip(offset.uv) {
                     *channel += delta * weight;
@@ -1668,6 +1814,11 @@ impl GpuRenderer {
             let info = adapter.get_info();
             format!("{} ({:?}/{:?})", info.name, info.backend, info.device_type)
         };
+        let color_features = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba8UnormSrgb).flags;
+        let depth_features = adapter.get_texture_format_features(wgpu::TextureFormat::Depth32Float).flags;
+        let sample_count = if color_features.sample_count_supported(4)
+            && color_features.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE)
+            && depth_features.sample_count_supported(4) { 4 } else { 1 };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("MMDbridge thumbnail renderer"),
@@ -1746,7 +1897,7 @@ impl GpuRenderer {
             label: Some("MMDbridge thumbnail shader"),
             source: wgpu::ShaderSource::Wgsl(THUMBNAIL_SHADER.into()),
         });
-        let vertex_attributes = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
+        let vertex_attributes = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Float32x2];
         let buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -1758,7 +1909,7 @@ impl GpuRenderer {
             write_mask: wgpu::ColorWrites::ALL,
         })];
         let opaque_pipeline =
-            create_pipeline(&device, &pipeline_layout, &shader, &buffers, &targets, true);
+            create_pipeline(&device, &pipeline_layout, &shader, &buffers, &targets, true, sample_count);
         let transparent_pipeline = create_pipeline(
             &device,
             &pipeline_layout,
@@ -1766,6 +1917,7 @@ impl GpuRenderer {
             &buffers,
             &targets,
             false,
+            sample_count,
         );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("MMDbridge material sampler"),
@@ -1792,6 +1944,7 @@ impl GpuRenderer {
             device,
             queue,
             adapter_name,
+            sample_count,
             opaque_pipeline,
             transparent_pipeline,
             material_layout,
@@ -1817,6 +1970,13 @@ impl GpuRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
+        let multisampled = (self.sample_count > 1).then(|| self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MMDbridge multisampled colour target"),
+            size: wgpu::Extent3d { width: WIDTH, height: HEIGHT, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: self.sample_count, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        }));
         let depth = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("MMDbridge thumbnail depth target"),
             size: wgpu::Extent3d {
@@ -1825,7 +1985,7 @@ impl GpuRenderer {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: self.sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1842,7 +2002,7 @@ impl GpuRenderer {
             mapped_at_creation: false,
         });
 
-        RenderTargets { target, depth, readback }
+        RenderTargets { target, depth, readback, multisampled }
     }
 
     fn render(
@@ -1856,6 +2016,7 @@ impl GpuRenderer {
         let RenderInput {
             vertices: source_vertices,
             uvs,
+            sphere_uvs,
             indices,
             material_ranges,
             materials,
@@ -1871,34 +2032,15 @@ impl GpuRenderer {
         }
         // Frame in camera space so the slight downward view also fits depth-heavy meshes.
         let tilt = Quat::from_rotation_x(-5.0f32.to_radians());
-        let (minimum, maximum) = bounds(source_vertices.iter().map(|vertex| tilt * vertex.position))?;
-        let framing_bounds = framing_bounds.map(|(minimum, maximum)| {
-            let mut lo = Vec3::splat(f32::INFINITY);
-            let mut hi = Vec3::splat(f32::NEG_INFINITY);
-            for x in [minimum.x, maximum.x] {
-                for y in [minimum.y, maximum.y] {
-                    for z in [minimum.z, maximum.z] {
-                        let point = tilt * Vec3::new(x, y, z);
-                        lo = lo.min(point);
-                        hi = hi.max(point);
-                    }
-                }
+        for index in &indices {
+            if *index as usize >= source_vertices.len() {
+                return Err(CoreError::ThumbnailRender(format!("网格索引 {index} 超出顶点范围 {}", source_vertices.len())));
             }
-            (lo, hi)
-        });
-        let mesh_half_extent = ((maximum.x - minimum.x)
-            .max(maximum.y - minimum.y) * 0.5).max(0.001) / 0.92;
-        let bone_half_extent = framing_bounds.map(|(bone_min, bone_max)| {
-            ((bone_max.x - bone_min.x).max(bone_max.y - bone_min.y) * 0.5).max(0.001) / 0.82
-        });
-        let (center, half_extent) = if bone_half_extent.is_some_and(|extent| extent < mesh_half_extent) {
-            let (bone_min, bone_max) = framing_bounds.expect("bone extent requires bounds");
-            diagnostics.push("CharacterBoneFraming".to_owned());
-            ((bone_min + bone_max) * 0.5, bone_half_extent.unwrap())
-        } else {
-            if framing_bounds.is_some() { diagnostics.push("CharacterMeshFraming".to_owned()); }
-            ((minimum + maximum) * 0.5, mesh_half_extent)
-        };
+        }
+        let (minimum, maximum) = bounds(indices.iter().map(|index| tilt * source_vertices[*index as usize].position))?;
+        let half_extent = ((maximum.x - minimum.x).max(maximum.y - minimum.y) * 0.5).max(0.001) / 0.92;
+        let center = (minimum + maximum) * 0.5;
+        if framing_bounds.is_some() { diagnostics.push("CharacterIndexedMeshFraming".to_owned()); }
         let depth_range = (maximum.z - minimum.z).max(0.001);
         let camera_view_projection = if scene_view {
             diagnostics.push("SceneWideCamera:165cm:90deg:Down5deg".to_owned());
@@ -1941,9 +2083,15 @@ impl GpuRenderer {
                 normal: vertex.normal.to_array(),
                 uv: [finite_or_zero(uvs[index][0]), finite_or_zero(uvs[index][1])],
                 color: vertex.color.map(finite_or_zero),
+                sphere_uv: sphere_uvs.get(index).copied().unwrap_or([0.0; 2]).map(finite_or_zero),
             });
         }
 
+        for size in [gpu_vertices.len() as u64 * std::mem::size_of::<GpuVertex>() as u64, indices.len() as u64 * 4] {
+            if size > self.device.limits().max_buffer_size {
+                return Err(CoreError::ThumbnailRender("网格缓冲区超过当前 GPU 上限".to_owned()));
+            }
+        }
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1959,16 +2107,8 @@ impl GpuRenderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        for index in &indices {
-            if *index as usize >= source_vertices.len() {
-                return Err(CoreError::ThumbnailRender(format!(
-                    "网格索引 {index} 超出顶点范围 {}",
-                    source_vertices.len()
-                )));
-            }
-        }
         let (texture_resources, material_bind_groups, texture_count, texture_alpha) =
-            self.create_material_bind_groups(source_path, &materials, &mut diagnostics)?;
+            self.create_material_bind_groups(source_path, &materials, &mut diagnostics, progress)?;
         let groups = build_draw_groups(
             &indices,
             &material_ranges,
@@ -1983,6 +2123,7 @@ impl GpuRenderer {
         let depth = &targets.depth;
         let readback = &targets.readback;
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let multisampled_view = targets.multisampled.as_ref().map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
         let unpadded_bytes_per_row = WIDTH * 4;
         let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -1996,8 +2137,8 @@ impl GpuRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MMDbridge thumbnail pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target_view,
-                    resolve_target: None,
+                    view: multisampled_view.as_ref().unwrap_or(&target_view),
+                    resolve_target: multisampled_view.as_ref().map(|_| &target_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.055,
@@ -2079,7 +2220,7 @@ impl GpuRenderer {
             })
             .map_err(|error| CoreError::ThumbnailRender(format!("GPU 等待失败：{error}")))?;
         receive
-            .recv()
+            .recv_timeout(Duration::from_secs(5))
             .map_err(|error| CoreError::ThumbnailRender(format!("读取 GPU 结果失败：{error}")))?
             .map_err(|error| CoreError::ThumbnailRender(format!("映射 GPU 缓冲区失败：{error}")))?;
         let mapped = slice.get_mapped_range().map_err(|error| {
@@ -2129,6 +2270,7 @@ impl GpuRenderer {
                 height: HEIGHT,
                 format: "webp".to_owned(),
                 quality: QUALITY as u8,
+                antialiasing_samples: self.sample_count,
                 preview_frame: None,
                 triangle_count: indices.len() / 3,
                 material_count: materials.len(),
@@ -2144,6 +2286,7 @@ impl GpuRenderer {
         source_path: &Path,
         materials: &[RenderMaterial],
         diagnostics: &mut Vec<String>,
+        progress: &mut dyn FnMut(&str, f64) -> bool,
     ) -> CoreResult<(Vec<TextureResource>, Vec<wgpu::BindGroup>, usize, Vec<TextureAlpha>)> {
         let fallback = TextureData {
             width: 1,
@@ -2162,6 +2305,7 @@ impl GpuRenderer {
         let mut texture_alpha = Vec::with_capacity(materials.len().max(1));
         let source_dir = source_path.parent().unwrap_or_else(|| Path::new("."));
         let mut texture_count = 0usize;
+        let mut texture_budget = TextureBudget::new();
 
         if materials.is_empty() {
             let fallback_material = RenderMaterial {
@@ -2188,7 +2332,10 @@ impl GpuRenderer {
             ));
             texture_alpha.push(TextureAlpha::default());
         }
-        for material in materials {
+        for (material_number, material) in materials.iter().enumerate() {
+            if !progress("Rendering", 0.40 + 0.38 * material_number as f64 / materials.len().max(1) as f64) {
+                return Err(CoreError::ThumbnailCancelled);
+            }
             let (diffuse_index, alpha) = self.resolve_texture_index(
                 source_dir,
                 &material.texture_path,
@@ -2198,6 +2345,7 @@ impl GpuRenderer {
                 &mut texture_resource_alpha,
                 &mut texture_cache,
                 &mut texture_count,
+                &mut texture_budget,
                 diagnostics,
             );
             let (sphere_index, _) = self.resolve_texture_index(
@@ -2209,6 +2357,7 @@ impl GpuRenderer {
                 &mut texture_resource_alpha,
                 &mut texture_cache,
                 &mut texture_count,
+                &mut texture_budget,
                 diagnostics,
             );
             let (mut toon_index, _) = self.resolve_texture_index(
@@ -2220,6 +2369,7 @@ impl GpuRenderer {
                 &mut texture_resource_alpha,
                 &mut texture_cache,
                 &mut texture_count,
+                &mut texture_budget,
                 diagnostics,
             );
             if material.toon_enabled && toon_index == 0 {
@@ -2283,6 +2433,7 @@ impl GpuRenderer {
         texture_resource_alpha: &mut Vec<TextureAlpha>,
         texture_cache: &mut HashMap<String, usize>,
         texture_count: &mut usize,
+        texture_budget: &mut TextureBudget,
         diagnostics: &mut Vec<String>,
     ) -> (usize, TextureAlpha) {
         if texture_path.trim().is_empty() {
@@ -2297,17 +2448,25 @@ impl GpuRenderer {
             ));
             return (0, TextureAlpha::default());
         };
-        let key = path.to_string_lossy().to_lowercase();
+        let key = path.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let key = key.to_lowercase();
         if let Some(index) = texture_cache.get(&key).copied() {
             return (
                 index,
                 texture_resource_alpha.get(index).copied().unwrap_or_default(),
             );
         }
-        let max_dimension =
-            MAX_TEXTURE_DIMENSION.min(self.device.limits().max_texture_dimension_2d);
+        let Some(max_dimension) = texture_budget.dimension(MAX_TEXTURE_DIMENSION.min(self.device.limits().max_texture_dimension_2d)) else {
+            diagnostics.push(format!("TextureBudgetExceeded:{material_name}:{texture_path}"));
+            texture_cache.insert(key, 0); return (0, TextureAlpha::default());
+        };
         match load_texture(&path, max_dimension) {
             Ok((data, resized)) => {
+                if !texture_budget.reserve(data.rgba.len()) {
+                    diagnostics.push(format!("TextureBudgetExceeded:{material_name}:{texture_path}"));
+                    texture_cache.insert(key, 0); return (0, TextureAlpha::default());
+                }
                 if resized {
                     diagnostics.push(format!("TextureResized:{material_name}:{}", path.display()));
                 }
@@ -2327,6 +2486,7 @@ impl GpuRenderer {
                 diagnostics.push(format!(
                     "{diagnostic_prefix}LoadFailed:{material_name}:{texture_path}:{error}"
                 ));
+                texture_cache.insert(key, 0);
                 (0, TextureAlpha::default())
             }
         }
@@ -2428,6 +2588,7 @@ fn create_pipeline(
     buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     targets: &[Option<wgpu::ColorTargetState>],
     depth_write_enabled: bool,
+    sample_count: u32,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if depth_write_enabled {
@@ -2456,7 +2617,7 @@ fn create_pipeline(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState { count: sample_count, ..Default::default() },
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
@@ -2688,12 +2849,13 @@ fn vmd_camera_view_projection(
 }
 
 fn texture_candidates(source_dir: &Path, texture_path: &str) -> Vec<PathBuf> {
-    let raw = PathBuf::from(texture_path);
-    if raw.is_absolute() {
-        vec![raw]
-    } else {
-        vec![source_dir.join(raw)]
+    let mut paths = Vec::new();
+    for value in [texture_path.to_owned(), texture_path.trim().replace('\\', "/")] {
+        let raw = PathBuf::from(value);
+        let path = if raw.is_absolute() { raw } else { source_dir.join(raw) };
+        if !paths.contains(&path) { paths.push(path); }
     }
+    paths
 }
 
 fn material_uniform(material: &RenderMaterial) -> MaterialUniform {
@@ -2847,6 +3009,7 @@ struct VertexInput {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec4<f32>,
+    @location(4) sphere_uv: vec2<f32>,
 };
 
 struct VertexOutput {
@@ -2854,6 +3017,7 @@ struct VertexOutput {
     @location(0) normal: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) sphere_uv: vec2<f32>,
 };
 
 @vertex
@@ -2863,6 +3027,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.normal = input.normal;
     output.uv = input.uv;
     output.color = input.color;
+    output.sphere_uv = input.sphere_uv;
     return output;
 }
 
@@ -2903,7 +3068,7 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @l
         let sphere_uv = clamp(vec2<f32>(dot(x_axis, normal), dot(y_axis, normal)) * 0.495 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
         var mapped_uv = sphere_uv;
         if (material.flags.x == 3u) {
-            mapped_uv = input.uv;
+            mapped_uv = input.sphere_uv;
         }
         let sphere_texel = textureSample(sphere_texture, diffuse_sampler, mapped_uv);
         let sphere_color = sphere_texel.rgb * material.sphere_factor.rgb;
@@ -2928,3 +3093,72 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @l
     return vec4<f32>(color, texel.a * material.texture_factor.a * material.diffuse.a * vertex_alpha);
 }
 "#;
+
+#[cfg(test)]
+#[path = "../tests/fixtures/mod.rs"]
+mod test_fixtures;
+
+#[cfg(test)]
+mod loading_tests {
+    use super::*;
+    use super::test_fixtures as fixtures;
+
+    #[test]
+    fn pmd_sphere_first_keeps_diffuse_and_the_no_toon_sentinel() {
+        let model = parse_pmd_model(&fixtures::pmd(false,"env.sph*tex.png")).unwrap();
+        let input = render_input_from_pmd(&model).unwrap();
+        assert_eq!(input.materials[0].texture_path, "tex.png");
+        assert_eq!(input.materials[0].sphere_texture_path, "env.sph");
+        assert!(!input.materials[0].toon_enabled);
+    }
+
+    #[test]
+    fn subtexture_coordinates_use_additional_uv_one() {
+        let bytes = fixtures::pmx(false,1,0,true);
+        let mut model = parse_pmx_model(&bytes).unwrap(); model.materials[0].sphere_mode = "subTexture".to_owned();
+        let input = render_input_from_pmx(&bytes, &model).unwrap();
+        assert_eq!(input.uvs[0], [0.0,0.0]); assert_eq!(input.sphere_uvs[0], [1.0,1.0]);
+        assert_eq!(input.materials[0].sphere_mode, 3);
+    }
+
+    #[test]
+    fn broken_runtime_still_allows_an_explicit_rest_mesh_preview() {
+        let bytes = fixtures::pmx(false,1,0,false); let mut model = parse_pmx_model(&bytes).unwrap();
+        model.skeleton.bones[0].parent_index = 1;
+        let bytes = mmd_anim_format::export_pmx_model(&model);
+        let input = render_input_from_pmx(&bytes, &model).unwrap();
+        assert_eq!(input.vertices[2].position, Vec3::new(0.0,2.0,0.0));
+        assert!(input.diagnostics.iter().any(|value| value.starts_with("RestPoseFallback:")));
+    }
+
+    #[test]
+    fn texture_budget_decreases_dimensions_and_never_exceeds_its_limit() {
+        let mut budget = TextureBudget::new(); assert_eq!(budget.dimension(4096), Some(4096));
+        assert!(budget.reserve(TextureBudget::LIMIT - 4 * 512 * 512));
+        assert_eq!(budget.dimension(4096), Some(512));
+        assert!(!budget.reserve(4 * 512 * 512 + 1));
+        assert!(budget.reserve(4 * 512 * 512)); assert_eq!(budget.dimension(4096), None);
+    }
+
+    #[test]
+    fn texture_candidates_preserve_raw_names_then_try_portable_separators() {
+        let paths = texture_candidates(Path::new("models"), "貼図\\tex.png ");
+        assert_eq!(paths[0], Path::new("models").join("貼図\\tex.png "));
+        assert!(paths.contains(&Path::new("models").join("貼図/tex.png")));
+    }
+
+    #[test]
+    fn motion_cache_tracks_preview_model_diffuse_and_sphere_file_changes() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-texture-stamp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let model = directory.join("model.pmd"); std::fs::write(&model,fixtures::pmd(false,"env.sph*tex.png")).unwrap();
+        let missing = motion_preview_settings_version(&model).unwrap();
+        std::fs::write(directory.join("tex.png"),b"fixture").unwrap();
+        let diffuse = motion_preview_settings_version(&model).unwrap(); assert_ne!(missing,diffuse);
+        std::fs::write(directory.join("env.sph"),b"fixture sphere").unwrap();
+        let sphere = motion_preview_settings_version(&model).unwrap(); assert_ne!(diffuse,sphere);
+        assert_eq!(sphere,motion_preview_settings_version(&model).unwrap());
+        assert!(directory.is_absolute() && directory.starts_with(std::env::temp_dir()));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
