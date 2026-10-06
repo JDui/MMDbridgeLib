@@ -49,17 +49,10 @@ const server = http.createServer((request,response)=>{
   response.writeHead(200,{'Content-Type':asset?.type??'text/html; charset=utf-8'});response.end(asset?.bytes??html);
 });
 await new Promise((ready,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',ready);});
-let browser;
+let browser, page;
 try {
   browser=await chromium.launch({headless:true,args:['--use-angle=swiftshader','--enable-unsafe-swiftshader']});
-  const page=await browser.newPage({viewport:{width:1480,height:960},locale:'zh-CN',reducedMotion:'reduce'});
-  await page.addInitScript(()=>{
-    const getContext=HTMLCanvasElement.prototype.getContext;
-    HTMLCanvasElement.prototype.getContext=function(type,...args){
-      if(new URLSearchParams(location.search).has('nogpu')&&/^(webgl2?|experimental-webgl)$/.test(type))return null;
-      return getContext.call(this,type,...args);
-    };
-  });
+  page=await browser.newPage({viewport:{width:1480,height:960},locale:'zh-CN',reducedMotion:'reduce'});
   page.setDefaultTimeout(20000);const errors=[];page.on('pageerror',error=>errors.push(error.message));
   const url=`http://127.0.0.1:${server.address().port}`;
   await page.goto(`${url}/?scheme=dark`);
@@ -99,8 +92,16 @@ try {
   });
   assert.equal(decoded.length,7);assert.ok(decoded.every(image=>image.nonBackgroundPixels>10000));
   await page.goto(`${url}/?scheme=dark&nogpu=1`);
+  assert.equal(await page.evaluate(()=>{
+    const getContext=HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext=function(type,...args){
+      return /^(webgl2?|experimental-webgl)$/.test(type)?null:getContext.call(this,type,...args);
+    };
+    return document.createElement('canvas').getContext('webgl2')===null;
+  }),true);
   const motion=manifest.entries.find(entry=>entry.asset.primarySource.toLowerCase().endsWith('.vmd'));assert.ok(motion);
   await page.getByRole('button',{name:new RegExp(motion.asset.name)}).first().dblclick();
+  await page.getByRole('dialog',{name:`${motion.asset.name} VMD 3D 预览`}).waitFor();
   await page.locator('.model-viewer-error').filter({hasText:'3D 渲染初始化失败'}).waitFor();
   await page.screenshot({path:join(output,'MBL_Model_Stage5_No_GPU.jpg'),type:'jpeg',quality:92,animations:'disabled'});
   await page.getByRole('button',{name:'关闭动作预览',exact:true}).click();
@@ -108,4 +109,10 @@ try {
   await fs.writeFile(join(output,'ui-verification.json'),JSON.stringify({sourceCommit:process.env.GITHUB_SHA,synthetic:true,headless:true,
     decoded,pmdViewerLoaded:true,loadErrorClosed:true,noGpuErrorClosed:true,pageErrors:errors},null,2));
   console.log('Seven Core-generated previews decoded; PMD weights loaded; load-error and no-GPU recovery verified.');
+} catch(reason) {
+  if(page){
+    await page.screenshot({path:join(output,'failure-ui.jpg'),type:'jpeg',quality:90}).catch(()=>{});
+    await fs.writeFile(join(output,'failure-ui.txt'),await page.locator('body').innerText().catch(()=>''));
+  }
+  throw reason;
 } finally {await browser?.close();await new Promise(resolve=>server.close(resolve));}
