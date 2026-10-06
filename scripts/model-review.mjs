@@ -100,14 +100,17 @@ try {
     return document.createElement('canvas').getContext('webgl2')===null;
   }),true);
   const motion=manifest.entries.find(entry=>entry.asset.primarySource.toLowerCase().endsWith('.vmd'));assert.ok(motion);
-  await page.getByRole('button',{name:new RegExp(motion.asset.name)}).first().dblclick();
+  const motionCard=page.getByRole('button',{name:new RegExp(motion.asset.name)}).first();
+  await motionCard.click();
+  assert.equal(await page.getByRole('button',{name:'显示资产详情',exact:true}).getAttribute('aria-pressed'),'false');
+  await motionCard.dblclick();
   await page.getByRole('dialog',{name:`${motion.asset.name} VMD 3D 预览`}).waitFor();
   await page.locator('.model-viewer-error').filter({hasText:'3D 渲染初始化失败'}).waitFor();
   await page.screenshot({path:join(output,'MBL_Model_Stage5_No_GPU.jpg'),type:'jpeg',quality:92,animations:'disabled'});
   await page.getByRole('button',{name:'关闭动作预览',exact:true}).click();
   assert.equal(await page.locator('.asset-card').count(),7);assert.deepEqual(errors,[]);
   await fs.writeFile(join(output,'ui-verification.json'),JSON.stringify({sourceCommit:process.env.GITHUB_SHA,synthetic:true,headless:true,
-    decoded,pmdViewerLoaded:true,loadErrorClosed:true,noGpuErrorClosed:true,pageErrors:errors},null,2));
+    decoded,pmdViewerLoaded:true,loadErrorClosed:true,noGpuErrorClosed:true,doubleClickSelectionStable:true,pageErrors:errors},null,2));
   console.log('Seven Core-generated previews decoded; PMD weights loaded; load-error and no-GPU recovery verified.');
 } catch(reason) {
   if(page){

@@ -1355,7 +1355,8 @@ export default function App() {
   function toggleBulkSelection(asset: Asset) {
     if (!bulkSelectMode) {
       setSelected(asset);
-      setInspectorOpen(true);
+      // Keep card positions stable between the two clicks of a double-click.
+      // The details button controls the panel; an open panel follows selection.
       return;
     }
     setBulkSelectedIds((current) => {
