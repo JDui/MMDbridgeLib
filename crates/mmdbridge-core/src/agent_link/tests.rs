@@ -1,7 +1,8 @@
 use std::{fs, path::PathBuf, thread, time::{Duration,Instant}};
-use mmdbridge_core::{AgentLinkScope, AgentLinkServer, AssetType, Library, agent_link_request};
+use crate::{AgentLinkScope, AgentLinkServer, AssetType, Library, agent_link_request, CoreError};
 use serde_json::{Value,json};
 
+#[path = "../../tests/fixtures/mod.rs"]
 mod fixtures;
 
 struct Fixture { directory:PathBuf, library:Option<Library>, server:Option<AgentLinkServer>, asset:String, other:String }
@@ -17,17 +18,27 @@ impl Fixture {
             fs::create_dir(path.join("貼図")).unwrap();
             image::RgbaImage::from_pixel(4,4,image::Rgba([180,190,210,255])).save(path.join("貼図/tex.png")).unwrap();
             let root=library.add_root(AssetType::Model,path.to_str().unwrap(),Some(label)).unwrap();
-            library.scan_root(&root.id).unwrap();
+            assert_eq!(library.scan_root(&root.id).unwrap().parse_failures,0);
             let asset=library.list_assets(Some(AssetType::Model),None,10).unwrap().into_iter().find(|asset|asset.root_id==root.id).unwrap();
             let rgba=vec![190u8;1024*1024*4];
             let image=webp::Encoder::from_rgba(&rgba,1024,1024).encode(50.0);
-            library.create_card(&asset.id,Some(&image)).unwrap();assets.push(asset.id);
+            // Protocol fixtures exercise current-preview checks without requiring a GPU.
+            // The separate agentlink_probe renders a real preview and runs the CLI.
+            let report=crate::thumbnail::ThumbnailRenderReport {
+                renderer_version:crate::thumbnail::RENDERER_VERSION.to_owned(),
+                preview_settings_version:crate::thumbnail::PREVIEW_SETTINGS_VERSION.to_owned(),
+                adapter:"Synthetic protocol fixture; no GPU render".to_owned(),front_axis:"-Z".to_owned(),
+                width:1024,height:1024,format:"webp".to_owned(),quality:50,antialiasing_samples:1,
+                preview_frame:None,vertex_count:3,triangle_count:1,material_count:1,texture_count:1,
+                diagnostics:Vec::new(),subject_palette:None,
+            };
+            crate::cards::create(&library,&asset.id,Some(&image),Some(&report)).unwrap();assets.push(asset.id);
         }
         let server=library.start_agent_link().unwrap();
         Self {directory,library:Some(library),server:Some(server),asset:assets[0].clone(),other:assets[1].clone()}
     }
     fn database(&self) -> PathBuf {self.directory.join("data/library.sqlite3")}
-    fn rpc(&self,command:&str,payload:Value) -> Result<Value,mmdbridge_core::CoreError> {
+    fn rpc(&self,command:&str,payload:Value) -> Result<Value,CoreError> {
         agent_link_request(&self.database(),command,payload,Duration::from_secs(5))
     }
     fn connect(&self) {self.rpc("agent-identify",json!({"name":"Codex"})).unwrap();}
@@ -79,6 +90,20 @@ fn live_tags_preserve_manual_parser_agent_assignments_and_user_removals() {
     assert!(tags.iter().any(|tag|tag.name=="格式:PMX" && tag.source=="parser"));
     assert!(tags.iter().any(|tag|tag.name=="造型:二次元" && tag.confidence==Some(0.75)));
     assert!(!tags.iter().any(|tag|tag.name=="穿搭:校园"));
+}
+
+#[test]
+fn unverified_preview_is_skipped_without_writes_or_render_jobs() {
+    let f=Fixture::new();let library=f.library.as_ref().unwrap();
+    let rgba=vec![160u8;1024*1024*4];
+    let preview=webp::Encoder::from_rgba(&rgba,1024,1024).encode(50.0);
+    library.create_card(&f.asset,Some(&preview)).unwrap();
+    let jobs=library.list_jobs().unwrap();f.connect();
+    assert_eq!(f.rpc("agent-inspect",json!({"assetId":f.asset})).unwrap()["card"]["status"],"CardStale");
+    assert!(f.rpc("agent-tags",json!({"assetIds":[f.asset],"name":"服装:制服","confidence":0.85})).is_err());
+    assert!(!library.list_asset_tags(&f.asset).unwrap().iter().any(|tag|tag.name=="服装:制服"));
+    assert_eq!(library.list_jobs().unwrap(),jobs);
+    f.rpc("agent-finish",json!({"summary":"跳过 1 项：预览未验证，未添加标签"})).unwrap();
 }
 
 #[test]

@@ -22,8 +22,9 @@ previews are required, the bridge never scans or renders, and completion checks
 that cards modified during the task have been synchronized. The page refreshes
 assets on changes/completion, including while the AgentLink page is hidden.
 
-Validation uses temporary synthetic models and a real CLI subprocess for the
-Core bridge. Screenshots use the actual frontend with recorded Core snapshots
+Core protocol tests use temporary, explicitly marked preview contract fixtures
+without a GPU. The separate probe renders a synthetic model and runs a real CLI
+subprocess against the bridge. Screenshots use the actual frontend with recorded Core snapshots
 and an isolated presentation bridge. They are not Windows desktop screenshots,
 real-library tests, or evidence that an external Agent classified the models.
 The fixture database and session token are excluded from review artifacts.

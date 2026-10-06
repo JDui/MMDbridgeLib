@@ -481,3 +481,6 @@ pub fn agent_link_request(database: &Path,command: &str,payload: Value,timeout: 
     })();
     let _=fs::remove_file(request);let _=fs::remove_file(response);result
 }
+
+#[cfg(test)]
+mod tests;
