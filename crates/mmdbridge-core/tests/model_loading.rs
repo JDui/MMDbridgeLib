@@ -17,12 +17,15 @@ impl Drop for FixtureDirectory {
 #[test]
 fn pmx_encodings_index_widths_and_weight_modes_load_without_gpu() {
     let directory = FixtureDirectory::new(); let library = Library::in_memory().unwrap();
-    for utf16 in [false,true] { for width in [1,2,4] { for mode in 0..=4 {
-        let path = directory.0.join(format!("モデル-{utf16}-{width}-{mode}.pmx"));
-        std::fs::write(&path, fixtures::pmx(utf16,width,mode,true)).unwrap();
+    for version in [2.0f32,2.1] { for utf16 in [false,true] { for width in [1,2,4] { for mode in 0..=4 {
+        if version == 2.0 && mode == 4 { continue; }
+        let path = directory.0.join(format!("モデル-{version}-{utf16}-{width}-{mode}.pmx"));
+        let mut bytes = fixtures::pmx(utf16,width,mode,true);
+        bytes[4..8].copy_from_slice(&version.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
         let preview = library.model_preview_file(&path).unwrap();
         assert_eq!(&preview[..4], b"MMDV"); assert_eq!(u32::from_le_bytes(preview[8..12].try_into().unwrap()), 3);
-    } } }
+    } } } }
 }
 
 #[test]

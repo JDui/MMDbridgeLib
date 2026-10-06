@@ -3158,7 +3158,36 @@ mod loading_tests {
         std::fs::write(directory.join("env.sph"),b"fixture sphere").unwrap();
         let sphere = motion_preview_settings_version(&model).unwrap(); assert_ne!(diffuse,sphere);
         assert_eq!(sphere,motion_preview_settings_version(&model).unwrap());
+        pmd_preview_file(&model).unwrap();
+        assert_eq!(sphere,motion_preview_settings_version(&model).unwrap(), "viewer warming must not alter motion cache identity");
         assert!(directory.is_absolute() && directory.starts_with(std::env::temp_dir()));
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pmd_motion_morph_resolves_the_base_vertex_table_before_skinning() {
+        let mut model = parse_pmd_model(&fixtures::pmd(false, "")).unwrap();
+        for (name, kind, vertex, position) in [("base","base",2,[0.0,2.0,0.0]), ("smile","vertex",0,[1.0,0.0,0.0])] {
+            model.morphs.push(serde_json::from_value(serde_json::json!({
+                "name":name,"nameBytes":[],"englishName":"","englishNameBytes":[],"type":kind,
+                "vertexCount":1,"vertexOffsets":[{"vertexIndex":vertex,"position":position}]
+            })).unwrap());
+        }
+        let bytes = mmd_anim_format::export_pmd_model(&model);
+        let model = parse_pmd_model(&bytes).unwrap();
+        let mut motion = b"Vocaloid Motion Data 0002".to_vec(); motion.resize(50,0);
+        motion.extend(0u32.to_le_bytes()); motion.extend(1u32.to_le_bytes());
+        let mut name = [0u8;15]; name[..5].copy_from_slice(b"smile"); motion.extend(name);
+        motion.extend(10u32.to_le_bytes()); motion.extend(0.5f32.to_le_bytes());
+        for _ in 0..4 { motion.extend(0u32.to_le_bytes()); }
+        let vmd = mmd_anim_format::vmd::parse_vmd_shared_context(&motion).unwrap();
+        let imported = crate::model_io::import_model_runtime(&bytes).unwrap();
+        let clip = mmd_anim_format::vmd::build_pair_clip(vmd.import_result(), &imported.bone_name_to_index,
+            &imported.morph_name_to_index, &imported.ik_solver_bone_name_to_index, imported.model.ik_solvers().len());
+        let sample = clip.sample_at(10.0);
+        let input = render_input_from_pmd_with_pose(&bytes,&model,None,Some(&sample),None).unwrap();
+        assert!((input.vertices[2].position.x - 0.5).abs() < 0.0001);
+        assert!((input.vertices[0].position.x + 1.0).abs() < 0.0001);
+        assert!(input.diagnostics.iter().any(|value| value == "AppliedPmdVertexMorphOffsets:1"));
     }
 }
