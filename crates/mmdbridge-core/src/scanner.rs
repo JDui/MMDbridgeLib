@@ -1,7 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
-    io::Read,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -1281,11 +1279,7 @@ fn parse_statuses(json: &str) -> Vec<String> {
 }
 
 fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    Ok(bytes)
+    crate::model_io::read_source(path).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

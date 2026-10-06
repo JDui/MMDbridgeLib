@@ -9,8 +9,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use image::{ImageReader, imageops::FilterType};
 use mmd_anim_format::{
-    PmdParsedModel, PmxParsedModel, VpdParsedPose, parse_pmd_model,
-    parse_pmx_model, parse_vpd_pose,
+    PmdParsedModel, PmxParsedModel, VpdParsedPose, parse_vpd_pose,
 };
 use mmd_anim_runtime::{BoneIndex, ClipSample, MorphIndex, RuntimeInstance};
 use serde::{Deserialize, Serialize};
@@ -18,6 +17,7 @@ use wgpu::util::DeviceExt;
 
 use crate::thumbnail_concurrency::{self, ThumbnailStage};
 use crate::pmx_runtime::import_pmx_runtime_compatible;
+use crate::model_io::{parse_pmd_model, parse_pmx_model, read_source, MAX_SOURCE_BYTES};
 use crate::{CoreError, CoreResult};
 
 const WIDTH: u32 = 1024;
@@ -26,7 +26,6 @@ const QUALITY: f32 = 50.0;
 pub(crate) const RENDERER_VERSION: &str = "0.5.2";
 pub(crate) const PREVIEW_SETTINGS_VERSION: &str = "front-minus-z-down5-min-bounds-soft-matcap-v8";
 pub(crate) const SCENE_PREVIEW_SETTINGS_VERSION: &str = "scene-center-165cm-down5-wide-camera-soft-matcap-v4";
-const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TEXTURE_DIMENSION: u32 = 4096;
 const MAX_TEXTURE_DECODE_DIMENSION: u32 = 8192;
 const MAX_TEXTURE_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
@@ -60,7 +59,7 @@ pub(crate) fn check_preview_texture(path: &Path, texture_path: &str) -> CoreResu
         .map(|entry| entry.paths.contains(texture_path));
     let referenced = if let Some(referenced) = cached { referenced } else {
         let paths: Vec<String> = if path.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("pmx")) {
-            let bytes = std::fs::read(path)?;
+            let bytes = read_source(path)?;
             parse_pmx_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?
                 .materials.into_iter().map(|material| material.texture_path).collect()
         } else {
@@ -234,7 +233,7 @@ pub(crate) fn render_file_with_progress(
             "模型文件超过 512 MiB 渲染上限".to_owned(),
         ));
     }
-    let bytes = std::fs::read(path)?;
+    let bytes = read_source(path)?;
     let mut input = if extension.eq_ignore_ascii_case("pmx") {
         let model = parse_pmx_model(&bytes)
             .map_err(|error| CoreError::ThumbnailRender(format!("PMX 解析失败：{error}")))?;
@@ -288,7 +287,7 @@ fn scene_view_input(path: &Path) -> CoreResult<RenderInput> {
     if std::fs::metadata(path)?.len() > MAX_SOURCE_BYTES {
         return Err(CoreError::ModelPreview("场景超过 512 MiB 预览上限".to_owned()));
     }
-    let bytes = std::fs::read(path)?;
+    let bytes = read_source(path)?;
     match path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase().as_str() {
         "pmx" => {
             let model = parse_pmx_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?;
@@ -303,8 +302,18 @@ fn scene_view_input(path: &Path) -> CoreResult<RenderInput> {
 }
 
 pub(crate) fn scene_preview_file(path: &Path) -> CoreResult<Vec<u8>> {
-    let metadata = std::fs::metadata(path)?;
     let input = scene_view_input(path)?;
+    encode_preview_input(path, input, None)
+}
+
+pub(crate) fn pmd_preview_file(path: &Path) -> CoreResult<Vec<u8>> {
+    let model = parse_pmd_model(&read_source(path)?).map_err(CoreError::ModelPreview)?;
+    let input = render_input_from_pmd(&model)?;
+    encode_preview_input(path, input, Some(&model))
+}
+
+fn encode_preview_input(path: &Path, input: RenderInput, pmd: Option<&PmdParsedModel>) -> CoreResult<Vec<u8>> {
+    let metadata = std::fs::metadata(path)?;
     remember_preview_textures(path, &metadata, input.materials.iter().map(|material| material.texture_path.clone()));
     let vertex_count = input.vertices.len();
     let group_count = input.material_ranges.len();
@@ -312,23 +321,35 @@ pub(crate) fn scene_preview_file(path: &Path) -> CoreResult<Vec<u8>> {
         input.materials.get(group.material_index).map(|material| material.texture_path.as_str()).unwrap_or("")
     }).collect::<Vec<_>>();
     let texture_bytes = texture_paths.iter().map(|path| 4usize.saturating_add(path.len())).sum::<usize>();
+    let bones = pmd.map(|model| model.skeleton.bones.as_slice()).unwrap_or_default();
+    let bone_bytes = bones.iter().try_fold(0usize, |size, bone| size.checked_add(20)?.checked_add(bone.name.len()))
+        .ok_or_else(|| CoreError::ModelPreview("骨骼预览大小溢出".to_owned()))?;
     let capacity = 24usize.checked_add(vertex_count.checked_mul(104).ok_or_else(|| CoreError::ModelPreview("场景网格过大".to_owned()))?)
         .and_then(|size| size.checked_add(input.indices.len().checked_mul(4)?))
         .and_then(|size| size.checked_add(group_count.checked_mul(24)?))
         .and_then(|size| size.checked_add(texture_bytes))
+        .and_then(|size| size.checked_add(bone_bytes))
         .ok_or_else(|| CoreError::ModelPreview("场景预览大小溢出".to_owned()))?;
     if capacity > 256 * 1024 * 1024 { return Err(CoreError::ModelPreview("场景网格超过 256 MiB 预览上限".to_owned())); }
     let mut output = Vec::with_capacity(capacity);
     output.extend_from_slice(b"MMDV");
-    for count in [3u32, vertex_count as u32, input.indices.len() as u32, group_count as u32, 0u32] {
+    for count in [3u32, vertex_count as u32, input.indices.len() as u32, group_count as u32, bones.len() as u32] {
         output.extend_from_slice(&count.to_le_bytes());
     }
     for (index, vertex) in input.vertices.iter().enumerate() {
         let uv = input.uvs.get(index).copied().unwrap_or([0.0; 2]);
-        let payload = [vertex.position.x,vertex.position.y,vertex.position.z,
+        let mut payload = [vertex.position.x,vertex.position.y,vertex.position.z,
             vertex.normal.x,vertex.normal.y,vertex.normal.z,uv[0],uv[1],
             0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,
             0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0];
+        if let Some(source) = pmd.and_then(|model| model.geometry.vertices.get(index)) {
+            let weight = (source.bone_weight as f32 / 100.0).clamp(0.0, 1.0);
+            payload[8] = source.bone_indices[0].max(0) as f32;
+            payload[9] = source.bone_indices[1].max(0) as f32;
+            payload[12] = if source.bone_indices[0] >= 0 { weight } else { 0.0 };
+            payload[13] = if source.bone_indices[1] >= 0 { 1.0 - weight } else { 0.0 };
+            payload[16] = 1.0;
+        }
         for value in payload { output.extend_from_slice(&finite_or_zero(value).to_le_bytes()); }
     }
     for index in input.indices { output.extend_from_slice(&index.to_le_bytes()); }
@@ -337,6 +358,12 @@ pub(crate) fn scene_preview_file(path: &Path) -> CoreResult<Vec<u8>> {
         output.extend_from_slice(&(group.count as u32).to_le_bytes());
         let color = input.materials.get(group.material_index).map(|material| material.diffuse).unwrap_or([0.72,0.76,0.79,1.0]);
         for value in color { output.extend_from_slice(&finite_or_zero(value).to_le_bytes()); }
+    }
+    for bone in bones {
+        output.extend_from_slice(&bone.parent_index.to_le_bytes());
+        for value in bone.position { output.extend_from_slice(&finite_or_zero(value).to_le_bytes()); }
+        output.extend_from_slice(&(bone.name.len() as u32).to_le_bytes());
+        output.extend_from_slice(bone.name.as_bytes());
     }
     for path in texture_paths {
         output.extend_from_slice(&(path.len() as u32).to_le_bytes());
@@ -386,8 +413,8 @@ pub(crate) fn render_vpd_motion_file_with_progress(
             )));
         }
     }
-    let motion_bytes = std::fs::read(motion_path)?;
-    let model_bytes = std::fs::read(preview_model_path)?;
+    let motion_bytes = read_source(motion_path)?;
+    let model_bytes = read_source(preview_model_path)?;
     let pose = parse_vpd_pose(&motion_bytes)
         .map_err(|error| CoreError::ThumbnailRender(format!("VPD 解析失败：{error}")))?;
     let model = parse_pmx_model(&model_bytes)
@@ -438,8 +465,8 @@ pub(crate) fn render_vmd_motion_file_with_progress(
             )));
         }
     }
-    let motion_bytes = std::fs::read(motion_path)?;
-    let model_bytes = std::fs::read(preview_model_path)?;
+    let motion_bytes = read_source(motion_path)?;
+    let model_bytes = read_source(preview_model_path)?;
     let vmd = mmd_anim_format::vmd::parse_vmd_shared_context(&motion_bytes)
         .map_err(|error| CoreError::ThumbnailRender(format!("VMD 解析失败：{error}")))?;
     let mut animation = vmd.import_result().clone();
@@ -791,20 +818,13 @@ fn render_input_from_pmd(model: &PmdParsedModel) -> CoreResult<RenderInput> {
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .collect::<Vec<_>>();
-        let diffuse_texture = texture_parts.first().copied().filter(|path| {
-            !Path::new(path)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    extension.eq_ignore_ascii_case("sph") || extension.eq_ignore_ascii_case("spa")
-                })
-        });
+        let diffuse_texture = crate::parser::pmd_diffuse_texture(&material.texture_name);
         if material.edge_enabled {
             diagnostics.push(format!("UnsupportedEdge:Material {material_index}"));
         }
         materials.push(RenderMaterial {
             name: format!("PMD material {material_index}"),
-            texture_path: diffuse_texture.unwrap_or_default().to_owned(),
+            texture_path: diffuse_texture.to_owned(),
             sphere_texture_path: texture_parts
                 .iter()
                 .find(|path| {
@@ -825,7 +845,7 @@ fn render_input_from_pmd(model: &PmdParsedModel) -> CoreResult<RenderInput> {
                 .cloned()
                 .unwrap_or_default(),
             // PMD toon indices 0..=9 select the ten standard toon maps.
-            shared_toon_index: Some(material.toon_index.saturating_add(1)),
+            shared_toon_index: (material.toon_index < 10).then(|| material.toon_index + 1),
             sphere_mode: texture_parts
                 .iter()
                 .find(|path| {
@@ -866,7 +886,7 @@ fn render_input_from_pmd(model: &PmdParsedModel) -> CoreResult<RenderInput> {
             texture_factor: [1.0; 4],
             sphere_factor: [1.0; 4],
             toon_factor: [1.0; 4],
-            toon_enabled: true,
+            toon_enabled: material.toon_index < 10,
             vertex_color_mode: 0,
         });
     }

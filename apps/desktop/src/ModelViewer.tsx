@@ -89,6 +89,9 @@ export function parsePreview(buffer: ArrayBuffer, analyzeWeights = true): Parsed
   }
   const vertices = new Float32Array(buffer, vertexOffset, vertexCount * 26);
   const indices = new Uint32Array(buffer, indexOffset, indexCount);
+  if (indexCount % 3 !== 0 || indices.some((index) => index >= vertexCount)) {
+    throw new Error("模型三角形索引无效。");
+  }
   const groups: MaterialGroup[] = [];
   for (let index = 0; index < groupCount; index += 1) {
     const offset = groupsOffset + index * 24;
@@ -125,7 +128,7 @@ export function parsePreview(buffer: ArrayBuffer, analyzeWeights = true): Parsed
     offset += length;
   }
   if (offset !== buffer.byteLength) throw new Error("模型预览数据包含无法识别的尾部内容。");
-  if (!vertexCount || !indexCount) throw new Error("PMX 中没有可显示的三角网格。");
+  if (!vertexCount || !indexCount) throw new Error("模型中没有可显示的三角网格。");
   return { vertexCount, indices, vertices, groups, bones, stats: analyzeModel(vertices, analyzeWeights ? vertexCount : 0, bones) };
 }
 
@@ -796,7 +799,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
 
   const totalWarnings = model?.stats.warnings.length ?? 0;
   const modeHelp: Record<ViewerMode, string> = {
-    texture: "显示 PMX 材质贴图；贴图会在网格出现后逐张加载。",
+    texture: "显示模型材质贴图；贴图会在网格出现后逐张加载。",
     materials: "按 PMX 漫反射色查看各材质分区。",
     types: "按 BDEF / SDEF / QDEF 类型着色；点击图例可淡化或恢复对应类型。",
     bone: "选择骨骼后显示该骨骼在每个顶点上的权重，0 到 1 使用热力色阶。",

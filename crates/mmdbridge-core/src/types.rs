@@ -31,7 +31,7 @@ impl AssetType {
 
     pub(crate) fn accepts_extension(self, extension: &str) -> bool {
         match self {
-            Self::Model => extension.eq_ignore_ascii_case("pmx"),
+            Self::Model => extension.eq_ignore_ascii_case("pmx") || extension.eq_ignore_ascii_case("pmd"),
             Self::Motion => {
                 extension.eq_ignore_ascii_case("vmd") || extension.eq_ignore_ascii_case("vpd")
             }
@@ -44,7 +44,7 @@ impl AssetType {
 
     pub fn supports_thumbnail_extension(self, extension: &str) -> bool {
         match self {
-            Self::Model => extension.eq_ignore_ascii_case("pmx"),
+            Self::Model => extension.eq_ignore_ascii_case("pmx") || extension.eq_ignore_ascii_case("pmd"),
             Self::Motion => {
                 extension.eq_ignore_ascii_case("vmd") || extension.eq_ignore_ascii_case("vpd")
             }

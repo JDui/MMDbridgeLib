@@ -209,7 +209,7 @@ const metadataLabels: Record<string, string> = {
   duration_seconds: "时长（秒）", start_frame: "起始帧", end_frame: "结束帧", has_bone_motion: "骨骼动画",
   has_morph_motion: "表情动画", has_camera: "包含镜头", has_light: "包含灯光", is_camera_only: "纯镜头",
   is_pose: "Pose", width: "宽度（MMD 单位）", depth: "深度（MMD 单位）", area: "占地面积",
-  file_type: "格式", pmx_version: "PMX 版本", preview_frame: "预览帧",
+  file_type: "格式", pmx_version: "PMX 版本", pmd_version: "PMD 版本", preview_frame: "预览帧",
 };
 
 function formatValue(value: unknown): string {
@@ -931,8 +931,8 @@ export default function App() {
   async function openModelPreview() {
     const path = await open({
       multiple: false,
-      title: "打开 PMX 模型预览",
-      filters: [{ name: "PMX 模型", extensions: ["pmx"] }],
+      title: "打开模型预览",
+      filters: [{ name: "PMX / PMD 模型", extensions: ["pmx", "pmd"] }],
     });
     if (typeof path !== "string" || !path.trim()) return;
     const name = path.split(/[\\/]/).pop() ?? path;

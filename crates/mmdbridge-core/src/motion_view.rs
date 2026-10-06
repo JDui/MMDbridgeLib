@@ -33,7 +33,7 @@ fn read_limited(path: &Path) -> CoreResult<Vec<u8>> {
     if std::fs::metadata(path)?.len() > MAX_SOURCE_BYTES {
         return Err(CoreError::ModelPreview(format!("文件超过 512 MiB 预览上限：{}", path.display())));
     }
-    Ok(std::fs::read(path)?)
+    Ok(crate::model_io::read_source(path)?)
 }
 
 fn paired_camera_path(library: &Library, asset_id: &str) -> CoreResult<Option<PathBuf>> {

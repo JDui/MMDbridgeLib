@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::Utc;
-use mmd_anim_format::parse_pmx_model;
+use crate::model_io::{parse_pmx_model, read_source};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
@@ -1387,10 +1387,10 @@ impl Library {
     pub fn model_preview(&self, asset_id: &str) -> CoreResult<Vec<u8>> {
         let asset = self.inspect_asset(asset_id)?;
         if asset.asset_type != AssetType::Model
-            || !asset.primary_source.to_ascii_lowercase().ends_with(".pmx")
+            || !crate::model_io::is_model_path(Path::new(&asset.primary_source))
         {
             return Err(CoreError::ModelPreview(
-                "3D preview currently supports PMX model assets".to_owned(),
+                "3D 模型预览支持 PMX 和 PMD 资产".to_owned(),
             ));
         }
         self.model_preview_file(Path::new(&asset.primary_source))
@@ -1417,6 +1417,9 @@ impl Library {
     }
 
     pub fn model_preview_file(&self, path: &Path) -> CoreResult<Vec<u8>> {
+        if path.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("pmd")) {
+            return crate::thumbnail::pmd_preview_file(path);
+        }
         if !path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -1432,7 +1435,7 @@ impl Library {
                 "PMX file exceeds the 512 MiB preview limit".to_owned(),
             ));
         }
-        let bytes = std::fs::read(path)?;
+        let bytes = read_source(path)?;
         let parsed =
             parse_pmx_model(&bytes).map_err(|error| CoreError::ModelPreview(error.to_string()))?;
         crate::thumbnail::remember_preview_textures(path, &metadata, parsed.materials.iter().map(|material| material.texture_path.clone()));
@@ -1453,6 +1456,9 @@ impl Library {
             return Err(CoreError::ModelPreview(
                 "PMX mesh has inconsistent geometry or weight data".to_owned(),
             ));
+        }
+        if geometry.indices.iter().any(|index| *index as usize >= vertex_count) {
+            return Err(CoreError::ModelPreview("PMX 三角形引用了不存在的顶点".to_owned()));
         }
         let group_count = geometry.material_groups.len();
         let texture_paths = geometry.material_groups.iter().map(|group| {
@@ -1598,8 +1604,7 @@ impl Library {
     }
 
     pub fn model_preview_texture_file(&self, model_path: &Path, texture_path: &str) -> CoreResult<Option<(Vec<u8>, u8)>> {
-        if !model_path.extension().and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("pmx"))
+        if !crate::model_io::is_model_path(model_path)
             || texture_path.len() > 4096 {
             return Err(CoreError::ModelPreview("invalid model or texture path".to_owned()));
         }

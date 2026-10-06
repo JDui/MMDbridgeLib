@@ -4,6 +4,7 @@ mod error;
 mod filters;
 mod jobs;
 mod motion_view;
+mod model_io;
 mod operations;
 mod parser;
 mod pmx_runtime;

@@ -1,13 +1,14 @@
 use std::path::Path;
 
-use mmd_anim_format::{parse_pmd_model, parse_pmx_model, parse_vmd_animation, parse_vpd_pose};
+use mmd_anim_format::{parse_vmd_animation, parse_vpd_pose};
+use crate::model_io::{parse_pmd_model, parse_pmx_model};
 use serde_json::json;
 
 use crate::types::{AssetType, ParsedCandidate, ParsedDependency, display_name};
 
 const CAMERA_CLASSIFICATION_VERSION: u8 = 2;
-const PMX_PARSER_REVISION: u32 = 2;
-const PMD_PARSER_REVISION: u32 = 1;
+const PMX_PARSER_REVISION: u32 = 3;
+const PMD_PARSER_REVISION: u32 = 2;
 const VMD_PARSER_REVISION: u32 = 2;
 const VPD_PARSER_REVISION: u32 = 1;
 
@@ -38,7 +39,7 @@ pub(crate) fn parse_asset(
         .unwrap_or_default();
     let fallback_name = display_name(path);
     match asset_type {
-        AssetType::Model => {
+        AssetType::Model if extension.eq_ignore_ascii_case("pmx") => {
             let parsed = parse_pmx_model(bytes).map_err(|error| error.to_string())?;
             Ok(ParsedCandidate {
                 name: non_empty(&parsed.metadata.name, fallback_name),
@@ -153,7 +154,7 @@ pub(crate) fn parse_asset(
                 dependencies: pmx_dependencies(&parsed.materials),
             })
         }
-        AssetType::Scene if extension.eq_ignore_ascii_case("pmd") => {
+        AssetType::Model | AssetType::Scene if extension.eq_ignore_ascii_case("pmd") => {
             let parsed = parse_pmd_model(bytes).map_err(|error| error.to_string())?;
             let (width, depth) = bounds_xz(
                 parsed
@@ -164,20 +165,13 @@ pub(crate) fn parse_asset(
             );
             let mut dependencies = Vec::new();
             for material in &parsed.materials {
-                let references = material
-                    .texture_name
-                    .split('*')
-                    .map(str::trim)
-                    .filter(|reference| !reference.is_empty());
-                for (index, reference) in references.enumerate() {
+                for reference in material.texture_name.split('*').map(str::trim).filter(|reference| !reference.is_empty()) {
                     push_dependency(
                         &mut dependencies,
                         reference,
-                        if index == 0 {
-                            "texture"
-                        } else {
+                        if is_sphere_texture(reference) {
                             "sphere_texture"
-                        },
+                        } else { "texture" },
                     );
                 }
             }
@@ -186,7 +180,12 @@ pub(crate) fn parse_asset(
             }
             Ok(ParsedCandidate {
                 name: non_empty(&parsed.metadata.name, fallback_name),
-                metadata: json!({"file_type":"pmd", "polygon_count":parsed.metadata.counts.faces, "width":width, "depth":depth, "area":width*depth, "coordinate_unit":"MMD", "bone_count":parsed.metadata.counts.bones, "parser_diagnostics":parsed.diagnostics}),
+                metadata: json!({"file_type":"pmd", "pmd_version":parsed.metadata.version,
+                    "vertex_count":parsed.metadata.counts.vertices, "polygon_count":parsed.metadata.counts.faces,
+                    "material_count":parsed.metadata.counts.materials, "bone_count":parsed.metadata.counts.bones,
+                    "morph_count":parsed.metadata.counts.morphs, "rigid_body_count":parsed.metadata.counts.rigid_bodies,
+                    "joint_count":parsed.metadata.counts.joints, "english_name":parsed.metadata.english_name,
+                    "width":width, "depth":depth, "area":width*depth, "coordinate_unit":"MMD", "parser_diagnostics":parsed.diagnostics}),
                 status: "Ready".to_owned(),
                 dependencies,
             })
@@ -196,6 +195,15 @@ pub(crate) fn parse_asset(
             asset_type.as_str()
         )),
     }
+}
+
+pub(crate) fn is_sphere_texture(reference: &str) -> bool {
+    Path::new(reference).extension().and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("sph") || value.eq_ignore_ascii_case("spa"))
+}
+
+pub(crate) fn pmd_diffuse_texture(reference: &str) -> &str {
+    reference.split('*').map(str::trim).find(|path| !path.is_empty() && !is_sphere_texture(path)).unwrap_or("")
 }
 
 fn pmx_dependencies(

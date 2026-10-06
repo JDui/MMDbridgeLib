@@ -1,4 +1,5 @@
-use mmd_anim_format::{PmxRuntimeImport, export_pmx_model, parse_pmx_model};
+use mmd_anim_format::{PmxRuntimeImport, export_pmx_model};
+use crate::model_io::parse_pmx_model;
 use mmd_anim_format::error::ImportError;
 use mmd_anim_runtime::ModelBuildError;
 
@@ -15,6 +16,7 @@ pub(crate) struct PmxRuntimeCorrections {
 pub(crate) fn import_pmx_runtime_compatible(
     bytes: &[u8],
 ) -> Result<(PmxRuntimeImport, PmxRuntimeCorrections), ImportError> {
+    crate::model_io::validate_pmx(bytes).map_err(|_| ImportError::SectionOverflow)?;
     let original_error = match mmd_anim_format::import_pmx_runtime(bytes) {
         Ok(imported) => return Ok((imported, PmxRuntimeCorrections::default())),
         Err(error) => error,
@@ -30,7 +32,7 @@ pub(crate) fn import_pmx_runtime_compatible(
             && reason == "parent cannot reference itself") {
         return Err(original_error);
     }
-    let mut model = parse_pmx_model(bytes)?;
+    let mut model = parse_pmx_model(bytes).map_err(|_| ImportError::SectionOverflow)?;
     let mut corrected = PmxRuntimeCorrections::default();
     for (index, bone) in model.skeleton.bones.iter_mut().enumerate() {
         if bone.parent_index == index as i32 {
