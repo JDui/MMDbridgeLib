@@ -16,7 +16,7 @@ impl Fixture {
             fs::write(path.join("模型.pmx"),fixtures::pmx(false,2,0,false)).unwrap();
             fs::create_dir(path.join("貼図")).unwrap();
             image::RgbaImage::from_pixel(4,4,image::Rgba([180,190,210,255])).save(path.join("貼図/tex.png")).unwrap();
-            let root=library.add_root(AssetType::Model,path.to_str().unwrap(),Some(label.to_owned())).unwrap();
+            let root=library.add_root(AssetType::Model,path.to_str().unwrap(),Some(label)).unwrap();
             library.scan_root(&root.id).unwrap();
             let asset=library.list_assets(Some(AssetType::Model),None,10).unwrap().into_iter().find(|asset|asset.root_id==root.id).unwrap();
             let rgba=vec![190u8;1024*1024*4];

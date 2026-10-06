@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     model.metadata.name = "几何预览模型".to_owned();
     fs::write(models.join("几何预览模型.pmx"), mmd_anim_format::export_pmx_model(&model))?;
     let library = Library::open(fixture.join("data/library.sqlite3"))?;
-    let root = library.add_root(AssetType::Model, models.to_str().ok_or("invalid fixture path")?, Some("模型测试目录".to_owned()))?;
+    let root = library.add_root(AssetType::Model, models.to_str().ok_or("invalid fixture path")?, Some("模型测试目录"))?;
     assert_eq!(library.scan_root(&root.id)?.parse_failures, 0);
     let asset = library.list_assets(Some(AssetType::Model), None, 10)?.remove(0);
     library.create_card_with_thumbnail(&asset.id)?;

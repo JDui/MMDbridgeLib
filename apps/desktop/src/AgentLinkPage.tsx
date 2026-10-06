@@ -65,7 +65,6 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
   }, []);
 
   useEffect(() => {
-    if (!active && current.current?.status !== "active") return;
     let disposed = false; let timer = 0;
     ++pollVersion.current;
     const poll = async () => {
@@ -84,11 +83,11 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
           accept(next); setConnectionError("");
         }
       } catch (reason) { if (!disposed) setConnectionError(toUiError(reason)); }
-      finally { if (!disposed) timer = window.setTimeout(poll, active ? 800 : 1600); }
+      finally { if (!disposed) timer = window.setTimeout(poll, active ? 800 : 2500); }
     };
     void poll();
     return () => { disposed = true; window.clearTimeout(timer); };
-  }, [active, accept, snapshot?.status]);
+  }, [active, accept]);
 
   useEffect(() => {
     if (active && followLog && logBody.current) logBody.current.scrollTop = logBody.current.scrollHeight;
