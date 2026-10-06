@@ -64,10 +64,12 @@ try {
   await page.goto(`${url}/?scheme=dark&before=1`);await select();
   assert.equal(await page.locator('.tag-chip-name').filter({hasText:'整体色:'}).count(),0);
   assert.equal(await page.locator('.inspector-preview img').count(),0);
+  await page.locator('.tags-section').scrollIntoViewIfNeeded();
   await page.screenshot({path:join(output,'MBL_Tags_Stage1_Scan.jpg'),type:'jpeg',quality:92,animations:'disabled'});
   await page.goto(`${url}/?scheme=dark`);await select();
   await page.waitForFunction(()=>[...document.querySelectorAll('.asset-card img')].length===2&&[...document.querySelectorAll('.asset-card img')].every(image=>image.complete&&image.naturalWidth===1024));
   await page.locator('.tag-chip-name').filter({hasText:'整体色:蓝色'}).waitFor();
+  await page.locator('.tags-section').scrollIntoViewIfNeeded();
   await page.screenshot({path:join(output,'MBL_Tags_Stage2_Colours.jpg'),type:'jpeg',quality:92,animations:'disabled'});
   await page.getByRole('button',{name:'设置',exact:true}).click();
   const technical=page.getByRole('checkbox',{name:'扫描时生成技术标签',exact:true});
