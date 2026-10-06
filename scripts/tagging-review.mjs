@@ -56,6 +56,8 @@ try {
   const select=async()=>{
     await page.locator('.asset-card').first().waitFor();
     await page.getByRole('button',{name:/蓝色材质测试/}).first().click();
+    const showDetails=page.getByRole('button',{name:'显示资产详情',exact:true});
+    if(await showDetails.count())await showDetails.click();
     await page.locator('.tag-chip-name').filter({hasText:'技术:含SDEF'}).waitFor();
     await page.evaluate(()=>document.fonts.ready);
   };
