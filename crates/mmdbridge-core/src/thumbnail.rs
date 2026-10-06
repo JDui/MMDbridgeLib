@@ -20,11 +20,14 @@ use crate::pmx_runtime::import_pmx_runtime_compatible;
 use crate::model_io::{parse_pmd_model, parse_pmx_model, read_source, MAX_SOURCE_BYTES};
 use crate::{CoreError, CoreResult};
 
+#[path = "thumbnail_framing.rs"]
+mod framing;
+
 const WIDTH: u32 = 1024;
 const HEIGHT: u32 = 1024;
 const QUALITY: f32 = 50.0;
-pub(crate) const RENDERER_VERSION: &str = "0.6.0";
-pub(crate) const PREVIEW_SETTINGS_VERSION: &str = "front-minus-z-down5-indexed-bounds-msaa-v9";
+pub(crate) const RENDERER_VERSION: &str = "0.6.1";
+pub(crate) const PREVIEW_SETTINGS_VERSION: &str = "front-minus-z-down5-subject-surface-msaa-v10";
 pub(crate) const SCENE_PREVIEW_SETTINGS_VERSION: &str = "scene-center-165cm-down5-wide-camera-msaa-v5";
 const MAX_TEXTURE_DIMENSION: u32 = 4096;
 const MAX_TEXTURE_DECODE_DIMENSION: u32 = 8192;
@@ -215,7 +218,7 @@ struct RenderInput {
     materials: Vec<RenderMaterial>,
     camera: Option<mmd_anim_format::vmd::VmdCameraState>,
     scene_view: bool,
-    framing_bounds: Option<(Vec3, Vec3)>,
+    subject_weights: Vec<f32>,
     diagnostics: Vec<String>,
 }
 
@@ -287,7 +290,6 @@ pub(crate) fn render_file_with_progress(
     };
     if scene_asset {
         input.scene_view = true;
-        input.framing_bounds = None;
     }
     drop(parse_permit);
     if !progress("Rendering", 0.40) {
@@ -480,7 +482,6 @@ pub(crate) fn render_vpd_motion_file_with_progress(
         let model = parse_pmx_model(&model_bytes).map_err(CoreError::ThumbnailRender)?;
         render_input_from_pmx_with_pose(&model_bytes, &model, Some(&pose), None, None)?
     };
-    input.framing_bounds = None;
     input.diagnostics.push("MotionPreview:VPD".to_owned());
     drop(parse_permit);
     render_motion_input_with_progress(preview_model_path, input, None, progress)
@@ -595,7 +596,6 @@ pub(crate) fn render_vmd_motion_file_with_progress(
         let model = parse_pmx_model(&model_bytes).map_err(CoreError::ThumbnailRender)?;
         render_input_from_pmx_with_pose(&model_bytes, &model, None, Some(&sample), camera)?
     };
-    input.framing_bounds = None;
     input
         .diagnostics
         .push(format!("MotionPreview:VMD:{preview_frame}"));
@@ -771,7 +771,7 @@ fn render_input_from_pmx_with_pose(
         materials,
         camera,
         scene_view: false,
-        framing_bounds: character_skeleton_bounds(model),
+        subject_weights: framing::pmx_body_weights(model),
         diagnostics,
     })
 }
@@ -963,7 +963,7 @@ fn render_input_from_pmd(model: &PmdParsedModel) -> CoreResult<RenderInput> {
         materials,
         camera: None,
         scene_view: false,
-        framing_bounds: None,
+        subject_weights: framing::pmd_body_weights(model),
         diagnostics,
     })
 }
@@ -2017,12 +2017,12 @@ impl GpuRenderer {
             vertices: source_vertices,
             uvs,
             sphere_uvs,
-            indices,
-            material_ranges,
+            mut indices,
+            mut material_ranges,
             materials,
             camera,
             scene_view,
-            framing_bounds,
+            subject_weights,
             mut diagnostics,
         } = input;
         if source_vertices.len() != uvs.len() || indices.is_empty() {
@@ -2030,18 +2030,7 @@ impl GpuRenderer {
                 "网格顶点、UV 或索引数据不完整".to_owned(),
             ));
         }
-        // Frame in camera space so the slight downward view also fits depth-heavy meshes.
-        let tilt = Quat::from_rotation_x(-5.0f32.to_radians());
-        for index in &indices {
-            if *index as usize >= source_vertices.len() {
-                return Err(CoreError::ThumbnailRender(format!("网格索引 {index} 超出顶点范围 {}", source_vertices.len())));
-            }
-        }
-        let (minimum, maximum) = bounds(indices.iter().map(|index| tilt * source_vertices[*index as usize].position))?;
-        let half_extent = ((maximum.x - minimum.x).max(maximum.y - minimum.y) * 0.5).max(0.001) / 0.92;
-        let center = (minimum + maximum) * 0.5;
-        if framing_bounds.is_some() { diagnostics.push("CharacterIndexedMeshFraming".to_owned()); }
-        let depth_range = (maximum.z - minimum.z).max(0.001);
+        let source_triangle_count = indices.len() / 3;
         let camera_view_projection = if scene_view {
             diagnostics.push("SceneWideCamera:165cm:90deg:Down5deg".to_owned());
             Some(scene_camera_view_projection(&source_vertices))
@@ -2053,6 +2042,19 @@ impl GpuRenderer {
         if camera.is_some() && camera_view_projection.is_none() {
             diagnostics.push("InvalidVmdCamera:usingAutoFraming".to_owned());
         }
+        let (minimum, maximum) = if camera_view_projection.is_none() {
+            let frame = framing::subject_frame(&source_vertices, &indices, &material_ranges, &materials,
+                &subject_weights, &mut diagnostics, progress)?;
+            indices = frame.indices;
+            material_ranges = frame.ranges;
+            (frame.minimum, frame.maximum)
+        } else {
+            framing::indexed_bounds(&source_vertices, &indices)?
+        };
+        let span = (maximum.x - minimum.x).max(maximum.y - minimum.y);
+        let half_extent = span.max(f64::MIN_POSITIVE) * 0.5 / 0.92;
+        let center = minimum + (maximum - minimum) * 0.5;
+        let depth_range = (maximum.z - minimum.z).max(half_extent * 1.0e-6).max(f64::MIN_POSITIVE);
         if let Some(camera) = camera.filter(|_| camera_view_projection.is_some()) {
             diagnostics.push(format!(
                 "VmdCameraProjection:{}:Fov:{}",
@@ -2066,15 +2068,15 @@ impl GpuRenderer {
         }
         let mut gpu_vertices = Vec::with_capacity(source_vertices.len());
         for (index, vertex) in source_vertices.iter().enumerate() {
-            let projected = tilt * vertex.position;
+            let projected = framing::project(vertex.position);
             let depth = (projected.z - minimum.z) / depth_range;
             let position = if let Some(view_projection) = camera_view_projection {
                 (view_projection * vertex.position.extend(1.0)).to_array()
             } else {
                 [
-                    (center.x - projected.x) / half_extent,
-                    (projected.y - center.y) / half_extent,
-                    0.002 + depth.clamp(0.0, 1.0) * 0.996,
+                    ((center.x - projected.x) / half_extent).clamp(-1.0e6, 1.0e6) as f32,
+                    ((projected.y - center.y) / half_extent).clamp(-1.0e6, 1.0e6) as f32,
+                    (0.002 + depth.clamp(0.0, 1.0) * 0.996) as f32,
                     1.0,
                 ]
             };
@@ -2272,7 +2274,7 @@ impl GpuRenderer {
                 quality: QUALITY as u8,
                 antialiasing_samples: self.sample_count,
                 preview_frame: None,
-                triangle_count: indices.len() / 3,
+                triangle_count: source_triangle_count,
                 material_count: materials.len(),
                 texture_count,
                 vertex_count: source_vertices.len(),
@@ -2696,60 +2698,6 @@ fn build_draw_groups(
         });
     }
     Ok(groups)
-}
-
-fn bounds(vertices: impl Iterator<Item = Vec3>) -> CoreResult<(Vec3, Vec3)> {
-    let mut minimum = Vec3::splat(f32::INFINITY);
-    let mut maximum = Vec3::splat(f32::NEG_INFINITY);
-    for vertex in vertices {
-        if !vertex.is_finite() {
-            return Err(CoreError::ThumbnailRender(
-                "骨骼蒙皮后包含非有限顶点坐标".to_owned(),
-            ));
-        }
-        minimum = minimum.min(vertex);
-        maximum = maximum.max(vertex);
-    }
-    if !minimum.is_finite() || !maximum.is_finite() {
-        return Err(CoreError::ThumbnailRender("模型边界框无效".to_owned()));
-    }
-    Ok((minimum, maximum))
-}
-
-fn character_skeleton_bounds(model: &PmxParsedModel) -> Option<(Vec3, Vec3)> {
-    let bones = &model.skeleton.bones;
-    if bones.len() < 12 {
-        return None;
-    }
-    let has_head = bones.iter().any(|bone| {
-        bone.name.contains('頭') || bone.english_name.to_ascii_lowercase().contains("head")
-    });
-    let has_leg = bones.iter().any(|bone| {
-        bone.name.contains('足') || bone.english_name.to_ascii_lowercase().contains("leg")
-    });
-    if !has_head || !has_leg {
-        return None;
-    }
-    let mut axes = [Vec::new(), Vec::new(), Vec::new()];
-    for bone in bones {
-        for (axis, value) in axes.iter_mut().zip(bone.position) {
-            if value.is_finite() { axis.push(value); }
-        }
-    }
-    if axes.iter().any(|axis| axis.len() < 12) {
-        return None;
-    }
-    let mut minimum = [0.0; 3];
-    let mut maximum = [0.0; 3];
-    for (index, axis) in axes.iter_mut().enumerate() {
-        axis.sort_by(f32::total_cmp);
-        let trim = axis.len() / 100;
-        minimum[index] = axis[trim];
-        maximum[index] = axis[axis.len() - 1 - trim];
-    }
-    let (minimum, maximum) = (Vec3::from_array(minimum), Vec3::from_array(maximum));
-    (maximum.y - minimum.y >= 1.0 && maximum.x - minimum.x >= 0.1)
-        .then_some((minimum, maximum))
 }
 
 fn scene_camera_view_projection(vertices: &[SkinnedVertex]) -> Mat4 {
