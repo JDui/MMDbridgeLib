@@ -10,12 +10,44 @@ const app = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const temporary = await mkdtemp(join(tmpdir(), "mmdbridge-functional-"));
 after(async () => { await rm(temporary, { recursive: true }); });
 const bundle = await build({
-  stdin: { contents: 'export * from "./src/preferences"; export * from "./src/libraryState"; export * from "./src/frameRequests"; export * from "./src/previewCamera";', resolveDir: app, loader: "ts" },
+  stdin: { contents: 'export * from "./src/preferences"; export * from "./src/libraryState"; export * from "./src/frameRequests"; export * from "./src/previewCamera"; export * from "./src/viewerPresets"; export * as Three from "./src/vendor/three.module.js";', resolveDir: app, loader: "ts" },
   bundle: true, platform: "node", format: "esm", write: false,
 });
 const modulePath = join(temporary, "functions.mjs");
 await writeFile(modulePath, bundle.outputFiles[0].text);
-const { readPreference, writePreference, readAssetViewState, visibleSelection, activeThumbnailStatuses, createFrameRequestQueue, sphereCameraDistance } = await import(pathToFileURL(modulePath).href);
+const { readPreference, writePreference, readAssetViewState, visibleSelection, activeThumbnailStatuses, createFrameRequestQueue, sphereCameraDistance,
+  createMatcapAppearance, applyScenePreset, Three } = await import(pathToFileURL(modulePath).href);
+
+test("Matcap switches preserve cutout, opacity, geometry and skinning, including late textures", () => {
+  const geometry = new Three.BufferGeometry();
+  const original = new Three.MeshStandardMaterial({ opacity: 0.6, alphaHash: true, alphaTest: 0.5, vertexColors: true });
+  const mesh = new Three.SkinnedMesh(geometry, original);
+  const skeleton = new Three.Skeleton([new Three.Bone()]); mesh.bind(skeleton);
+  const appearance = createMatcapAppearance(mesh, [original]);
+  const map = new Three.DataTexture(new Uint8Array([50,100,150,0]),1,1,Three.RGBAFormat);
+  appearance.apply("ceramic");
+  const matcap = mesh.material;
+  assert.ok(matcap.isMeshMatcapMaterial); assert.equal(matcap.vertexColors,false);
+  assert.equal(matcap.opacity,0.6); assert.equal(matcap.alphaTest,0.5); assert.equal(matcap.alphaHash,true);
+  original.map = map; appearance.apply("ceramic"); assert.equal(matcap.map,map);
+  const shader = { fragmentShader: "#include <map_fragment>" }; matcap.onBeforeCompile(shader);
+  assert.match(shader.fragmentShader,/diffuseColor\.a/); assert.doesNotMatch(shader.fragmentShader,/diffuseColor\.rgb/);
+  appearance.apply("silver"); assert.notEqual(matcap.matcap,null);
+  assert.equal(mesh.geometry,geometry); assert.equal(mesh.skeleton,skeleton);
+  appearance.apply("original"); assert.equal(mesh.material,original); assert.equal(original.map,map);
+  let disposed = 0; matcap.addEventListener("dispose",()=>disposed++);
+  appearance.dispose(); appearance.dispose(); assert.equal(disposed,1);
+  geometry.dispose(); original.dispose(); map.dispose(); skeleton.dispose();
+});
+
+test("scene presets restore the original lighting and tone mapping", () => {
+  const lighting = { renderer: { setClearColor(value){this.background=value;} }, ambient: new Three.AmbientLight(),
+    key: new Three.DirectionalLight(), fill: new Three.DirectionalLight(), rim: new Three.DirectionalLight() };
+  applyScenePreset(lighting,"warm"); const warm = lighting.key.color.getHex();
+  applyScenePreset(lighting,"night"); assert.notEqual(lighting.key.color.getHex(),warm);
+  applyScenePreset(lighting,"original"); assert.equal(lighting.renderer.toneMapping,Three.NoToneMapping);
+  assert.equal(lighting.renderer.background,0x10191f); assert.equal(lighting.ambient.intensity,1.5);
+});
 
 test("initial camera fits a whole sphere in wide and narrow viewports", () => {
   for (const aspect of [0.35,0.55,1,1.3,2.1]) {

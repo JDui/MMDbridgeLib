@@ -62,7 +62,15 @@
   display: flex;
   align-items: center;
   gap: 9px;
+  flex-shrink: 0;
 }
+
+.viewer-preset-select { display: flex; align-items: center; gap: 8px; color: var(--text-3); font-size: 11px; white-space: nowrap; }
+.viewer-preset-select .mantine-NativeSelect-root { width: 112px; }
+.scene-reference-controls { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.scene-reference-controls > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scene-reference-controls .mantine-Checkbox-label { color: var(--text-3); font-size: 11px; }
+.scene-reference-error { color: var(--library-error); }
 
 .model-viewer-content {
   min-height: 0;
@@ -420,6 +428,9 @@
 }
 
 @media (max-width: 800px) {
+  .model-viewer-header { flex-wrap: wrap; gap: 10px; }
+  .model-viewer-controls { flex-wrap: wrap; max-width: calc(100% - 12px); justify-content: flex-end; }
+  .scene-reference-controls { flex-wrap: wrap; gap: 8px; }
   .model-viewer-window { width: 100%; height: calc(100dvh - 40px); }
   .model-viewer-content { grid-template-columns: 230px minmax(0, 1fr); }
   .mv-section { padding: 9px; }

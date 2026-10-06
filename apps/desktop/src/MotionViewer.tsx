@@ -8,6 +8,8 @@ import { toUiError } from "./uiError";
 import { sphereCameraDistance } from "./previewCamera";
 import { loadViewerTextures, setMaterialAlpha, setMaterialCentre, sortTransparentMaterials } from "./viewerRendering";
 import { createFrameRequestQueue, type FrameRequestQueue } from "./frameRequests";
+import { writePreference } from "./preferences";
+import { MATCAP_PRESETS, MATCAP_PREFERENCE, readViewerPreset, createMatcapAppearance, type MatcapAppearance, type MatcapPreset } from "./viewerPresets";
 import "./motion-viewer.css";
 
 type MotionAsset = { id: string; name: string; primarySource: string; metadata: Record<string, unknown> };
@@ -19,7 +21,7 @@ type CameraMode = "orbit" | "own" | "paired";
 export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; onClose: () => void }) {
   const host = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<{ renderer: any; scene: any; camera: any; ortho: any; controls: any; mesh: any;
-    bones: any[]; textures: any[]; resizeObserver: ResizeObserver } | null>(null);
+    bones: any[]; textures: any[]; appearance: MatcapAppearance | null; resizeObserver: ResizeObserver } | null>(null);
   const frameQueue = useRef<FrameRequestQueue | null>(null);
   const frameRef = useRef(0);
   const maxFrameRef = useRef(0);
@@ -38,6 +40,13 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
   const [hasPairedCamera, setHasPairedCamera] = useState(false);
   const lastCamera = useRef<MotionFrame | null>(null);
   const orbitState = useRef<{ position: any; target: any } | null>(null);
+  const [matcap, setMatcap] = useState<MatcapPreset>(() => readViewerPreset(MATCAP_PREFERENCE, MATCAP_PRESETS));
+  const matcapRef = useRef(matcap);
+
+  useEffect(() => {
+    matcapRef.current = matcap;
+    sceneRef.current?.appearance?.apply(matcap);
+  }, [matcap]);
 
   function applyCamera(value: MotionFrame) {
     const view = sceneRef.current;
@@ -134,7 +143,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
     };
     const resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(element);
-    sceneRef.current = { renderer, scene, camera, ortho, controls, mesh: null, bones: [], textures: [], resizeObserver };
+    sceneRef.current = { renderer, scene, camera, ortho, controls, mesh: null, bones: [], textures: [], appearance: null, resizeObserver };
     resize();
     renderer.setAnimationLoop((time: number) => {
       if (playingRef.current && maxFrameRef.current > 0 && !queue.pending) {
@@ -201,6 +210,8 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
         const active = sceneRef.current;
         if (!active) return;
         active.mesh = mesh; active.bones = bones;
+        active.appearance = createMatcapAppearance(mesh, materials);
+        active.appearance.apply(matcapRef.current);
         geometry.computeBoundingSphere();
         const sphere = geometry.boundingSphere;
         const radius = Math.max(sphere.radius, 0.01);
@@ -236,6 +247,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
                 setMaterialAlpha(materials[index], group.color[3], alphaMode);
                 materials[index].needsUpdate = true;
               });
+              active.appearance?.apply(matcapRef.current);
             } finally { URL.revokeObjectURL(url); }
           } catch (reason) { console.warn("动作预览贴图加载失败", texturePath, reason); }
         });
@@ -249,6 +261,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
       resizeObserver.disconnect();
       controls.dispose();
       const active = sceneRef.current;
+      active?.appearance?.dispose();
       active?.textures.forEach((texture) => texture.dispose());
       if (active?.mesh) {
         active.mesh.geometry.dispose();
@@ -276,7 +289,7 @@ export default function MotionViewer({ asset, onClose }: { asset: MotionAsset; o
     } else if (lastCamera.current) applyCamera(lastCamera.current);
   }
 
-  return <Modal.Root opened onClose={onClose} withinPortal={false} centered xOffset={20} yOffset={20} size={1240} zIndex={250} padding={0} transitionProps={{ duration: 150 }}><Modal.Overlay backgroundOpacity={0.72} blur={6} /><Modal.Content className="viewer-modal-content" aria-label={`${asset.name} VMD 3D 预览`}><Modal.Body p={0} className={"motion-viewer-window"}><header className="model-viewer-header"><div><span className="model-viewer-eyebrow">动作预览</span><h2>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div><ActionIcon variant="subtle" size="sm" className="model-viewer-close" aria-label="关闭动作预览" onClick={onClose}>×</ActionIcon></header><div className="motion-viewer-stage" ref={host}>
+  return <Modal.Root opened onClose={onClose} withinPortal={false} centered xOffset={20} yOffset={20} size={1240} zIndex={250} padding={0} transitionProps={{ duration: 150 }}><Modal.Overlay backgroundOpacity={0.72} blur={6} /><Modal.Content className="viewer-modal-content" aria-label={`${asset.name} VMD 3D 预览`}><Modal.Body p={0} className={"motion-viewer-window"}><header className="model-viewer-header"><div><span className="model-viewer-eyebrow">动作预览</span><h2>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div><div className="model-viewer-header-actions"><label className="viewer-preset-select">Matcap<NativeSelect aria-label="动作 Matcap 预设" value={matcap} disabled={loading || !!error} onChange={(event) => { const value = event.target.value as MatcapPreset; matcapRef.current = value; setMatcap(value); writePreference(MATCAP_PREFERENCE, value); }}>{MATCAP_PRESETS.map((preset) => <option key={preset.value} value={preset.value}>{preset.label}</option>)}</NativeSelect></label><ActionIcon variant="subtle" size="sm" className="model-viewer-close" aria-label="关闭动作预览" onClick={onClose}>×</ActionIcon></div></header><div className="motion-viewer-stage" ref={host}>
         {loading && <div className="model-viewer-message">正在加载预览模型和 VMD 轨道…</div>}
         {error && <div className="model-viewer-message model-viewer-error">{error}</div>}
       </div><footer className="motion-viewer-timeline">

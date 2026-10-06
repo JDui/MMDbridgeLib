@@ -101,6 +101,96 @@ fn main() -> Result<(), Box<dyn Error>> {
     let png = library.model_preview_texture_file(&pmd_path,"tex.png")?.ok_or("PMD texture absent")?;
     fs::write(output.join("preview-texture.png"),png.0)?;
     fs::write(output.join("manifest.json"),serde_json::to_vec_pretty(&json!({"synthetic":true,"entries":manifest}))?)?;
+    write_viewer_fixtures(&output, &vertices, &indices)?;
     println!("{}",serde_json::to_string(&json!({"synthetic":true,"rendered":manifest.len(),"models":5,"pmdMotionPreviews":2}))?);
+    Ok(())
+}
+
+fn write_viewer_fixtures(output: &std::path::Path,
+    sphere: &[([f32;3],[f32;3],[f32;2])], sphere_indices: &[u32]) -> Result<(), Box<dyn Error>> {
+    let folder = output.join("viewer-fixtures"); fs::create_dir(&folder)?;
+    let mut vertices = Vec::new(); let mut indices = Vec::new();
+    for (centre, scale) in [
+        ([0.0,18.5,0.0],[2.0,2.1,1.65]), ([0.0,12.5,0.0],[2.2,3.9,1.15]),
+        ([0.0,8.9,0.0],[2.5,1.5,1.25]), ([-3.0,12.0,0.0],[0.7,3.3,0.7]),
+        ([3.0,12.0,0.0],[0.7,3.3,0.7]), ([-1.15,4.6,0.0],[0.7,4.25,0.75]),
+        ([1.15,4.6,0.0],[0.7,4.25,0.75]), ([-1.15,0.5,-0.45],[0.8,0.5,1.3]),
+        ([1.15,0.5,-0.45],[0.8,0.5,1.3]),
+    ] {
+        let offset = vertices.len() as u32;
+        for (_, normal, uv) in sphere {
+            let position = std::array::from_fn(|axis| centre[axis] + normal[axis] * scale[axis]);
+            let mut transformed: [f32;3] = std::array::from_fn(|axis| normal[axis] / scale[axis]);
+            let length = transformed.iter().map(|value| value * value).sum::<f32>().sqrt();
+            transformed.iter_mut().for_each(|value| *value /= length);
+            vertices.push((position, transformed, *uv));
+        }
+        indices.extend(sphere_indices.iter().map(|index| index + offset));
+    }
+    let pmx_path = folder.join("参照角色.pmx");
+    let mut pmx = mmd_anim_format::parse_pmx_model(&fixtures::pmx_mesh(false,2,0,false,&vertices,&indices))?;
+    pmx.materials[0].texture_path.clear(); pmx.materials[0].sphere_texture_path.clear();
+    fs::write(&pmx_path,mmd_anim_format::export_pmx_model(&pmx))?;
+    let pmd_path = folder.join("参照角色.pmd");
+    let mut pmd = mmd_anim_format::parse_pmd_model(&fixtures::pmd(false,""))?;
+    let template = pmd.geometry.vertices[0].clone();
+    pmd.geometry.vertices = vertices.iter().map(|(position,normal,uv)| {
+        let mut vertex = template.clone(); vertex.position = *position; vertex.normal = *normal;
+        vertex.uv = *uv; vertex.bone_weight = 100; vertex
+    }).collect();
+    pmd.geometry.indices = indices.iter().map(|index| *index as u16).collect();
+    pmd.materials[0].face_count = (indices.len()/3) as u32;
+    fs::write(&pmd_path,mmd_anim_format::export_pmd_model(&pmd))?;
+    let library = Library::in_memory()?;
+    fs::write(output.join("viewer-character-pmx.bin"),library.model_preview_file(&pmx_path)?)?;
+    fs::write(output.join("viewer-character-pmd.bin"),library.model_preview_file(&pmd_path)?)?;
+
+    let scene_folder = folder.join("scenes"); fs::create_dir(&scene_folder)?;
+    let mut room_vertices = Vec::new(); let mut room_indices = Vec::new();
+    let mut quad = |points: [[f32;3];4], normal: [f32;3]| {
+        let offset = room_vertices.len() as u32;
+        for (position,uv) in points.into_iter().zip([[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0]]) {
+            room_vertices.push((position,normal,uv));
+        }
+        room_indices.extend([offset,offset+1,offset+2,offset,offset+2,offset+3]);
+    };
+    quad([[-32.0,-0.1,-60.0],[32.0,-0.1,-60.0],[32.0,-0.1,32.0],[-32.0,-0.1,32.0]],[0.0,1.0,0.0]);
+    quad([[-32.0,0.0,32.0],[32.0,0.0,32.0],[32.0,36.0,32.0],[-32.0,36.0,32.0]],[0.0,0.0,-1.0]);
+    quad([[-32.0,0.0,-60.0],[-32.0,0.0,32.0],[-32.0,36.0,32.0],[-32.0,36.0,-60.0]],[1.0,0.0,0.0]);
+    quad([[32.0,0.0,32.0],[32.0,0.0,-60.0],[32.0,36.0,-60.0],[32.0,36.0,32.0]],[-1.0,0.0,0.0]);
+    let mut room = mmd_anim_format::parse_pmx_model(&fixtures::pmx_mesh(false,2,0,false,&room_vertices,&room_indices))?;
+    room.metadata.name = "场景与尺寸参照".to_owned(); room.materials[0].texture_path.clear();
+    fs::write(scene_folder.join("场景.pmx"),mmd_anim_format::export_pmx_model(&room))?;
+    let root = library.add_root(AssetType::Scene,scene_folder.to_str().ok_or("invalid scene path")?,None)?;
+    assert_eq!(library.scan_root(&root.id)?.parse_failures,0);
+    let scene = library.list_assets(Some(AssetType::Scene),None,1)?.remove(0);
+    fs::write(output.join("viewer-scene.bin"),library.scene_preview(&scene.id)?)?;
+
+    let motion_folder = folder.join("motions"); fs::create_dir(&motion_folder)?;
+    let mut vmd = b"Vocaloid Motion Data 0002".to_vec(); vmd.resize(30,0); vmd.extend([0;20]);
+    vmd.extend(2u32.to_le_bytes());
+    for (frame,x) in [(0u32,0.0),(60u32,3.0)] {
+        let mut name = [0u8;15]; name[..4].copy_from_slice(b"root"); vmd.extend(name);
+        vmd.extend(frame.to_le_bytes()); fixtures::floats(&mut vmd,&[x,0.0,0.0,0.0,0.0,0.0,1.0]); vmd.extend([20;64]);
+    }
+    for _ in 0..5 { vmd.extend(0u32.to_le_bytes()); }
+    fs::write(motion_folder.join("参照角色动作.vmd"),vmd)?;
+    library.set_motion_preview_model(Some(pmd_path.to_str().ok_or("invalid reference path")?))?;
+    let root = library.add_root(AssetType::Motion,motion_folder.to_str().ok_or("invalid motion path")?,None)?;
+    assert_eq!(library.scan_root(&root.id)?.parse_failures,0);
+    let motion = library.list_assets(Some(AssetType::Motion),None,1)?.remove(0);
+    let mut frames = Vec::new();
+    for frame in 0..=60 {
+        let mut value = library.motion_preview_frame(&motion.id,frame)?;
+        value["modelPath"] = json!("E:\\MMD\\Tests\\参照角色.pmd"); frames.push(value);
+    }
+    let mut scene_display = serde_json::to_value(scene)?;
+    scene_display["primarySource"] = json!("E:\\MMD\\Tests\\场景.pmx");
+    let mut motion_display = serde_json::to_value(motion)?;
+    motion_display["primarySource"] = json!("E:\\MMD\\Tests\\参照角色动作.vmd");
+    fs::write(output.join("viewer-fixtures.json"),serde_json::to_vec_pretty(&json!({
+        "synthetic":true,"scene":scene_display,"motion":motion_display,"frames":frames,
+        "referencePmx":"E:\\MMD\\Tests\\参照角色.pmx","referencePmd":"E:\\MMD\\Tests\\参照角色.pmd"
+    }))?)?;
     Ok(())
 }

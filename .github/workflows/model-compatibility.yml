@@ -7,6 +7,7 @@ on:
       - 'crates/mmdbridge-core/**'
       - 'apps/desktop/src/**'
       - 'scripts/model-review*'
+      - 'scripts/viewer-review*'
       - '.github/workflows/model-compatibility.yml'
   workflow_dispatch:
 
@@ -46,6 +47,8 @@ jobs:
           "$RUNNER_TEMP/mbl-browser-test/node_modules/.bin/playwright" install --with-deps chromium
       - name: Verify image decoding and model UI loading
         run: node scripts/model-review.mjs
+      - name: Verify viewer presets and origin reference
+        run: node scripts/viewer-review.mjs
       - uses: actions/upload-artifact@v7
         if: always()
         with:

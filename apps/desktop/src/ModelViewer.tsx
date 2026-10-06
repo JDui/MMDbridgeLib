@@ -6,6 +6,9 @@ import { OrbitControls } from "./vendor/OrbitControls.js";
 import { toUiError } from "./uiError";
 import { sphereCameraDistance } from "./previewCamera";
 import { loadViewerTextures, setMaterialAlpha, setMaterialCentre, sortTransparentMaterials } from "./viewerRendering";
+import { writePreference } from "./preferences";
+import { MATCAP_PRESETS, SCENE_PRESETS, MATCAP_PREFERENCE, SCENE_PREFERENCE, readViewerPreset,
+  createMatcapAppearance, applyScenePreset, type MatcapAppearance, type MatcapPreset, type ScenePreset, type SceneLighting } from "./viewerPresets";
 import "./model-viewer.css";
 
 type ViewerAsset = { id?: string; name: string; primarySource: string; assetType?: "model" | "scene" };
@@ -41,6 +44,8 @@ type SceneHandles = {
   grid: any;
   resizeObserver: ResizeObserver;
   frame: (geometry: any) => void;
+  lighting: SceneLighting;
+  viewOrigin: () => void;
 };
 type ModelObjects = {
   data: ParsedModel;
@@ -52,6 +57,7 @@ type ModelObjects = {
   warningPoints: any;
   wireframe: any;
   materials: any[];
+  appearance: MatcapAppearance;
   textures: Map<string, { texture: any; alphaMode: number }>;
   vertexColors: Float32Array;
   pointColors: Float32Array;
@@ -241,6 +247,14 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
   const [showWireframe, setShowWireframe] = useState(false);
   const [showSdefCenters, setShowSdefCenters] = useState(false);
   const [pointSize, setPointSize] = useState(2.5);
+  const [matcap, setMatcap] = useState<MatcapPreset>(() => readViewerPreset(MATCAP_PREFERENCE, MATCAP_PRESETS));
+  const [scenePreset, setScenePreset] = useState<ScenePreset>(() => readViewerPreset(SCENE_PREFERENCE, SCENE_PRESETS));
+  const scenePresetRef = useRef(scenePreset);
+  const [showReference, setShowReference] = useState(true);
+  const [referenceReload, setReferenceReload] = useState(0);
+  const [referenceStatus, setReferenceStatus] = useState("");
+  const [referenceError, setReferenceError] = useState(false);
+  const isScene = asset.assetType === "scene";
 
   useEffect(() => {
     const element = host.current;
@@ -265,7 +279,8 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       controls.rotateSpeed = 0.85;
       controls.zoomSpeed = 0.45;
       controls.zoomToCursor = true;
-      scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+      const ambientLight = new THREE.AmbientLight(0xffffff, 1.5);
+      scene.add(ambientLight);
       const keyLight = new THREE.DirectionalLight(0xffffff, 1.5);
       keyLight.position.set(-14, 26, -20);
       scene.add(keyLight);
@@ -413,7 +428,16 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
         grid.position.y = sphere.center.y - radius * 1.02;
         grid.scale.setScalar(Math.max(radius / 15, 0.01));
       };
-      const sceneHandles: SceneHandles = { renderer, scene, camera, controls, modelRoot, grid, resizeObserver, frame };
+      const lighting = { renderer, ambient: ambientLight, key: keyLight, fill: fillLight, rim: rimLight };
+      if (isScene) applyScenePreset(lighting, scenePresetRef.current);
+      const viewOrigin = () => {
+        pressed.clear();
+        camera.position.set(0, 165 / 8, -40);
+        camera.fov = 55;
+        yaw = Math.PI; pitch = -Math.atan2(165 / 8 - 10, 40); orient();
+        camera.updateProjectionMatrix();
+      };
+      const sceneHandles: SceneHandles = { renderer, scene, camera, controls, modelRoot, grid, resizeObserver, frame, lighting, viewOrigin };
       handles.current = sceneHandles;
       let previousTime = performance.now();
       const movement = new THREE.Vector3();
@@ -455,6 +479,9 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
     setModel(null);
     setSelectedVertex(null);
     setTexturesLoaded(0);
+    if (asset.assetType === "scene") {
+      setMode("texture"); setShowPoints(false); setShowWireframe(false); setShowBones(false); setShowSdefCenters(false);
+    }
     const command = asset.assetType === "scene" ? "scene_preview" : asset.id ? "model_preview" : "model_preview_file";
     const args = asset.id ? { assetId: asset.id } : { path: asset.primarySource };
     invoke<ArrayBuffer>(command, args)
@@ -605,7 +632,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
         scene.renderer.domElement.addEventListener("dblclick", doubleClick);
         objects.current = {
           data: parsed, mesh, pointCloud, sdefCenters, bonePoints, boneLines, warningPoints, wireframe,
-          materials, textures: new Map(), vertexColors, pointColors, selectedPoint, doubleClick,
+          materials, appearance: createMatcapAppearance(mesh, materials), textures: new Map(), vertexColors, pointColors, selectedPoint, doubleClick,
         };
         scene.frame(geometry);
         setModel(parsed);
@@ -649,6 +676,90 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       objects.current = null;
     };
   }, [asset.id, asset.primarySource, asset.assetType]);
+
+  useEffect(() => {
+    scenePresetRef.current = scenePreset;
+    if (isScene && handles.current) applyScenePreset(handles.current.lighting, scenePreset);
+  }, [scenePreset, isScene]);
+
+  useEffect(() => {
+    const view = handles.current;
+    if (!isScene || !showReference || !view) { setReferenceStatus(""); return; }
+    let active = true;
+    let mesh: any = null;
+    const textures: any[] = [];
+    setReferenceStatus("正在加载参照角色…"); setReferenceError(false);
+    void (async () => {
+      try {
+        const path = await invoke<string | null>("motion_preview_model_get");
+        if (!active) return;
+        if (!path) { setReferenceStatus("未设置预览角色"); return; }
+        const buffer = await invoke<ArrayBuffer>("model_preview_file", { path });
+        if (!active) return;
+        const parsed = parsePreview(buffer, false);
+        const geometry = new THREE.BufferGeometry();
+        const data = new THREE.InterleavedBuffer(parsed.vertices, 26);
+        geometry.setAttribute("position", new THREE.InterleavedBufferAttribute(data, 3, 0));
+        geometry.setAttribute("normal", new THREE.InterleavedBufferAttribute(data, 3, 3));
+        geometry.setAttribute("uv", new THREE.InterleavedBufferAttribute(data, 2, 6));
+        geometry.setIndex(new THREE.BufferAttribute(parsed.indices, 1));
+        const groups = parsed.groups.length ? parsed.groups : [{ start: 0, count: parsed.indices.length, color: [0.72, 0.76, 0.79, 1], texturePath: "" }];
+        const materials = groups.map((group, index) => {
+          geometry.addGroup(group.start, group.count, index);
+          const material = new THREE.MeshStandardMaterial({ color: new THREE.Color().setRGB(group.color[0], group.color[1], group.color[2]), side: THREE.DoubleSide, roughness: 0.72 });
+          setMaterialAlpha(material, group.color[3]);
+          setMaterialCentre(material, geometry, group.start, group.count);
+          return material;
+        });
+        mesh = new THREE.Mesh(geometry, materials.length === 1 ? materials[0] : materials);
+        mesh.name = "场景原点参照角色";
+        // Source positions use MMD coordinates. No centring, normalisation or foot offset.
+        mesh.position.set(0, 0, 0);
+        mesh.frustumCulled = false;
+        view.scene.add(mesh);
+        const name = path.split(/[\\/]/).pop() ?? path;
+        const baseStatus = `${name} · 原点 (0, 0, 0)`;
+        setReferenceStatus(baseStatus);
+        let missingTextures = 0;
+        const loader = new THREE.TextureLoader();
+        await loadViewerTextures(groups.map((group) => group.texturePath), () => active, async (texturePath) => {
+          try {
+            const bytes = await invoke<ArrayBuffer>("model_preview_texture_file", { modelPath: path, texturePath });
+            if (!active) return;
+            if (bytes.byteLength <= 1) { missingTextures++; return; }
+            const alphaMode = new Uint8Array(bytes)[0];
+            const url = URL.createObjectURL(new Blob([new Uint8Array(bytes, 1)], { type: "image/png" }));
+            try {
+              const texture = await loader.loadAsync(url);
+              if (!active) { texture.dispose(); return; }
+              texture.colorSpace = THREE.SRGBColorSpace; texture.flipY = false;
+              texture.wrapS = THREE.RepeatWrapping; texture.wrapT = THREE.RepeatWrapping;
+              textures.push(texture);
+              groups.forEach((group, index) => {
+                if (group.texturePath !== texturePath) return;
+                materials[index].map = texture;
+                setMaterialAlpha(materials[index], group.color[3], alphaMode);
+                materials[index].needsUpdate = true;
+              });
+            } finally { URL.revokeObjectURL(url); }
+          } catch { if (active) missingTextures++; }
+        });
+        if (active && missingTextures) setReferenceStatus(`${baseStatus} · ${missingTextures} 张贴图未加载`);
+      } catch (reason) {
+        if (active) { setReferenceError(true); setReferenceStatus(`参照角色加载失败：${toUiError(reason)}`); }
+      }
+    })();
+    return () => {
+      active = false;
+      if (mesh) {
+        view.scene.remove(mesh);
+        mesh.geometry.dispose();
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        materials.forEach((material: any) => material.dispose());
+      }
+      textures.forEach((texture) => texture.dispose());
+    };
+  }, [asset.id, asset.primarySource, isScene, showReference, referenceReload]);
 
   useEffect(() => {
     const current = objects.current;
@@ -724,6 +835,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       material.polygonOffsetFactor = 1;
       material.polygonOffsetUnits = 1;
     }
+    current.appearance.apply(!isScene && (mode === "texture" || mode === "materials") ? matcap : "original");
     if (selectedVertex !== null && selectedVertex >= 0 && selectedVertex < data.vertexCount) {
       const offset = selectedVertex * 26;
       const coordinate = new Float32Array([data.vertices[offset], data.vertices[offset + 1], data.vertices[offset + 2]]);
@@ -743,7 +855,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
       current.selectedPoint.material.dispose();
       current.selectedPoint = null;
     }
-  }, [mode, texturesLoaded, visibleTypes, selectedBone, selectedVertex, showPoints, showShadedMesh, showBones, showWireframe, showSdefCenters, pointSize, model]);
+  }, [mode, texturesLoaded, visibleTypes, selectedBone, selectedVertex, showPoints, showShadedMesh, showBones, showWireframe, showSdefCenters, pointSize, model, matcap, isScene]);
 
 
   const selectedVertexDetails = model && selectedVertex !== null ? (() => {
@@ -808,7 +920,10 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
 
   return <Modal.Root opened onClose={onClose} withinPortal={false} centered xOffset={20} yOffset={20} size={1120} zIndex={250} padding={0} transitionProps={{ duration: 150 }}><Modal.Overlay backgroundOpacity={0.72} blur={6} /><Modal.Content className="viewer-modal-content" aria-label={`${asset.name} 3D 查看器`}><Modal.Body p={0} className={`model-viewer-window ${asset.assetType === "scene" ? "scene-viewer" : ""}`}><header className="model-viewer-header">
         <div><span className="model-viewer-eyebrow">{asset.assetType === "scene" ? "场景预览" : "模型与权重预览"}</span><h2 title={asset.name}>{asset.name}</h2><small title={asset.primarySource}>{asset.primarySource}</small></div>
-        <div className="model-viewer-header-actions"><Button disabled={!model} title="导出当前视角 PNG" onClick={exportPng}>导出截图</Button><ActionIcon variant="subtle" size="sm" className="model-viewer-close" aria-label="关闭 3D 预览" onClick={onClose}>×</ActionIcon></div>
+        <div className="model-viewer-header-actions"><label className="viewer-preset-select">{isScene ? "渲染预设" : "Matcap"}<NativeSelect aria-label={isScene ? "场景渲染预设" : "角色 Matcap 预设"} value={isScene ? scenePreset : matcap} disabled={loading || !!error || (!isScene && mode !== "texture" && mode !== "materials")} onChange={(event) => {
+          if (isScene) { const value = event.target.value as ScenePreset; setScenePreset(value); writePreference(SCENE_PREFERENCE, value); }
+          else { const value = event.target.value as MatcapPreset; setMatcap(value); writePreference(MATCAP_PREFERENCE, value); }
+        }}>{(isScene ? SCENE_PRESETS : MATCAP_PRESETS).map((preset) => <option key={preset.value} value={preset.value}>{preset.label}</option>)}</NativeSelect></label><Button disabled={!model} title="导出当前视角 PNG" onClick={exportPng}>导出截图</Button><ActionIcon variant="subtle" size="sm" className="model-viewer-close" aria-label="关闭 3D 预览" onClick={onClose}>×</ActionIcon></div>
       </header><div className="model-viewer-content">
         <aside className="model-viewer-sidebar">
           <div className="model-viewer-sidebar-scroll">
@@ -818,6 +933,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
                 {([ ["texture", "材质贴图"], ["types", "权重类型"], ["materials", "材质颜色"], ["bone", "骨骼权重"], ["anomaly", "异常顶点"] ] as Array<[ViewerMode, string]>).map(([value, label]) => <Button key={value} variant={mode === value ? "filled" : "light"} aria-pressed={mode === value} onClick={() => setMode(value)}>{label}</Button>)}
               </div>
               <p className="mv-hint">{modeHelp[mode]}</p>
+              {mode !== "texture" && mode !== "materials" && <p className="mv-hint">权重检查使用原始色阶；返回材质模式后恢复 Matcap。</p>}
               {mode === "texture" && model && <p className="mv-hint">已加载贴图 {texturesLoaded} / {new Set(model.groups.map((group) => group.texturePath).filter(Boolean)).size}</p>}
               {mode === "bone" && <label className="mv-select-label">目标骨骼<NativeSelect value={selectedBone} onChange={(event) => setSelectedBone(Number(event.target.value))} disabled={!model?.bones.length}>{model?.bones.map((bone, index) => <option value={index} key={`${index}-${bone.name}`}>{bone.name} ({index})</option>)}</NativeSelect></label>}
             </section>
@@ -874,12 +990,13 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
           <div className="model-viewer-canvas" ref={host} />
           {loading && <div className="model-viewer-message">正在由 Rust Core 解析 3D 网格…</div>}
           {error && <div className="model-viewer-message model-viewer-error">模型无法预览：{error}</div>}
-          {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls">{asset.assetType === "scene" ? <><span>WASD 移动</span><span>Q 降 / E 升</span><span>Shift 加速 / Ctrl 慢速</span><span>左键 / 右键拖动朝向</span><span>滚轮调整 FOV</span></> : <><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span></>}<Button onClick={resetCamera}>重置视角</Button></div></>}
+          {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls">{asset.assetType === "scene" ? <><span>WASD 移动</span><span>Q 降 / E 升</span><span>Shift 加速 / Ctrl 慢速</span><span>左键 / 右键拖动朝向</span><span>滚轮调整 FOV</span><Button onClick={() => handles.current?.viewOrigin()}>查看原点</Button></> : <><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span></>}<Button onClick={resetCamera}>重置视角</Button></div></>}
         </main>
-      </div><footer className="model-viewer-footer">{asset.assetType === "scene" ? "场景以源文件的世界坐标和材质显示。" : "已解析模型权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer></Modal.Body></Modal.Content></Modal.Root>;
+      </div><footer className="model-viewer-footer">{isScene ? <div className="scene-reference-controls"><Checkbox size="xs" label="原点参照角色" checked={showReference} disabled={!!error} onChange={(event) => setShowReference(event.currentTarget.checked)} /><span role="status" className={referenceError ? "scene-reference-error" : ""} title={referenceStatus}>{showReference ? referenceStatus : "参照角色已隐藏"}</span><Button size="xs" variant="subtle" disabled={!showReference || !!error} onClick={() => setReferenceReload((count) => count + 1)}>重载角色</Button></div> : "已解析模型权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer></Modal.Body></Modal.Content></Modal.Root>;
 }
 
 function disposeModelObjects(objects: ModelObjects, handles: SceneHandles | null) {
+  objects.appearance.dispose();
   for (const record of objects.textures.values()) record.texture.dispose();
   const rendererElement = handles?.renderer?.domElement as HTMLCanvasElement | undefined;
   if (rendererElement) rendererElement.removeEventListener("dblclick", objects.doubleClick);
