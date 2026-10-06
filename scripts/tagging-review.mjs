@@ -28,7 +28,7 @@ const originalInvoke=window.__TAURI_INTERNALS__.invoke;
 window.__TAURI_INTERNALS__.invoke=async(cmd,args={})=>{
  if(cmd==='asset_counts')return {all:2,model:2,motion:0,scene:0,byRoot:{'root-0':2}};
  if(cmd==='assets_page')return {items:tagEntries.map(({asset})=>({...asset,rootId:'root-0',hasThumbnail:!tagBefore,cardStatus:tagBefore?'CardMissing':'CardValid'})),nextCursor:null};
- if(cmd==='asset_inspect')return tagEntries.find(({asset})=>asset.id===args.assetId).asset;
+ if(cmd==='asset_inspect')return {...tagEntries.find(({asset})=>asset.id===args.assetId).asset,rootId:'root-0',hasThumbnail:!tagBefore,cardStatus:tagBefore?'CardMissing':'CardValid'};
  if(cmd==='asset_tags'){const entry=tagEntries.find(({asset})=>asset.id===args.assetId);return tagBefore?entry.beforeTags:entry.afterTags;}
  if(cmd==='tags_list')return [...new Set(tagEntries.flatMap(entry=>(tagBefore?entry.beforeTags:entry.afterTags).map(tag=>tag.name)))];
  if(cmd==='card_thumbnail')return (await fetch('/'+args.assetId+'.webp')).arrayBuffer();
@@ -63,6 +63,7 @@ try {
   };
   await page.goto(`${url}/?scheme=dark&before=1`);await select();
   assert.equal(await page.locator('.tag-chip-name').filter({hasText:'整体色:'}).count(),0);
+  assert.equal(await page.locator('.inspector-preview img').count(),0);
   await page.screenshot({path:join(output,'MBL_Tags_Stage1_Scan.jpg'),type:'jpeg',quality:92,animations:'disabled'});
   await page.goto(`${url}/?scheme=dark`);await select();
   await page.waitForFunction(()=>[...document.querySelectorAll('.asset-card img')].length===2&&[...document.querySelectorAll('.asset-card img')].every(image=>image.complete&&image.naturalWidth===1024));
