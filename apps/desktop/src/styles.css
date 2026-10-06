@@ -2609,3 +2609,5 @@ button:focus-visible {
 .library-content.browsing-folders { overflow-anchor: none; }
 .folder-browser { height: calc(305px - 195px * var(--folder-collapse, 0)); box-sizing: border-box; grid-template-rows: auto minmax(0, 1fr); gap: calc(10px - 3px * var(--folder-collapse, 0)); padding: calc(12px - 2px * var(--folder-collapse, 0)) 12px; overflow: hidden; }
 .folder-browser .folder-tree, .folder-browser .folder-root-grid { min-height: 0; max-height: none; overflow: auto; }
+
+.auto-tag-settings .mantine-Checkbox-root + .mantine-Checkbox-root { margin-top: 10px; }

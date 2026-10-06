@@ -15,6 +15,46 @@ impl Drop for FixtureDirectory {
 }
 
 #[test]
+fn scan_tags_are_repeatable_replace_old_facts_and_respect_user_removals() {
+    let directory = FixtureDirectory::new(); let library = Library::in_memory().unwrap();
+    let path = directory.0.join("裙子蓝色.pmx"); std::fs::write(&path, fixtures::pmx(false,1,3,false)).unwrap();
+    let root = library.add_root(AssetType::Model, directory.0.to_str().unwrap(), None).unwrap();
+    library.scan_root(&root.id).unwrap();
+    let asset = library.list_assets(None, None, 10).unwrap().remove(0);
+    let tags = library.list_asset_tags(&asset.id).unwrap();
+    assert!(tags.iter().any(|tag| tag.name == "技术:含SDEF" && tag.source == "parser"));
+    assert!(!tags.iter().any(|tag| tag.name.starts_with("裙型:") || tag.name.starts_with("整体色:")));
+    assert_eq!(library.scan_root(&root.id).unwrap().assets_unchanged, 1);
+    assert_eq!(serde_json::to_value(&tags).unwrap(), serde_json::to_value(library.list_asset_tags(&asset.id).unwrap()).unwrap());
+    library.remove_asset_tag(&asset.id, "技术:含SDEF").unwrap();
+    library.add_asset_tag(&asset.id, "服装:半身裙", "agent", Some(0.85)).unwrap();
+    std::fs::write(&path, fixtures::pmx(false,1,0,true)).unwrap();
+    library.scan_root(&root.id).unwrap();
+    let tags = library.list_asset_tags(&asset.id).unwrap();
+    assert!(!tags.iter().any(|tag| tag.name == "技术:含SDEF"));
+    assert!(tags.iter().any(|tag| tag.name == "服装:半身裙" && tag.source == "agent"));
+    std::fs::write(&path, fixtures::pmx(false,1,3,true)).unwrap(); library.scan_root(&root.id).unwrap();
+    assert!(!library.list_asset_tags(&asset.id).unwrap().iter().any(|tag| tag.name == "技术:含SDEF"));
+    std::fs::write(&path, b"corrupt").unwrap(); library.scan_root(&root.id).unwrap();
+    assert!(!library.list_asset_tags(&asset.id).unwrap().iter().any(|tag| tag.source == "parser"));
+    assert!(library.list_asset_tags(&asset.id).unwrap().iter().any(|tag| tag.source == "agent"));
+}
+
+#[test]
+fn enabling_scan_tags_backfills_unchanged_assets_without_reparsing() {
+    let directory = FixtureDirectory::new(); let library = Library::in_memory().unwrap();
+    library.set_auto_tag_settings(&mmdbridge_core::AutoTagSettings { technical:false, colors:false }).unwrap();
+    let path = directory.0.join("旧模型.pmd"); std::fs::write(&path, fixtures::pmd(false, "")).unwrap();
+    let root = library.add_root(AssetType::Model, directory.0.to_str().unwrap(), None).unwrap();
+    library.scan_root(&root.id).unwrap(); let asset = library.list_assets(None, None, 10).unwrap().remove(0);
+    assert!(library.list_asset_tags(&asset.id).unwrap().is_empty());
+    library.set_auto_tag_settings(&mmdbridge_core::AutoTagSettings::default()).unwrap();
+    assert_eq!(library.scan_root(&root.id).unwrap().assets_unchanged, 1);
+    assert!(library.list_asset_tags(&asset.id).unwrap().iter().any(|tag| tag.name == "格式:PMD"));
+    assert!(!library.list_asset_tags(&asset.id).unwrap().iter().any(|tag| tag.name == "技术:含Morph"));
+}
+
+#[test]
 fn pmx_encodings_index_widths_and_weight_modes_load_without_gpu() {
     let directory = FixtureDirectory::new(); let library = Library::in_memory().unwrap();
     for version in [2.0f32,2.1] { for utf16 in [false,true] { for width in [1,2,4] { for mode in 0..=4 {

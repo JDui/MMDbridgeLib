@@ -8,6 +8,7 @@ on:
       - 'apps/desktop/src/**'
       - 'scripts/model-review*'
       - 'scripts/viewer-review*'
+      - 'scripts/tagging-review*'
       - '.github/workflows/model-compatibility.yml'
   workflow_dispatch:
 
@@ -33,6 +34,8 @@ jobs:
           echo "MBL_PLAYWRIGHT_MODULE=$RUNNER_TEMP/mbl-browser-test/node_modules/playwright" >> "$GITHUB_ENV"
       - name: Parse and render synthetic PMX and PMD fixtures
         run: cargo run --locked -p mmdbridge-core --example compatibility_probe -- "$MBL_MODEL_REVIEW"
+      - name: Verify scan tagging and colour analysis
+        run: cargo run --locked -p mmdbridge-core --example tagging_probe -- "$MBL_MODEL_REVIEW/tagging"
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -49,6 +52,8 @@ jobs:
         run: node scripts/model-review.mjs
       - name: Verify viewer presets and origin reference
         run: node scripts/viewer-review.mjs
+      - name: Verify automatic tag controls and capture tagging stages
+        run: node scripts/tagging-review.mjs
       - uses: actions/upload-artifact@v7
         if: always()
         with:

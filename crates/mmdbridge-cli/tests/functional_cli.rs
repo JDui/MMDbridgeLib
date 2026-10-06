@@ -129,6 +129,9 @@ fn errors_have_structured_json_and_nonzero_exit_codes() {
 #[test]
 fn unicode_scan_tags_favorites_and_root_removal_share_the_portable_database() {
     let fixture = Fixture::new();
+    assert_eq!(fixture.succeed(&["settings", "auto-tags"]), json!({"technical":true,"colors":true}));
+    assert_eq!(fixture.succeed(&["settings", "auto-tags", "--colors", "false"]), json!({"technical":true,"colors":false}));
+    assert_eq!(fixture.succeed(&["settings", "auto-tags"])["colors"], false);
     let root = fixture.succeed(&[
         "roots", "add", "--type", "motion", "--path", fixture.assets.to_str().unwrap(), "--name", "动作_日本",
     ]);

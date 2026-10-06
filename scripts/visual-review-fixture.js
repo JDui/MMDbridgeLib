@@ -46,6 +46,8 @@ window.__TAURI_INTERNALS__ = {
   if (cmd === 'relations_list' || cmd === 'jobs_list' || cmd === 'scan_states' || cmd === 'filters_list') return [];
   if (cmd === 'jobs_summary') return {};
   if (cmd === 'motion_preview_model_get') return null;
+  if (cmd === 'auto_tag_settings_get') return {technical: true, colors: true};
+  if (cmd === 'auto_tag_settings_set') return args.settings;
   if (cmd === 'thumbnail_concurrency_get') return {parse: null, render: null, encode: null};
   if (cmd === 'storage_info') return {path: 'E:\\MMD\\MBL\\data\\library.sqlite3', databaseBytes: 16000000, walBytes: 0, databaseLimitBytes: 1000000000, walTargetBytes: 64000000};
   if (cmd === 'asset_directories') return [{path: roots.find(r => r.id === args.rootId)?.path + '\\角色', count: 6}];

@@ -1,0 +1,4 @@
+interface:
+  display_name: "MMDbridgeLib 标签整理"
+  short_description: "Review MMD cards for clothing, skirt and color tags"
+  default_prompt: "Use $mmdbridge-card-manager to review existing asset thumbnails and add supported clothing, skirt, hair and color tags while preserving user choices."

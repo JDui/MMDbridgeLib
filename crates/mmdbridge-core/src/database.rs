@@ -2091,7 +2091,7 @@ impl Library {
         Ok(mutations)
     }
 
-    fn add_asset_tag_in_transaction(
+    pub(crate) fn add_asset_tag_in_transaction(
         transaction: &Transaction<'_>,
         asset_id: &str,
         name: &str,
@@ -2147,7 +2147,8 @@ impl Library {
         };
         let changed = transaction.execute(
             "INSERT INTO asset_tags(asset_id,tag_id,source,confidence) VALUES (?1,?2,?3,?4)
-             ON CONFLICT(asset_id,tag_id) DO UPDATE SET source=excluded.source,confidence=excluded.confidence",
+             ON CONFLICT(asset_id,tag_id) DO UPDATE SET source=excluded.source,confidence=excluded.confidence
+             WHERE asset_tags.source<>excluded.source OR asset_tags.confidence IS NOT excluded.confidence",
                 params![asset_id, tag_id, source, confidence],
         )? > 0;
         if changed {

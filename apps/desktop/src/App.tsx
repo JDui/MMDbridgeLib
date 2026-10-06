@@ -378,6 +378,7 @@ export default function App() {
   const [motionViewerAsset, setMotionViewerAsset] = useState<Asset | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [motionPreviewModel, setMotionPreviewModel] = useState<string | null>(null);
+  const [autoTagSettings, setAutoTagSettings] = useState({ technical: true, colors: true });
   const [thumbnailConcurrencyDraft, setThumbnailConcurrencyDraft] = useState<ThumbnailConcurrencySettings>({ parse: null, render: null, encode: null });
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState("");
@@ -942,14 +943,16 @@ export default function App() {
   async function openSettings() {
     setSettingsError("");
     try {
-      const [path, concurrency, storage] = await Promise.all([
+      const [path, concurrency, storage, autoTags] = await Promise.all([
         invoke<string | null>("motion_preview_model_get"),
         invoke<ThumbnailConcurrencySettings>("thumbnail_concurrency_get"),
         invoke<StorageInfo>("storage_info"),
+        invoke<{ technical: boolean; colors: boolean }>("auto_tag_settings_get"),
       ]);
       setMotionPreviewModel(path);
       setThumbnailConcurrencyDraft(concurrency);
       setStorageInfo(storage);
+      setAutoTagSettings(autoTags);
       setSettingsOpen(true);
     } catch (reason) {
       setSettingsError(toUiError(reason));
@@ -993,6 +996,20 @@ export default function App() {
     } finally {
       setSettingsBusy(false);
     }
+  }
+
+  async function saveAutoTagSettings() {
+    setSettingsBusy(true);
+    setSettingsError("");
+    try {
+      const saved = await invoke<{ technical: boolean; colors: boolean }>("auto_tag_settings_set", { settings: autoTagSettings });
+      setAutoTagSettings(saved);
+      setNotice("已保存自动标签设置。技术标签在下次扫描时更新，整体色在缩略图完成后更新。");
+      setError("");
+    } catch (reason) {
+      setSettingsError(toUiError(reason));
+      setError(toUiError(reason));
+    } finally { setSettingsBusy(false); }
   }
 
   async function saveThumbnailConcurrency() {
@@ -1796,7 +1813,7 @@ export default function App() {
           </div></div>
           {selected.assetType === "model" && <div className="detail-row"><span>骨架分类</span><strong>{selected.metadata.skeleton_class === "standard" ? "MMD 标准人形" : selected.metadata.skeleton_class === "nonstandard" ? "非标准" : "待分类"}</strong></div>}
           <div className="inspector-section source-section"><div className="section-title">源文件</div><div className="source-path" title={selected.primarySource}><FileText className="file-icon" size={17} aria-hidden="true" /><div><strong>{selected.primarySource.split(/[\\/]/).pop()}</strong><small>{selected.assetDirectory}</small></div></div><div className="asset-file-actions"><Button disabled={busy} onClick={() => void planRenameAsset(selected)}>重命名资产包</Button><Button disabled={busy} onClick={() => void planMoveAssets([selected.id])}>移动…</Button>{selected.assetType === "model" && selected.primarySource.toLowerCase().endsWith(".pmx") ? <Button color="red" className="danger" disabled={busy} onClick={() => void requestAssetOperation("delete_model", [selected.id])}>删除模型…</Button> : <Button disabled={busy} onClick={() => void requestAssetOperation("recycle", [selected.id])}>移到回收站…</Button>}</div></div>
-          <div className="inspector-section tags-section"><div className="section-title">标签 <ActionIcon variant="subtle" size="sm" className="add-tag" aria-label="添加用户标签" title="添加用户标签" disabled={!detailsReady || busy} onClick={() => void addTag()}><Plus size={15} aria-hidden="true" /></ActionIcon></div>{currentDetails?.status === "failed" ? <Alert color="red" title="标签与关系读取失败" role="alert">{currentDetails.error}<Button disabled={busy} onClick={() => setSelectedDetailsRevision((value) => value + 1)}>重试详情</Button></Alert> : !detailsReady ? <div className="tag-empty" role="status">正在加载标签与关系…</div> : assetTags.length ? <div className="tag-list">{assetTags.map((tag) => <span className={`tag-chip ${tag.source}`} key={`${tag.name}-${tag.source}`} title={`来源：${tag.source}`}><span className="tag-chip-name">{tag.name}</span><ActionIcon variant="subtle" size="xs" aria-label={`移除标签 ${tag.name}`} disabled={!detailsReady || busy} onClick={() => void removeTag(tag.name)}><X size={14} aria-hidden="true" /></ActionIcon></span>)}</div> : <div className="tag-empty">尚未添加标签</div>}</div>
+          <div className="inspector-section tags-section"><div className="section-title">标签 <ActionIcon variant="subtle" size="sm" className="add-tag" aria-label="添加用户标签" title="添加用户标签" disabled={!detailsReady || busy} onClick={() => void addTag()}><Plus size={15} aria-hidden="true" /></ActionIcon></div>{currentDetails?.status === "failed" ? <Alert color="red" title="标签与关系读取失败" role="alert">{currentDetails.error}<Button disabled={busy} onClick={() => setSelectedDetailsRevision((value) => value + 1)}>重试详情</Button></Alert> : !detailsReady ? <div className="tag-empty" role="status">正在加载标签与关系…</div> : assetTags.length ? <div className="tag-list">{assetTags.map((tag) => <span className={`tag-chip ${tag.source}`} key={`${tag.name}-${tag.source}`} title={`来源：${tag.source === "user" ? "手动" : tag.source === "parser" ? "程序自动" : "Agent"}${tag.confidence == null ? "" : ` · 置信度 ${Math.round(tag.confidence * 100)}%`}`}><span className="tag-chip-name">{tag.name}</span><ActionIcon variant="subtle" size="xs" aria-label={`移除标签 ${tag.name}`} disabled={!detailsReady || busy} onClick={() => void removeTag(tag.name)}><X size={14} aria-hidden="true" /></ActionIcon></span>)}</div> : <div className="tag-empty">尚未添加标签</div>}</div>
           {assetRelations.length > 0 && <div className="inspector-section relation-section"><div className="section-title">关系与版本 <span className="relation-count">{assetRelations.length}</span></div><div className="relation-list">{assetRelations.map((relation) => {
             const otherPath = selected.id === relation.sourceAsset ? relation.reason.target_path : relation.reason.source_path;
             const otherName = typeof otherPath === "string" ? otherPath.split(/[\\/]/).pop() : (selected.id === relation.sourceAsset ? relation.targetAsset : relation.sourceAsset).slice(0, 8);
@@ -1848,7 +1865,7 @@ export default function App() {
           </div>}
           {entry.status === "RecoveryNeeded" && <Button className="journal-resolve-button" onClick={() => void resolveJournalEntry(entry)}>已人工恢复并重扫，标记已核对</Button>}
         </article>) : <div className="jobs-panel-empty">暂无资产文件操作记录</div>}</div></Modal>}
-      {settingsOpen && <Modal opened onClose={() => { setSettingsOpen(false); }} title={<div><strong id="settings-title">外观与设置</strong></div>} size={620} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "settings-modal" }}><AppearanceSettings />{settingsError && <Alert color="red" role="alert" mb="sm">{settingsError}</Alert>}<div className="settings-field"><label>预览角色</label><p>选择 PMX 或 PMD 模型，用于动作与姿势预览，以及场景原点的尺寸参照。场景保留角色的原始坐标和尺寸。VMD 缩略图使用首帧或第一关键帧；包含镜头轨道时按镜头取景。</p><div className="settings-model-path" title={motionPreviewModel ?? "尚未设置"}>{motionPreviewModel ?? "尚未设置模型"}</div><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void chooseMotionPreviewModel()}>{settingsBusy ? "正在保存…" : "选择模型"}</Button><Button disabled={settingsBusy || !motionPreviewModel} onClick={() => void clearMotionPreviewModel()}>清除</Button></div></div><div className="settings-field"><label>缩略图</label><p>重新生成在后台执行，可取消或重试。尚未设置预览模型时会跳过动作。</p><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void regenerateAllThumbnails()}>{settingsBusy ? "正在加入队列…" : "重新生成全部缩略图"}</Button></div>{notice && <p role="status">{notice}</p>}</div><div className="settings-field concurrency-settings"><label>缩略图阶段并发上限</label><p>分别限制解析、GPU 渲染和 WebP 编码。自动模式会按设备资源选择；每阶段可设 1–8 路，渲染自动模式为 1 路。</p>
+      {settingsOpen && <Modal opened onClose={() => { setSettingsOpen(false); }} title={<div><strong id="settings-title">外观与设置</strong></div>} size={620} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "settings-modal" }}><AppearanceSettings />{settingsError && <Alert color="red" role="alert" mb="sm">{settingsError}</Alert>}<div className="settings-field"><label>预览角色</label><p>选择 PMX 或 PMD 模型，用于动作与姿势预览，以及场景原点的尺寸参照。场景保留角色的原始坐标和尺寸。VMD 缩略图使用首帧或第一关键帧；包含镜头轨道时按镜头取景。</p><div className="settings-model-path" title={motionPreviewModel ?? "尚未设置"}>{motionPreviewModel ?? "尚未设置模型"}</div><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void chooseMotionPreviewModel()}>{settingsBusy ? "正在保存…" : "选择模型"}</Button><Button disabled={settingsBusy || !motionPreviewModel} onClick={() => void clearMotionPreviewModel()}>清除</Button></div></div><div className="settings-field auto-tag-settings"><label>自动标签</label><p>扫描时提取格式、骨架与技术特征；角色缩略图完成后分析整体色。裙型、服装类别和发型由 Agent 按标签 Skill 补充。</p><Checkbox label="扫描时生成技术标签" checked={autoTagSettings.technical} disabled={settingsBusy} onChange={(event) => setAutoTagSettings((current) => ({ ...current, technical: event.target.checked }))} /><Checkbox label="从角色缩略图提取整体色" checked={autoTagSettings.colors} disabled={settingsBusy} onChange={(event) => setAutoTagSettings((current) => ({ ...current, colors: event.target.checked }))} /><p>保留手动和 Agent 标签；手动移除的标签不会自动加回。关闭开关会暂停新增与更新。</p><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void saveAutoTagSettings()}>保存标签设置</Button></div></div><div className="settings-field"><label>缩略图</label><p>重新生成在后台执行，可取消或重试。尚未设置预览模型时会跳过动作。</p><div className="settings-modal-actions"><Button disabled={settingsBusy} onClick={() => void regenerateAllThumbnails()}>{settingsBusy ? "正在加入队列…" : "重新生成全部缩略图"}</Button></div>{notice && <p role="status">{notice}</p>}</div><div className="settings-field concurrency-settings"><label>缩略图阶段并发上限</label><p>分别限制解析、GPU 渲染和 WebP 编码。自动模式会按设备资源选择；每阶段可设 1–8 路，渲染自动模式为 1 路。</p>
           {(["parse", "render", "encode"] as const).map((stage) => {
             const value = thumbnailConcurrencyDraft[stage];
             const selection = value === null ? "auto" : ([1, 2, 4, 8].includes(value) ? String(value) : "custom");

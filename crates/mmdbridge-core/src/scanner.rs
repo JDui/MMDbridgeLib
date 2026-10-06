@@ -223,6 +223,9 @@ pub(crate) fn scan(
                     relations_dirty |= root.asset_type == AssetType::Motion;
                 }
                 report.assets_unchanged += 1;
+                if let Some(metadata) = old_metadata.as_ref() {
+                    crate::auto_tags::backfill(library, asset_id, root.asset_type, metadata, old_fingerprint)?;
+                }
                 continue;
             }
         }
@@ -956,6 +959,20 @@ fn store_candidate(
     }
     transaction.execute("INSERT INTO metadata(asset_id,key,value_json) VALUES (?1,'parsed',?2) ON CONFLICT(asset_id,key) DO UPDATE SET value_json=excluded.value_json", params![stored_id, parsed_metadata])?;
     transaction.execute("INSERT INTO cards(asset_id,card_path,status,last_checked_at) VALUES (?1,?2,'CardMissing',?3) ON CONFLICT(asset_id) DO UPDATE SET card_path=excluded.card_path,status=CASE WHEN cards.status='CardValid' THEN 'CardStale' ELSE cards.status END,last_checked_at=excluded.last_checked_at", params![stored_id, card_path, now])?;
+    let settings: crate::AutoTagSettings = transaction.query_row(
+        "SELECT value_json FROM settings WHERE key='auto_tags'", [], |row| row.get::<_, String>(0),
+    ).optional()?.map(|json| serde_json::from_str(&json)).transpose()?.unwrap_or_default();
+    if visibility == "normal" {
+        if settings.technical {
+            crate::auto_tags::reconcile(&transaction, &stored_id, "technical", &fingerprint,
+                &crate::auto_tags::technical_tags(root.asset_type, &parsed.metadata), 1.0)?;
+        }
+        if settings.colors {
+            // Any successful reparse can reflect changed texture dependencies as well
+            // as changed geometry. Old automatic colours must wait for a fresh preview.
+            crate::auto_tags::reconcile(&transaction, &stored_id, "palette", &fingerprint, &[], 0.78)?;
+        }
+    }
     transaction.commit()?;
     Ok(true)
 }

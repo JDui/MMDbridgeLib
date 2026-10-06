@@ -6,7 +6,7 @@ use mmdbridge_core::{
     Asset, AssetCursor, AssetOperationJournalEntry, AssetOperationPlan, AssetPage,
     AssetRelation, AssetTag, AssetType, CoreError, FilterExpr, Library, RelationRefreshReport,
     Root, SavedFilter, ScanState, TagMutation,
-    ThumbnailConcurrencySettings,
+    ThumbnailConcurrencySettings, AutoTagSettings,
 };
 use serde::Serialize;
 use tauri::{Manager, State, ipc::Response};
@@ -294,6 +294,16 @@ fn thumbnail_concurrency_get(
     state: State<'_, CoreState>,
 ) -> Result<ThumbnailConcurrencySettings, ApiError> {
     state.0.thumbnail_concurrency().map_err(Into::into)
+}
+
+#[tauri::command]
+fn auto_tag_settings_get(state: State<'_, CoreState>) -> Result<AutoTagSettings, ApiError> {
+    state.0.auto_tag_settings().map_err(Into::into)
+}
+
+#[tauri::command]
+fn auto_tag_settings_set(state: State<'_, CoreState>, settings: AutoTagSettings) -> Result<AutoTagSettings, ApiError> {
+    state.0.set_auto_tag_settings(&settings).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -828,6 +838,8 @@ fn main() {
             motion_preview_model_get,
             motion_preview_model_set,
             thumbnail_concurrency_get,
+            auto_tag_settings_get,
+            auto_tag_settings_set,
             thumbnail_concurrency_set,
             asset_operation_plan,
             asset_operation_execute,

@@ -586,7 +586,7 @@ fn create_checked(
     if crate::operations::is_asset_operation_active(library, asset_id)? {
         return Err(CoreError::AssetOperation("该资产有进行中或待恢复的文件操作，暂时不能创建资源卡".to_owned()));
     }
-    let context = load_context(library, asset_id)?;
+    let mut context = load_context(library, asset_id)?;
     if expected_asset.is_some_and(|asset| asset.fingerprint != context.fingerprint || Path::new(&asset.primary_source) != context.source_path) {
         return Err(CoreError::Card("资产在缩略图生成期间发生变化，请重新生成".to_owned()));
     }
@@ -628,12 +628,30 @@ fn create_checked(
         .as_ref()
         .and_then(|card| card.preview_webp.as_deref());
     let preview_webp = preview_webp.or(preserved_preview);
-    let render_report = render_report.cloned().or_else(|| {
+    let mut render_report = render_report.cloned().or_else(|| {
         preserved_card
             .as_ref()
             .and_then(|card| card.manifest.thumbnail.as_ref())
             .and_then(|thumbnail| thumbnail.render_report.clone())
     });
+    if context.asset_type == AssetType::Model {
+        if let (Some(report), Some(preview)) = (render_report.as_mut(), preview_webp) {
+            let current_report = format!("{}:{}", report.renderer_version, report.preview_settings_version)
+                == expected_renderer_revision(library, context.asset_type)?;
+            if current_report && report.subject_palette.is_none() {
+                // Older current cards can acquire colour tags without another GPU render.
+                if let Ok(image) = image::load_from_memory_with_format(preview, image::ImageFormat::WebP) {
+                    let rgba = image.to_rgba8();
+                    report.subject_palette = Some(crate::auto_tags::subject_palette(rgba.as_raw(), rgba.width(), rgba.height(), &report.diagnostics));
+                }
+            }
+            if let Some(palette) = report.subject_palette.as_ref().filter(|_| current_report) {
+                if crate::auto_tags::apply_palette(library, asset_id, &context.fingerprint, &context.metadata, palette)? {
+                    context = load_context(library, asset_id)?;
+                }
+            }
+        }
+    }
     let expected_renderer_revision = expected_renderer_revision(library, context.asset_type)?;
     let renderer_revision = if preview_webp.is_some() {
         render_report
@@ -874,7 +892,7 @@ pub(crate) fn cached_thumbnail(
             |row| row.get(0),
         )
         .optional()?;
-    if status.as_deref() != Some("CardValid") {
+    if !matches!(status.as_deref(), Some("CardValid" | "CardStale")) {
         return Ok(None);
     }
     let context = load_context(library, asset_id)?;
@@ -888,6 +906,7 @@ pub(crate) fn cached_thumbnail(
     let card = read_card(path)?;
     if card.manifest.asset_id != context.asset_id
         || card.manifest.source.fingerprint != context.fingerprint
+        || card.manifest.metadata != context.metadata
     {
         return Ok(None);
     }

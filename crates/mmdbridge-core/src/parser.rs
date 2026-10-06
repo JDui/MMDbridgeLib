@@ -7,8 +7,8 @@ use serde_json::json;
 use crate::types::{AssetType, ParsedCandidate, ParsedDependency, display_name};
 
 const CAMERA_CLASSIFICATION_VERSION: u8 = 2;
-const PMX_PARSER_REVISION: u32 = 3;
-const PMD_PARSER_REVISION: u32 = 2;
+const PMX_PARSER_REVISION: u32 = 4;
+const PMD_PARSER_REVISION: u32 = 3;
 const VMD_PARSER_REVISION: u32 = 2;
 const VPD_PARSER_REVISION: u32 = 1;
 
@@ -43,7 +43,7 @@ pub(crate) fn parse_asset(
             let parsed = parse_pmx_model(bytes).map_err(|error| error.to_string())?;
             Ok(ParsedCandidate {
                 name: non_empty(&parsed.metadata.name, fallback_name),
-                metadata: json!({
+                metadata: with_pmx_features(json!({
                     "file_type": "pmx", "pmx_version": parsed.metadata.version,
                     "vertex_count": parsed.metadata.counts.vertices, "polygon_count": parsed.metadata.counts.faces,
                     "material_count": parsed.metadata.counts.materials, "bone_count": parsed.metadata.counts.bones,
@@ -51,7 +51,7 @@ pub(crate) fn parse_asset(
                     "joint_count": parsed.metadata.counts.joints, "english_name": parsed.metadata.english_name,
                     "parser_diagnostics": parsed.diagnostics,
                     "skeleton_class": if is_standard_mmd_skeleton(&parsed) { "standard" } else { "nonstandard" },
-                }),
+                }), &parsed),
                 status: "Ready".to_owned(),
                 dependencies: pmx_dependencies(&parsed.materials),
             })
@@ -149,7 +149,7 @@ pub(crate) fn parse_asset(
             );
             Ok(ParsedCandidate {
                 name: non_empty(&parsed.metadata.name, fallback_name),
-                metadata: json!({"file_type":"pmx", "polygon_count":parsed.metadata.counts.faces, "width":width, "depth":depth, "area":width*depth, "coordinate_unit":"MMD", "parser_diagnostics":parsed.diagnostics}),
+                metadata: with_pmx_features(json!({"file_type":"pmx", "polygon_count":parsed.metadata.counts.faces, "width":width, "depth":depth, "area":width*depth, "coordinate_unit":"MMD", "parser_diagnostics":parsed.diagnostics}), &parsed),
                 status: "Ready".to_owned(),
                 dependencies: pmx_dependencies(&parsed.materials),
             })
@@ -185,6 +185,8 @@ pub(crate) fn parse_asset(
                     "material_count":parsed.metadata.counts.materials, "bone_count":parsed.metadata.counts.bones,
                     "morph_count":parsed.metadata.counts.morphs, "rigid_body_count":parsed.metadata.counts.rigid_bodies,
                     "joint_count":parsed.metadata.counts.joints, "english_name":parsed.metadata.english_name,
+                    "usable_morph_count":parsed.morphs.iter().filter(|morph| morph.kind != "base").count(),
+                    "vertex_morph_count":parsed.morphs.iter().filter(|morph| morph.kind != "base").count(),
                     "width":width, "depth":depth, "area":width*depth, "coordinate_unit":"MMD", "parser_diagnostics":parsed.diagnostics}),
                 status: "Ready".to_owned(),
                 dependencies,
@@ -195,6 +197,23 @@ pub(crate) fn parse_asset(
             asset_type.as_str()
         )),
     }
+}
+
+fn with_pmx_features(mut metadata: serde_json::Value, model: &mmd_anim_format::PmxParsedModel) -> serde_json::Value {
+    let fields = metadata.as_object_mut().expect("parser metadata is an object");
+    let features = json!({
+        "rigid_body_count":model.metadata.counts.rigid_bodies,
+        "joint_count":model.metadata.counts.joints,
+        "usable_morph_count":model.morphs.len(),
+        "sdef_vertex_count":model.geometry.sdef.skinning_modes.iter().filter(|mode| mode.as_str() == "sdef").count(),
+        "qdef_vertex_count":model.geometry.sdef.skinning_modes.iter().filter(|mode| mode.as_str() == "qdef").count(),
+        "vertex_morph_count":model.morphs.iter().filter(|morph| morph.kind == "vertex").count(),
+        "bone_morph_count":model.morphs.iter().filter(|morph| morph.kind == "bone").count(),
+        "material_morph_count":model.morphs.iter().filter(|morph| morph.kind == "material").count(),
+        "uv_morph_count":model.morphs.iter().filter(|morph| morph.kind.to_ascii_lowercase().contains("uv")).count(),
+    });
+    fields.extend(features.as_object().expect("feature metadata is an object").clone());
+    metadata
 }
 
 pub(crate) fn is_sphere_texture(reference: &str) -> bool {

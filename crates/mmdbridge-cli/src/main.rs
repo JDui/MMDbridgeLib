@@ -262,6 +262,12 @@ enum ThumbnailCommand {
 
 #[derive(Debug, Subcommand)]
 enum SettingCommand {
+    AutoTags {
+        #[arg(long, action = clap::ArgAction::Set)]
+        technical: Option<bool>,
+        #[arg(long, action = clap::ArgAction::Set)]
+        colors: Option<bool>,
+    },
     MotionPreviewModel {
         #[command(subcommand)]
         command: MotionPreviewModelCommand,
@@ -620,6 +626,13 @@ fn run() -> Result<CommandOutput, CoreError> {
         Command::Filters {
             command: FilterCommand::Remove { filter_id },
         } => Ok(json!({"removed":library.remove_saved_filter(&filter_id)?})),
+        Command::Settings { command: SettingCommand::AutoTags { technical, colors } } => {
+            let mut settings = library.auto_tag_settings()?;
+            if let Some(enabled) = technical { settings.technical = enabled; }
+            if let Some(enabled) = colors { settings.colors = enabled; }
+            if technical.is_some() || colors.is_some() { library.set_auto_tag_settings(&settings)?; }
+            Ok(json!(settings))
+        }
         Command::Settings {
             command:
                 SettingCommand::MotionPreviewModel {

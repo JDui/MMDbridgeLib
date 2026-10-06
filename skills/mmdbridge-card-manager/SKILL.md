@@ -1,17 +1,19 @@
 ---
 name: mmdbridge-card-manager
-description: Review existing MMDbridgeLib asset cards and their software-generated thumbnails, then add evidence-supported multidimensional tags when the user asks for tagging.
+description: Add evidence-supported MMDbridgeLib asset tags when the user requests tagging, including scan-and-tag workflows, overall and part colors, skirt types, clothing, hair, accessories, model roles, motions, and scenes. Review Core-generated cards and thumbnails; preserve automatic facts and user overrides.
 ---
 
 # MMDbridgeLib Card Tagger
 
 Use the installed `mmdbridge` CLI and Core APIs to tag assets only after the user asks. Core owns scanning, parsing, metadata, thumbnail rendering, and card creation. Never write to SQLite or edit MMDRCV files directly.
 
+Read [the responsibility split and visual taxonomy](references/tag-taxonomy.md) before model tagging. The software already generates deterministic technical tags during scanning and conservative overall colors after character thumbnails finish. Add semantic visual facets; do not duplicate Core facts or reinterpret an overall color as hair/clothing color. Running a scan does not launch an Agent. In an explicitly requested scan-and-tag task, wait for cards in bounded batches, then perform this visual pass. Earlier authorization in the same session remains valid.
+
 ## Scope and inventory
 
 1. Resolve the requested asset types and enabled configured roots with `mmdbridge roots list --json`. For an all-library request, include enabled model, motion, and scene roots. List each requested type with `mmdbridge assets list --type <model|motion|scene> --limit 50000 --json`, then retain only assets in the selected roots. The Core list limit is 50,000 per type; if a result contains exactly 50,000 items, stop that type and report that coverage may be truncated instead of claiming a full-library run. Do not scan for a tag-only request. Scan only when explicitly requested, using the queue and waiting for `Completed`; do not use `--full-check` unless explicitly requested.
 2. Use only normal, supported assets. Pure-Camera VMD rows are auxiliary and must not be retrieved or tagged by internal ID. Existing unsupported/retired X rows are out of scope.
-3. For each eligible asset, inspect parsed metadata and existing tag assignments (`name`, `source`, `confidence`). The Core batch-add response reports `blockedByUser` when a removal override blocks a candidate; do not bypass it or inspect SQLite. Preserve user tags and old unprefixed tags; do not rename, merge, or delete them. If a legacy tag already expresses the same fact, avoid adding a duplicate prefixed synonym. If an old agent tag conflicts with current evidence, leave it in place and report the conflict for review; `tags remove` records a user removal override and is not a cleanup tool.
+3. For each eligible asset, inspect parsed metadata, existing tag assignments (`name`, `source`, `confidence`), and removal overrides with `tags list <id> --include-overrides --json` or bounded `tags audit-batch --asset-id <id>... --json`. The Core batch-add response reports `blockedByUser` when a removal override blocks a candidate; do not bypass it or inspect SQLite. Preserve user, parser, and old unprefixed tags; do not rename, merge, or delete them. If a legacy tag already expresses the same fact, avoid adding a duplicate prefixed synonym. If an old agent or parser color tag conflicts with current evidence, leave it in place and report the conflict for review; `tags remove` records a user removal override and is not a cleanup tool.
 
 ## Cards and visual evidence
 
@@ -30,13 +32,15 @@ Use stable `dimension:value` tag names for newly added tags. Keep dimensions dis
 
 Useful visual vocabulary includes anime, realistic, semi-realistic, cartoon, chibi, low-poly, pixel-art, clay-like; sweet, fresh, elegant, ornate, simple, gothic, lolita, punk, street, sporty, casual, school, idol-stage, retro, and futuristic. Chinese clothing is not automatically historical; a single accessory does not define the whole outfit. Select main color(s), at most a useful accent, and clear part colors. Describe body shape neutrally and only when visible; loose clothing, capes, skirts, armor, or props can obscure it. Do not infer body shape from bounding-box thresholds. Material tags describe visual appearance, not verified shader/material properties.
 
+For skirts, separate garment category, length, silhouette, folds, and decorations. Use the taxonomy's visible criteria, compatible combinations, and ambiguous examples. A skirt-shaped outline alone does not prove pleats, a dress, or a particular fashion subculture. Pants under a skirt do not make it a culotte; classify divided construction only when clearly visible. Omit hidden waistlines, obscured hems, texture-only fold impressions, and uncertain garment types.
+
 Search aliases such as `高→比例:高挑`, `矮→比例:娇小`, `瘦→体型:苗条`, and `胖→体型:丰满` belong in search normalization; do not add both synonyms as tags. Multiple values in one dimension are fine only when the evidence supports them; do not assign contradictory hair lengths or styles by default.
 
 ## Tag count and confidence
 
-For a complete, clearly visible role model, aim for 8–16 distinct, useful tags when evidence supports them. This is not a minimum. The soft cap for automatic additions is 20 total tags per asset. Use fewer for ambiguous/incomplete assets; never delete existing tags or exceed the cap to satisfy a quota. For motions and scenes, add only the useful facts available; there is no minimum. Prioritize role/type/format, reliable identity, major clothing or scene content, principal colors, clear appearance, and parser-backed technical facts. Do not add every small decoration or repeat old synonyms.
+For a complete, clearly visible role model, aim for 8–16 distinct, useful tags when evidence supports them, including facts already supplied by Core. This is not a minimum. Stop adding Agent tags once the asset reaches 20 total tags; existing tags may exceed that cap and must remain. Use fewer for ambiguous/incomplete assets; never delete existing tags or exceed the cap to satisfy a quota. For motions and scenes, add only the useful facts available; there is no minimum. Prioritize role/type, reliable identity, major clothing or scene content, principal colors, and clear appearance. Do not add every small decoration or repeat old synonyms.
 
-Confidence is a heuristic, not a calibrated probability. Parser-backed facts may use about `0.95`; clear visual facts about `0.75–0.9`. Unclear visual impressions should be omitted or reported for review rather than written as confirmed tags. User additions, edits, and removals always take precedence. Do not promote an old agent tag to user source.
+Confidence is a heuristic, not a calibrated probability. Core writes parser facts with `1.0` and overall-color estimates with `0.78`; these do not prove garment regions. Use `0.75–0.9` for clear visual facts; require at least `0.8` and visible construction for skirt subtypes. Omit weaker visual impressions or report them for review rather than writing confirmed tags. User additions, edits, and removals always take precedence. Do not promote an old agent tag to user source.
 
 ## Writing and manifest sync
 
@@ -47,6 +51,7 @@ Confidence is a heuristic, not a calibrated probability. Parser-backed facts may
    `mmdbridge cards sync-manifest --asset-id <id-1> <id-2> --json`
    This command calls Core `Library::create_card(id, None)` and skips assets without a current usable thumbnail. Review both `completed` and `failed` records even when the process exits nonzero (`partialFailure=true`); retry only failed IDs after resolving the cause. Never call `cards refresh` without a supplied preview for a tag-only update, because that path may render a thumbnail.
 3. Verify the affected cards with `mmdbridge cards verify` and confirm they are `CardValid` with `hasThumbnail=true`; re-list tags for affected assets. Summarize processed, skipped, failed, low-confidence review, and user-override counts. Do not claim the whole library was retagged if any requested root/type was omitted.
+4. Keep a compact review record per affected asset: asset ID, thumbnail reviewed, newly added tags, visible evidence, omitted uncertain facets, and conflicts. Distinguish automatic Core tags from tags added in this pass. Do not report skipped visuals as successfully classified.
 
 ## Safety
 

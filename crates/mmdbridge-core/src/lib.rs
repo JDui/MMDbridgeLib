@@ -1,4 +1,5 @@
 mod cards;
+mod auto_tags;
 mod database;
 mod error;
 mod filters;
@@ -18,6 +19,7 @@ mod thumbnail_physics;
 mod types;
 
 pub use database::{Library, LibraryOpenProgress};
+pub use auto_tags::{AutoTagSettings, SubjectColor, SubjectPalette};
 pub use error::{CoreError, CoreResult};
 pub use operations::{
     AssetOperationAsset, AssetOperationDependencySnapshot, AssetOperationJournalEntry,

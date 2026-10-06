@@ -106,6 +106,8 @@ pub struct ThumbnailRenderReport {
     pub material_count: usize,
     pub texture_count: usize,
     pub diagnostics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_palette: Option<crate::SubjectPalette>,
 }
 
 fn single_sample() -> u32 { 1 }
@@ -2248,6 +2250,7 @@ impl GpuRenderer {
             .encode_simple(false, QUALITY)
             .map_err(|error| CoreError::ThumbnailRender(format!("WebP Q50 编码失败：{error:?}")))?
             .to_vec();
+        let subject_palette = (!scene_view).then(|| crate::auto_tags::subject_palette(&rgba, WIDTH, HEIGHT, &diagnostics));
         if !progress("Encoding", 0.98) {
             return Err(CoreError::ThumbnailCancelled);
         }
@@ -2279,6 +2282,7 @@ impl GpuRenderer {
                 texture_count,
                 vertex_count: source_vertices.len(),
                 diagnostics,
+                subject_palette,
             },
         })
     }
