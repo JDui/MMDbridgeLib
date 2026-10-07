@@ -31,3 +31,24 @@ subprocess against the bridge. Screenshots use the actual frontend with recorded
 and an isolated presentation bridge. They are not Windows desktop screenshots,
 real-library tests, or evidence that an external Agent classified the models.
 The fixture database and session token are excluded from review artifacts.
+
+Working sessions add a restrained glass glow/sweep to both panels, an orbiting
+operation glyph, progress sheen and short entry transitions for new log records.
+The glyph reflects the most recent inspection, tag or card-sync operation.
+Only the most recent six arriving records animate, and their classes expire;
+restored history never enters again. Progress uses the actual reported value,
+or an indeterminate track without a percentage when no value was reported.
+
+Continuous effects stop on cancellation or a connection-read failure, pause
+when the page/window is hidden, and resume after recovery. Both the appearance
+motion switch and system reduced-motion preference disable animations. Completion
+adds one brief green settle, with no replay on unchanged polls or navigation.
+Loops animate decorative transforms/opacity, with no per-frame JavaScript,
+animated blur, moving text, extra application dependencies or synthetic progress.
+
+The isolated frontend review checks motion advancing without layout movement,
+actual/unknown progress, bounded arrivals, history replay, copy interactions,
+reduced motion, hidden pages, cancellation and connection loss. It records an
+MP4 of the actual CSS using a synthetic Core trace and captures light/dark
+working states and completion. This records presentation behavior, not Windows
+device performance or an external Agent actually classifying user assets.

@@ -1,6 +1,6 @@
-import { ActionIcon, Alert, Badge, Button, Checkbox, NativeSelect, Progress } from "@mantine/core";
+import { ActionIcon, Alert, Badge, Button, Checkbox, NativeSelect } from "@mantine/core";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, Copy, Link2, RefreshCw, Square, Unplug } from "lucide-react";
+import { Check, Copy, FileCheck, Link2, RefreshCw, ScanLine, Square, Tags, Unplug } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toUiError } from "./uiError";
 
@@ -17,6 +17,20 @@ export type AgentLinkSnapshot = {
 const statusLabels = { waiting: "等待连接", active: "正在接管", finished: "已完成", cancelled: "已取消", disconnected: "连接已断开" };
 const operationLabels: Record<string, string> = { "agent-identify": "Agent 连接", "agent-inspect": "资产检查", "agent-tags": "追加标签", "agent-sync-cards": "资源卡同步", "agent-log": "进度", "agent-finish": "完成", "agent-cancel": "取消接管", "agent-session": "新会话" };
 const summaryKeys: Record<string, string> = { assets: "资产", items: "读取", changed: "新增", blockedByUser: "移除覆盖", completed: "完成", failed: "失败" };
+const activityIcons = { "agent-inspect": ScanLine, "agent-tags": Tags, "agent-sync-cards": FileCheck };
+
+function PanelEffects() {
+  return <span className="agentlink-panel-effects" aria-hidden="true"><span className="agentlink-panel-glow" /><span className="agentlink-panel-sweep" /><span className="agentlink-panel-settle" /></span>;
+}
+
+function ActivityGlyph({ status, operation }: { status: AgentLinkSnapshot["status"]; operation: string }) {
+  const Icon = status === "finished" ? Check : status === "cancelled" ? Square : status === "disconnected" ? Unplug
+    : status === "active" ? activityIcons[operation as keyof typeof activityIcons] ?? Link2 : Link2;
+  return <span className="agentlink-activity" aria-hidden="true" title={status === "active" ? `最近操作：${operationLabels[operation] ?? "Agent 连接"}` : statusLabels[status]}>
+    <svg className="agentlink-activity-orbit" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeOpacity=".16" /><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.3" strokeDasharray="38 25" strokeLinecap="round" /></svg>
+    <Icon size={13} strokeWidth={1.7} />
+  </span>;
+}
 
 async function copyText(value: string): Promise<void> {
   try { await navigator.clipboard.writeText(value); return; } catch { /* Use the WebView clipboard fallback. */ }
@@ -40,6 +54,9 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
   const [busy, setBusy] = useState(false);
   const [followLog, setFollowLog] = useState(true);
   const [copied, setCopied] = useState<"prompt" | "log" | null>(null);
+  const [documentVisible, setDocumentVisible] = useState(() => !document.hidden);
+  const [freshEvents, setFreshEvents] = useState<Set<string>>(() => new Set());
+  const [settling, setSettling] = useState(false);
   const current = useRef<AgentLinkSnapshot | null>(null);
   const dirtyRef = useRef(false);
   const scopeApplied = useRef(false);
@@ -49,6 +66,10 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
   const inFlight = useRef(false);
   const pollVersion = useRef(0);
   const copyTimer = useRef<number | null>(null);
+  const settleTimer = useRef<number | null>(null);
+  const freshTimer = useRef<number | null>(null);
+  const visible = useRef(active && documentVisible);
+  visible.current = active && documentVisible;
   onChanged.current = onLibraryChanged;
 
   const accept = useCallback((next: AgentLinkSnapshot, replacePrompt = false) => {
@@ -58,6 +79,20 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
       && next.status === previous.status && next.cliAvailable === previous.cliAvailable
       && next.skillAvailable === previous.skillAvailable && next.error === previous.error) return;
     current.current = next; setSnapshot(next); setScope(next.scope);
+    // Animate only newly received records, never restored history or offscreen work.
+    const sameSession = previous?.sessionId === next.sessionId;
+    const previousIds = new Set(previous?.events.map((event) => event.id));
+    const arrivals = visible.current && sameSession ? next.events.filter((event) => !previousIds.has(event.id)).slice(-6).map((event) => event.id) : [];
+    if (freshTimer.current !== null) window.clearTimeout(freshTimer.current);
+    freshTimer.current = null; setFreshEvents(new Set(arrivals));
+    if (arrivals.length) freshTimer.current = window.setTimeout(() => { setFreshEvents(new Set()); freshTimer.current = null; }, 950);
+    if (sameSession && previous?.status === "active" && next.status === "finished" && visible.current) {
+      if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
+      setSettling(true); settleTimer.current = window.setTimeout(() => { setSettling(false); settleTimer.current = null; }, 950);
+    } else if (next.status !== "finished" || !sameSession) {
+      if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
+      settleTimer.current = null; setSettling(false);
+    }
     if (replacePrompt || !dirtyRef.current) { setPrompt(next.prompt); setDirty(false); dirtyRef.current = false; setStalePrompt(false); }
     else if (previous && (previous.sessionId !== next.sessionId || JSON.stringify(previous.scope) !== JSON.stringify(next.scope))) setStalePrompt(true);
     if (previous && (next.libraryRevision !== previous.libraryRevision || (next.status === "finished" && previous.status !== "finished"))) {
@@ -93,7 +128,25 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
   useEffect(() => {
     if (active && followLog && logBody.current) logBody.current.scrollTop = logBody.current.scrollHeight;
   }, [active, followLog, snapshot?.revision]);
-  useEffect(() => () => { if (copyTimer.current !== null) window.clearTimeout(copyTimer.current); }, []);
+  useEffect(() => {
+    const changed = () => setDocumentVisible(!document.hidden);
+    document.addEventListener("visibilitychange", changed);
+    return () => document.removeEventListener("visibilitychange", changed);
+  }, []);
+  useEffect(() => {
+    if (!active || !documentVisible) {
+      setFreshEvents(new Set()); setSettling(false);
+      if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
+      if (freshTimer.current !== null) window.clearTimeout(freshTimer.current);
+      settleTimer.current = null;
+      freshTimer.current = null;
+    }
+  }, [active, documentVisible]);
+  useEffect(() => () => {
+    if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
+    if (freshTimer.current !== null) window.clearTimeout(freshTimer.current);
+  }, []);
 
   async function action(command: string, args: Record<string, unknown> = {}, replacePrompt = false) {
     inFlight.current = true; ++pollVersion.current; setBusy(true); setError("");
@@ -116,13 +169,15 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
   const connected = snapshot?.status === "active";
   const events = snapshot?.events ?? [];
   const progress = snapshot?.percent ?? null;
+  const visualStatus = connectionError || snapshot?.error ? "disconnected" : snapshot?.status ?? "waiting";
+  const recentOperation = [...events].reverse().find((event) => event.operation in activityIcons || event.operation === "agent-identify" || event.operation === "agent-session")?.operation ?? "agent-identify";
   const scopeRoots = roots.filter((root) => root.enabled && (!scope.assetType || root.assetType === scope.assetType));
   const unavailableRoot = scope.rootId && !scopeRoots.some((root) => root.id === scope.rootId)
     ? [{value:scope.rootId,label:(roots.find((root) => root.id === scope.rootId)?.displayName ?? "原资产目录") + " · 不可用",disabled:true}] : [];
-  return <section className="agentlink-page" hidden={!active} aria-label="AgentLink">
+  return <section className={`agentlink-page ${settling ? "is-settling" : ""}`} data-status={visualStatus} data-animate={active && documentVisible && !connectionError && !snapshot?.error} hidden={!active} aria-label="AgentLink">
     <div className="agentlink-heading"><div><h1>AgentLink</h1><p>在外部 Agent 中使用 Prompt，进度与操作记录会显示在 Log。</p></div>
       <div className="agentlink-session-controls">
-        <Badge variant="light" color={connected ? "blue" : snapshot?.status === "finished" ? "green" : "gray"} className={`agentlink-status ${connected ? "is-active" : ""}`}><span className="agentlink-status-dot" />{snapshot ? statusLabels[snapshot.status] : "正在连接"}{snapshot?.agentName ? ` · ${snapshot.agentName}` : ""}</Badge>
+        <Badge variant="light" color={visualStatus === "active" ? "blue" : visualStatus === "finished" ? "green" : "gray"} className={`agentlink-status ${visualStatus === "active" ? "is-active" : ""}`}><span className="agentlink-status-dot" />{snapshot ? statusLabels[visualStatus] : "正在连接"}{snapshot?.agentName ? ` · ${snapshot.agentName}` : ""}</Badge>
         {connected ? <Button variant="light" color="red" disabled={busy} leftSection={<Square size={13} />} onClick={() => void action("agentlink_cancel")}>取消接管</Button>
           : <Button variant="subtle" disabled={busy || !snapshot || snapshot.status === "disconnected"} leftSection={<Link2 size={15} />} onClick={() => void action("agentlink_new_session")}>新会话</Button>}
       </div>
@@ -136,17 +191,19 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
     </div>
     <div className="agentlink-panels">
       <div className="agentlink-panel prompt-panel">
+        <PanelEffects />
         <div className="agentlink-panel-header"><h2>Prompt</h2><div><Button size="compact-xs" variant="subtle" leftSection={<RefreshCw size={14} />} disabled={busy || !snapshot} onClick={() => void action("agentlink_open", {}, true)}>重新生成</Button><Button size="compact-xs" variant="light" leftSection={copied === "prompt" ? <Check size={14} /> : <Copy size={14} />} disabled={!prompt || stalePrompt} onClick={() => void copy("prompt")}>{copied === "prompt" ? "已复制" : "复制"}</Button></div></div>
         {stalePrompt && <div className="agentlink-prompt-warning" role="status">范围或会话已变化，请重新生成 Prompt。</div>}
         <textarea className="agentlink-prompt" aria-label="AgentLink Prompt" spellCheck={false} value={prompt} placeholder="正在生成当前资产范围的 Prompt…" onChange={(event) => {setPrompt(event.target.value);setDirty(true);dirtyRef.current=true;}} />
         <div className="agentlink-panel-footer"><span>{dirty ? "已编辑" : "当前资产范围"}</span><span>{prompt.length.toLocaleString()} 字符</span></div>
       </div>
       <div className="agentlink-panel log-panel">
-        <div className="agentlink-panel-header"><h2>Log</h2><div><ActionIcon variant="subtle" aria-label="复制 AgentLink 日志" title="复制日志" disabled={!events.length} onClick={() => void copy("log")}>{copied === "log" ? <Check size={15} /> : <Copy size={15} />}</ActionIcon><Button size="compact-xs" variant="subtle" leftSection={<RefreshCw size={14} />} disabled={busy} onClick={() => void onChanged.current().catch((reason) => setError(toUiError(reason)))}>刷新资产</Button></div></div>
-        {progress !== null && <div className="agentlink-progress"><Progress value={progress} size={3} aria-label="Agent 接管进度" /><span>{progress}%</span></div>}
+        <PanelEffects />
+        <div className="agentlink-panel-header"><h2>Log <ActivityGlyph status={visualStatus} operation={recentOperation} /></h2><div><ActionIcon variant="subtle" aria-label="复制 AgentLink 日志" title="复制日志" disabled={!events.length} onClick={() => void copy("log")}>{copied === "log" ? <Check size={15} /> : <Copy size={15} />}</ActionIcon><Button size="compact-xs" variant="subtle" leftSection={<RefreshCw size={14} />} disabled={busy} onClick={() => void onChanged.current().catch((reason) => setError(toUiError(reason)))}>刷新资产</Button></div></div>
+        {(progress !== null || connected) && <div className={`agentlink-progress ${progress === null ? "is-indeterminate" : ""}`}><div className="agentlink-progress-track" role="progressbar" aria-label="Agent 接管进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress ?? undefined}><div className="agentlink-progress-fill" style={{ transform: `scaleX(${(progress ?? 100) / 100})` }}><i className="agentlink-progress-sheen" aria-hidden="true" /></div></div><span>{progress === null ? "—" : `${progress}%`}</span></div>}
         <div className="agentlink-log" ref={logBody} role="log" aria-label="AgentLink 操作日志" aria-live="polite" aria-relevant="additions">
           {!events.length && <div className="agentlink-log-empty"><Unplug size={25} strokeWidth={1.3} /><strong>暂无操作记录</strong><span>Agent 连接后会显示检查、标签与资源卡同步记录。</span></div>}
-          {events.map((event) => <article key={event.id} className={`agentlink-event phase-${event.phase}`}><div className="agentlink-event-heading"><strong>{operationLabels[event.operation] ?? event.operation}</strong><time dateTime={event.time}>{new Date(event.time).toLocaleTimeString("zh-CN",{hour12:false})}</time></div><p>{event.message}</p>{Object.entries(event.details).some(([key,value]) => summaryKeys[key] && typeof value === "number") && <dl>{Object.entries(event.details).filter(([key,value]) => summaryKeys[key] && typeof value === "number").map(([key,value]) => <div key={key}><dt>{summaryKeys[key]}</dt><dd>{String(value)}</dd></div>)}</dl>}</article>)}
+          {events.map((event) => <article key={event.id} className={`agentlink-event phase-${event.phase} ${freshEvents.has(event.id) ? "is-new" : ""}`}><div className="agentlink-event-heading"><strong>{operationLabels[event.operation] ?? event.operation}</strong><time dateTime={event.time}>{new Date(event.time).toLocaleTimeString("zh-CN",{hour12:false})}</time></div><p>{event.message}</p>{Object.entries(event.details).some(([key,value]) => summaryKeys[key] && typeof value === "number") && <dl>{Object.entries(event.details).filter(([key,value]) => summaryKeys[key] && typeof value === "number").map(([key,value]) => <div key={key}><dt>{summaryKeys[key]}</dt><dd>{String(value)}</dd></div>)}</dl>}</article>)}
         </div>
         <div className="agentlink-panel-footer"><Checkbox size="xs" label="跟随最新日志" checked={followLog} onChange={(event) => setFollowLog(event.target.checked)} /><span>{events.length} 条记录</span></div>
       </div>

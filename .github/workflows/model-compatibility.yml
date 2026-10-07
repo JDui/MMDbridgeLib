@@ -30,7 +30,7 @@ jobs:
       - name: Prepare software Vulkan
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y mesa-vulkan-drivers fonts-noto-cjk
+          sudo apt-get install -y mesa-vulkan-drivers fonts-noto-cjk ffmpeg
           mkdir -m 700 "$RUNNER_TEMP/mbl-xdg"
           echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/mbl-xdg" >> "$GITHUB_ENV"
           echo "MBL_MODEL_REVIEW=$RUNNER_TEMP/mbl-model-review" >> "$GITHUB_ENV"
