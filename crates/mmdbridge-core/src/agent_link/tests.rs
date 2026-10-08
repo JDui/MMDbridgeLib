@@ -49,6 +49,31 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn failed_session_file_writes_keep_the_previous_session_available_for_retry() {
+    let mut f=Fixture::new();
+    let server=f.server.as_mut().unwrap();
+    // Freeze only this isolated fixture's workers while simulating blocked file writes.
+    server.stopped.store(true,super::Ordering::Release);
+    for worker in server.workers.drain(..) { worker.join().unwrap(); }
+    server.stopped.store(false,super::Ordering::Release);
+    for name in ["owner.lock","session.json"] {
+        let before=server.snapshot().unwrap();
+        let target=server.directory.join(name);let backup=server.directory.join(format!("{name}.backup"));
+        fs::rename(&target,&backup).unwrap();fs::create_dir(&target).unwrap();
+        assert!(server.new_session().is_err());
+        assert_eq!(server.auth.lock().unwrap().session_id,before.session_id);
+        assert_eq!(server.snapshot().unwrap().status,before.status);
+        fs::remove_dir(&target).unwrap();fs::rename(&backup,&target).unwrap();
+        let restored=super::session_at(&server.directory,&server.database).unwrap();
+        assert_eq!(restored.session_id,before.session_id);
+        assert_eq!(restored.token,server.auth.lock().unwrap().token);
+        let retried=server.new_session().unwrap();
+        assert_ne!(retried.session_id,before.session_id);assert_eq!(retried.status,"waiting");
+        assert_eq!(super::session_at(&server.directory,&server.database).unwrap().session_id,retried.session_id);
+    }
+}
+
+#[test]
 fn live_session_identifies_logs_and_requires_synced_cards_before_finish() {
     let f=Fixture::new();let library=f.library.as_ref().unwrap();
     assert!(f.rpc("agent-inspect",json!({})).is_err());f.connect();

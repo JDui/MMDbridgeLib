@@ -778,8 +778,7 @@ impl Library {
     }
 
     pub fn regenerate_thumbnail(&self, asset_id: &str) -> CoreResult<serde_json::Value> {
-        self.ensure_asset_visible(asset_id)?;
-        self.connection()?.execute("UPDATE cards SET status='CardStale' WHERE asset_id=?1", [asset_id])?;
+        crate::cards::request_thumbnail_refresh(self, asset_id)?;
         self.enqueue_thumbnail(asset_id, 10)
     }
 
@@ -1831,7 +1830,7 @@ impl Library {
                 if !progress("Encoding", 0.95) {
                     return Err(CoreError::ThumbnailCancelled);
                 }
-                return crate::cards::create_for_asset(self, &asset, Some(&preview), Some(&report));
+                return crate::cards::create_with_cached_thumbnail(self, &asset, &preview, &report);
             }
             let generated = if let Some(model_path) = motion_preview_model.as_deref() {
                 match extension.map(str::to_ascii_lowercase).as_deref() {

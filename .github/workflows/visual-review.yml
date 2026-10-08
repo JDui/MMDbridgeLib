@@ -6,6 +6,10 @@ on:
     paths:
       - 'scripts/visual-review*'
       - 'apps/desktop/src/App.tsx'
+      - 'apps/desktop/src/libraryState.ts'
+      - 'apps/desktop/src/theme.ts'
+      - 'apps/desktop/src/AppearanceSettings.tsx'
+      - 'crates/mmdbridge-core/**'
       - 'apps/desktop/src/**/*.css'
       - '.github/workflows/visual-review.yml'
   workflow_dispatch:

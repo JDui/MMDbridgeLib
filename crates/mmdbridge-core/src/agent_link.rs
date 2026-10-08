@@ -312,8 +312,12 @@ impl AgentLinkServer {
         if state.status=="active" { return Err(failure("请先结束或取消当前接管")); }
         if self.stopped.load(Ordering::Acquire) { return Err(failure("连接已断开，请重新打开软件")); }
         let mut auth=self.auth.lock().map_err(|_| CoreError::LockPoisoned)?;
-        *auth=new_session(&self.database);atomic_json(&self.directory.join("session.json"),&*auth)?;
-        fs::write(self.directory.join("owner.lock"),&auth.session_id)?;
+        let replacement=new_session(&self.database);
+        // The lock file reserves the directory; session.json is the credential commit.
+        // Keep the live credentials until both writes succeed so a retry remains usable.
+        fs::write(self.directory.join("owner.lock"),&replacement.session_id)?;
+        atomic_json(&self.directory.join("session.json"),&replacement)?;
+        *auth=replacement;
         self.cancelled.store(false,Ordering::Release);state.status="waiting".to_owned();state.agent_name.clear();state.percent=None;state.unsynced.clear();
         state.emit(&self.directory,"agent-session","ready","新会话已准备好".to_owned(),json!({}));
         drop(auth);drop(state);self.snapshot()

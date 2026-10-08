@@ -24,6 +24,7 @@ const CARD_SCHEMA_VERSION: u32 = 1;
 const MANIFEST_REVISION: &str = concat!("card-", env!("CARGO_PKG_VERSION"), "-", "1");
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
+const REFRESH_REQUESTED_REVISION: &str = "refresh-requested";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestSource {
@@ -82,6 +83,8 @@ struct AssetContext {
     is_favorite: bool,
     current_card_path: Option<PathBuf>,
     current_manifest_json: Option<String>,
+    current_card_status: Option<String>,
+    current_renderer_revision: Option<String>,
 }
 
 struct ReadCard {
@@ -263,16 +266,7 @@ pub(crate) fn verify_with_renderer_revision(
     renderer_revision: &str,
 ) -> CoreResult<CardValidation> {
     let context = load_context(library, asset_id)?;
-    let was_stale = library
-        .connection()?
-        .query_row(
-            "SELECT status FROM cards WHERE asset_id=?1",
-            [asset_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .as_deref()
-        == Some("CardStale");
+    let was_stale = context.current_card_status.as_deref() == Some("CardStale");
     let stored_card_path = context
         .current_card_path
         .clone()
@@ -413,12 +407,39 @@ pub(crate) fn verify_with_renderer_revision(
                 metadata_modified_ns(&metadata),
             )
         });
-    let stored_renderer_revision = manifest_renderer_revision(
-        manifest_json.as_deref(),
-        renderer_revision,
-    );
-    let connection = library.connection()?;
-    connection.execute(
+    let stored_renderer_revision = if context.current_renderer_revision.as_deref() == Some(REFRESH_REQUESTED_REVISION) {
+        REFRESH_REQUESTED_REVISION.to_owned()
+    } else {
+        manifest_renderer_revision(manifest_json.as_deref(), renderer_revision)
+    };
+    let validation = CardValidation {
+        asset_id: context.asset_id.clone(),
+        status: status.to_owned(),
+        card_path: Some(card_path.to_string_lossy().into_owned()),
+        has_thumbnail,
+        message,
+    };
+    publish_validation(library, &context, validation, manifest_json, file_signature,
+        &stored_renderer_revision, &now)
+}
+
+fn publish_validation(
+    library: &Library,
+    context: &AssetContext,
+    validation: CardValidation,
+    manifest_json: Option<String>,
+    file_signature: Option<(i64, i64)>,
+    renderer_revision: &str,
+    checked_at: &str,
+) -> CoreResult<CardValidation> {
+    let mut connection = library.connection()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !publication_context_is_current(&transaction, context)?
+        || crate::operations::is_asset_operation_active_on(&transaction, &context.asset_id)?
+    {
+        return Err(CoreError::Card("资产信息或资源卡在验证期间发生变化，请稍后重试".to_owned()));
+    }
+    transaction.execute(
         "INSERT INTO cards(asset_id,card_path,status,manifest_json,last_checked_at,file_size,modified_ns,manifest_revision,renderer_revision,has_thumbnail)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
          ON CONFLICT(asset_id) DO UPDATE SET card_path=excluded.card_path,status=excluded.status,
@@ -428,25 +449,19 @@ pub(crate) fn verify_with_renderer_revision(
            has_thumbnail=excluded.has_thumbnail",
         params![
             context.asset_id,
-            card_path.to_string_lossy().into_owned(),
-            status,
+            validation.card_path,
+            validation.status,
             manifest_json,
-            now,
+            checked_at,
             file_signature.map(|signature| signature.0),
             file_signature.map(|signature| signature.1),
             MANIFEST_REVISION,
-            stored_renderer_revision,
-            i64::from(has_thumbnail),
+            renderer_revision,
+            i64::from(validation.has_thumbnail),
         ],
     )?;
-
-    Ok(CardValidation {
-        asset_id: context.asset_id,
-        status: status.to_owned(),
-        card_path: Some(card_path.to_string_lossy().into_owned()),
-        has_thumbnail,
-        message,
-    })
+    transaction.commit()?;
+    Ok(validation)
 }
 
 pub(crate) fn verify_if_changed(
@@ -564,7 +579,7 @@ pub(crate) fn create(
     preview_webp: Option<&[u8]>,
     render_report: Option<&ThumbnailRenderReport>,
 ) -> CoreResult<CardResult> {
-    create_checked(library, asset_id, preview_webp, render_report, None)
+    create_checked(library, asset_id, preview_webp, render_report, None, preview_webp.is_none())
 }
 
 pub(crate) fn create_for_asset(
@@ -573,7 +588,13 @@ pub(crate) fn create_for_asset(
     preview_webp: Option<&[u8]>,
     render_report: Option<&ThumbnailRenderReport>,
 ) -> CoreResult<CardResult> {
-    create_checked(library, &asset.id, preview_webp, render_report, Some(asset))
+    create_checked(library, &asset.id, preview_webp, render_report, Some(asset), preview_webp.is_none())
+}
+
+pub(crate) fn create_with_cached_thumbnail(
+    library: &Library, asset: &Asset, preview_webp: &[u8], render_report: &ThumbnailRenderReport,
+) -> CoreResult<CardResult> {
+    create_checked(library, &asset.id, Some(preview_webp), Some(render_report), Some(asset), true)
 }
 
 fn create_checked(
@@ -582,13 +603,18 @@ fn create_checked(
     preview_webp: Option<&[u8]>,
     render_report: Option<&ThumbnailRenderReport>,
     expected_asset: Option<&Asset>,
+    reuse_thumbnail: bool,
 ) -> CoreResult<CardResult> {
     if crate::operations::is_asset_operation_active(library, asset_id)? {
         return Err(CoreError::AssetOperation("该资产有进行中或待恢复的文件操作，暂时不能创建资源卡".to_owned()));
     }
     let mut context = load_context(library, asset_id)?;
-    if expected_asset.is_some_and(|asset| asset.fingerprint != context.fingerprint || Path::new(&asset.primary_source) != context.source_path) {
+    if expected_asset.is_some_and(|asset| asset.fingerprint != context.fingerprint
+        || Path::new(&asset.primary_source) != context.source_path || asset.metadata != context.metadata) {
         return Err(CoreError::Card("资产在缩略图生成期间发生变化，请重新生成".to_owned()));
+    }
+    if reuse_thumbnail && context.current_renderer_revision.as_deref() == Some(REFRESH_REQUESTED_REVISION) {
+        return Err(CoreError::Card("缩略图已请求重新渲染，请等待预览完成后再同步资源卡".to_owned()));
     }
     if let Some(report) = render_report {
         let rendered_revision = format!("{}:{}", report.renderer_version, report.preview_settings_version);
@@ -624,6 +650,9 @@ fn create_checked(
     } else {
         None
     };
+    if preserved_card.as_ref().is_some_and(|card| card.manifest.metadata != context.metadata) {
+        return Err(CoreError::Card("资源卡预览输入已变化，请重新生成缩略图后再同步信息".to_owned()));
+    }
     let preserved_preview = preserved_card
         .as_ref()
         .and_then(|card| card.preview_webp.as_deref());
@@ -647,7 +676,16 @@ fn create_checked(
             }
             if let Some(palette) = report.subject_palette.as_ref().filter(|_| current_report) {
                 if crate::auto_tags::apply_palette(library, asset_id, &context.fingerprint, &context.metadata, palette)? {
-                    context = load_context(library, asset_id)?;
+                    let updated = load_context(library, asset_id)?;
+                    if updated.asset_type != context.asset_type || updated.source_path != context.source_path
+                        || updated.fingerprint != context.fingerprint || updated.metadata != context.metadata
+                        || updated.current_card_path != context.current_card_path
+                        || updated.current_manifest_json != context.current_manifest_json
+                        || updated.current_renderer_revision != context.current_renderer_revision
+                    {
+                        return Err(CoreError::Card("资产预览输入或资源卡在颜色标签更新期间发生变化，请重新生成".to_owned()));
+                    }
+                    context = updated;
                 }
             }
         }
@@ -884,18 +922,21 @@ pub(crate) fn cached_thumbnail(
     asset_id: &str,
     expected_preview_settings_version: &str,
 ) -> CoreResult<Option<(Vec<u8>, ThumbnailRenderReport)>> {
-    let status: Option<String> = library
+    let cached: Option<(String, Option<String>)> = library
         .connection()?
         .query_row(
-            "SELECT status FROM cards WHERE asset_id=?1",
+            "SELECT status,renderer_revision FROM cards WHERE asset_id=?1",
             [asset_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if !matches!(status.as_deref(), Some("CardValid" | "CardStale")) {
+    let Some((status, revision)) = cached else { return Ok(None); };
+    if !matches!(status.as_str(), "CardValid" | "CardStale")
+        || revision.as_deref() != Some(format!("{}:{expected_preview_settings_version}", crate::thumbnail::RENDERER_VERSION).as_str()) {
         return Ok(None);
     }
     let context = load_context(library, asset_id)?;
+    if context.current_renderer_revision != revision { return Ok(None); }
     let Some(path) = context
         .current_card_path
         .as_deref()
@@ -927,6 +968,19 @@ pub(crate) fn cached_thumbnail(
     Ok(Some((preview, report.clone())))
 }
 
+pub(crate) fn request_thumbnail_refresh(library: &Library, asset_id: &str) -> CoreResult<()> {
+    let mut connection = library.connection()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    load_context_on(&transaction, asset_id)?;
+    if crate::operations::is_asset_operation_active_on(&transaction, asset_id)? {
+        return Err(CoreError::AssetOperation("该资产正在执行文件操作，暂时不能重新生成缩略图".to_owned()));
+    }
+    transaction.execute("UPDATE cards SET status='CardStale',renderer_revision=?2 WHERE asset_id=?1",
+        params![asset_id, REFRESH_REQUESTED_REVISION])?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn load_context(library: &Library, asset_id: &str) -> CoreResult<AssetContext> {
     library.ensure_asset_visible(asset_id)?;
     let connection = library.connection()?;
@@ -941,7 +995,9 @@ fn publication_context_is_current(connection: &Connection, expected: &AssetConte
         && current.tags == expected.tags && current.suppressed_tags == expected.suppressed_tags
         && current.is_favorite == expected.is_favorite
         && current.current_card_path == expected.current_card_path
-        && current.current_manifest_json == expected.current_manifest_json)
+        && current.current_manifest_json == expected.current_manifest_json
+        && current.current_card_status == expected.current_card_status
+        && current.current_renderer_revision == expected.current_renderer_revision)
 }
 
 fn load_context_on(connection: &Connection, asset_id: &str) -> CoreResult<AssetContext> {
@@ -955,13 +1011,15 @@ fn load_context_on(connection: &Connection, asset_id: &str) -> CoreResult<AssetC
         Option<String>,
         Option<String>,
         bool,
+        Option<String>,
+        Option<String>,
     )> =
         connection
             .query_row(
                 "SELECT a.id,a.asset_type,a.name,a.primary_source,r.path,a.fingerprint,c.card_path,c.manifest_json,
-                        EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id)
+                        EXISTS(SELECT 1 FROM favorites f WHERE f.asset_id=a.id),c.status,c.renderer_revision
                  FROM assets a JOIN roots r ON r.id=a.root_id LEFT JOIN cards c ON c.asset_id=a.id
-                 WHERE a.id=?1",
+                 WHERE a.id=?1 AND a.retired_format=0 AND a.visibility='normal'",
                 [asset_id],
                 |row| {
                     Ok((
@@ -974,6 +1032,8 @@ fn load_context_on(connection: &Connection, asset_id: &str) -> CoreResult<AssetC
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
@@ -988,6 +1048,8 @@ fn load_context_on(connection: &Connection, asset_id: &str) -> CoreResult<AssetC
         card_path,
         manifest_json,
         is_favorite,
+        card_status,
+        renderer_revision,
     )) = row
     else {
         return Err(CoreError::AssetNotFound(asset_id.to_owned()));
@@ -1032,6 +1094,8 @@ fn load_context_on(connection: &Connection, asset_id: &str) -> CoreResult<AssetC
         is_favorite,
         current_card_path: card_path.map(PathBuf::from),
         current_manifest_json: manifest_json,
+        current_card_status: card_status,
+        current_renderer_revision: renderer_revision,
     })
 }
 
@@ -1450,6 +1514,10 @@ fn is_windows_numbered_device(name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[path = "../tests/fixtures/mod.rs"]
+mod test_fixtures;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1494,6 +1562,77 @@ mod tests {
         assert!(publication_context_is_current(&library.connection().unwrap(), &current).unwrap());
     }
 
+    fn publish_prepared_validation(library: &Library, context: &AssetContext) -> CoreResult<CardValidation> {
+        publish_validation(library, context, CardValidation {
+            asset_id: context.asset_id.clone(),
+            status: "CardValid".to_owned(),
+            card_path: context.current_card_path.as_ref().map(|path| path.to_string_lossy().into_owned()),
+            has_thumbnail: true,
+            message: None,
+        }, Some("{}".to_owned()), Some((123, 456)), "test-renderer", "verified")
+    }
+
+    #[test]
+    fn verification_does_not_overwrite_changes_made_while_reading_the_card() {
+        for change in ["favorite", "tag", "metadata", "dependency"] {
+            let library = publication_library();
+            let prepared = load_context(&library, "a").unwrap();
+            match change {
+                "favorite" => { library.set_favorite("a", true).unwrap(); }
+                "tag" => { library.add_asset_tag("a", "新标签", "user", None).unwrap(); }
+                "metadata" => { library.connection().unwrap().execute_batch(
+                    r#"UPDATE metadata SET value_json='{"bone_count":20}' WHERE asset_id='a' AND key='parsed';
+                       UPDATE cards SET status='CardStale' WHERE asset_id='a';"#
+                ).unwrap(); }
+                "dependency" => { library.connection().unwrap().execute("UPDATE cards SET status='CardStale' WHERE asset_id='a'", []).unwrap(); }
+                _ => unreachable!(),
+            }
+            assert!(matches!(publish_prepared_validation(&library, &prepared),
+                Err(CoreError::Card(message)) if message.contains("验证期间")), "{change}");
+            let connection = library.connection().unwrap();
+            let (status, manifest, checked): (String, String, String) = connection.query_row(
+                "SELECT status,manifest_json,last_checked_at FROM cards WHERE asset_id='a'", [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(status, "CardStale", "{change}");
+            assert_eq!(manifest, "{}", "{change}");
+            assert_ne!(checked, "verified", "{change}");
+        }
+    }
+
+    #[test]
+    fn verification_keeps_a_newer_card_publication_and_hidden_assets_untouched() {
+        let library = publication_library();
+        let prepared = load_context(&library, "a").unwrap();
+        library.connection().unwrap().execute_batch(
+            r#"UPDATE cards SET manifest_json='{"updated_at":"newer"}',file_size=999,last_checked_at='newer' WHERE asset_id='a';"#
+        ).unwrap();
+        assert!(publish_prepared_validation(&library, &prepared).is_err());
+        let current = load_context(&library, "a").unwrap();
+        library.connection().unwrap().execute("UPDATE assets SET visibility='auxiliary' WHERE id='a'", []).unwrap();
+        assert!(matches!(publish_prepared_validation(&library, &current), Err(CoreError::AssetNotFound(_))));
+        let (manifest, size, checked): (String, i64, String) = library.connection().unwrap().query_row(
+            "SELECT manifest_json,file_size,last_checked_at FROM cards WHERE asset_id='a'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(manifest, r#"{"updated_at":"newer"}"#);
+        assert_eq!(size, 999);
+        assert_eq!(checked, "newer");
+    }
+
+    #[test]
+    fn verification_publishes_when_the_context_is_still_current() {
+        let library = publication_library();
+        let prepared = load_context(&library, "a").unwrap();
+        let result = publish_prepared_validation(&library, &prepared).unwrap();
+        assert_eq!(result.status, "CardValid");
+        let stored: (String, i64, i64, String, bool) = library.connection().unwrap().query_row(
+            "SELECT last_checked_at,file_size,modified_ns,renderer_revision,has_thumbnail FROM cards WHERE asset_id='a'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(stored, ("verified".to_owned(), 123, 456, "test-renderer".to_owned(), true));
+    }
+
     #[test]
     fn rendered_asset_version_cannot_be_published_as_a_newly_scanned_version() {
         let library = Library::in_memory().unwrap();
@@ -1505,6 +1644,69 @@ mod tests {
         let rendered = library.inspect_asset("a").unwrap();
         library.connection().unwrap().execute("UPDATE assets SET fingerprint='after' WHERE id='a'", []).unwrap();
         assert!(matches!(create_for_asset(&library, &rendered, None, None), Err(CoreError::Card(message)) if message.contains("缩略图生成期间")));
+    }
+
+    #[test]
+    fn rendering_rejects_new_dependency_metadata_even_when_the_model_fingerprint_is_unchanged() {
+        let library = publication_library();
+        let rendered = library.inspect_asset("a").unwrap();
+        library.connection().unwrap().execute(
+            r#"UPDATE metadata SET value_json='{"file_dependencies":[{"path":"texture.png","file_size":99}]}'
+               WHERE asset_id='a' AND key='parsed'"#, [],
+        ).unwrap();
+        assert!(matches!(create_for_asset(&library, &rendered, None, None),
+            Err(CoreError::Card(message)) if message.contains("缩略图生成期间")));
+        assert_eq!(library.inspect_asset("a").unwrap().fingerprint, rendered.fingerprint);
+    }
+
+    #[test]
+    fn explicit_refresh_bypasses_cached_previews_until_a_new_render_is_published() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-refresh-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("model.pmx"), super::test_fixtures::pmx(false, 2, 0, false)).unwrap();
+        let library = Library::in_memory().unwrap();
+        library.set_auto_tag_settings(&crate::AutoTagSettings { technical: false, colors: false }).unwrap();
+        let root = library.add_root(AssetType::Model, directory.to_str().unwrap(), None).unwrap();
+        library.scan_root(&root.id).unwrap();
+        let asset = library.list_assets(Some(AssetType::Model), None, 10).unwrap().remove(0);
+        let rgba = vec![190u8; 1024 * 1024 * 4];
+        let preview = webp::Encoder::from_rgba(&rgba, 1024, 1024).encode(50.0);
+        let report = ThumbnailRenderReport {
+            renderer_version: crate::thumbnail::RENDERER_VERSION.to_owned(),
+            preview_settings_version: crate::thumbnail::PREVIEW_SETTINGS_VERSION.to_owned(),
+            adapter: "Synthetic cache fixture; no GPU render".to_owned(), front_axis: "-Z".to_owned(),
+            width: 1024, height: 1024, format: "webp".to_owned(), quality: 50, antialiasing_samples: 1,
+            preview_frame: None, vertex_count: 3, triangle_count: 1, material_count: 1, texture_count: 0,
+            diagnostics: Vec::new(), subject_palette: None,
+        };
+        create_for_asset(&library, &asset, Some(&preview), Some(&report)).unwrap();
+        let settings = crate::thumbnail::PREVIEW_SETTINGS_VERSION;
+        let (cached_preview, cached_report) = cached_thumbnail(&library, &asset.id, settings).unwrap().unwrap();
+        library.add_asset_tag(&asset.id, "手动标签", "user", None).unwrap();
+        assert!(cached_thumbnail(&library, &asset.id, settings).unwrap().is_some(), "annotation changes retain reusable previews");
+        let tagged = library.inspect_asset(&asset.id).unwrap();
+        request_thumbnail_refresh(&library, &asset.id).unwrap();
+        assert!(cached_thumbnail(&library, &asset.id, settings).unwrap().is_none());
+        assert!(create_with_cached_thumbnail(&library, &tagged, &cached_preview, &cached_report).is_err(), "a cache selected before invalidation cannot publish afterwards");
+        assert!(create(&library, &asset.id, None, None).is_err(), "metadata-only sync cannot clear a refresh request");
+        assert_eq!(verify(&library, &asset.id).unwrap().status, "CardStale");
+        assert!(cached_thumbnail(&library, &asset.id, settings).unwrap().is_none(), "verification preserves invalidation");
+        create_for_asset(&library, &tagged, Some(&preview), Some(&report)).unwrap();
+        assert_eq!(verify(&library, &asset.id).unwrap().status, "CardValid");
+        assert!(cached_thumbnail(&library, &asset.id, settings).unwrap().is_some());
+        assert_eq!(library.list_asset_tags(&asset.id).unwrap()[0].name, "手动标签");
+        let card_path = PathBuf::from(verify(&library, &asset.id).unwrap().card_path.unwrap());
+        let previous_card = fs::read(&card_path).unwrap();
+        library.connection().unwrap().execute_batch(
+            r#"UPDATE metadata SET value_json=json_set(value_json,'$.file_dependencies',json('[{"path":"texture.png","file_size":99}]'))
+                 WHERE key='parsed';
+               UPDATE cards SET status='CardStale';"#
+        ).unwrap();
+        assert!(create(&library, &asset.id, None, None).is_err(), "metadata-only sync cannot republish a stale texture preview");
+        assert_eq!(fs::read(card_path).unwrap(), previous_card);
+        drop(library);
+        assert!(directory.is_absolute() && directory.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

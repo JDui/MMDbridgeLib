@@ -4,8 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'crates/mmdbridge-core/src/thumbnail*'
-      - 'crates/mmdbridge-core/examples/subject_framing_probe.rs'
+      - 'crates/mmdbridge-core/**'
       - 'scripts/subject-review.mjs'
       - 'apps/desktop/src/styles.css'
       - '.github/workflows/subject-framing.yml'
