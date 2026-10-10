@@ -1,4 +1,4 @@
-import { ActionIcon, Button, Checkbox, NativeSelect, Slider, TextInput, UnstyledButton, Alert, AppShell, Badge, Menu, Modal, MultiSelect, Progress, Tabs } from "@mantine/core";
+import { ActionIcon, Button, Checkbox, NativeSelect, SegmentedControl, Slider, TextInput, UnstyledButton, Alert, AppShell, Badge, Menu, Modal, MultiSelect, Progress, Tabs } from "@mantine/core";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUpRight, Box, Boxes, Camera, Check, ChevronDown, ChevronRight, ChevronUp, Clapperboard, FileText, Folder, FolderOpen, Grid2X2, History, Layers3, Link2, ListTodo, Minus, MoreHorizontal, PanelRight, Play, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, Star, X } from "lucide-react";
 import { AppearanceSettings } from "./AppearanceSettings";
@@ -265,6 +265,25 @@ const scanStatusLabels: Record<string, string> = {
   Relations: "分析关系", Pausing: "正在暂停", Paused: "已暂停",
   Cancelling: "正在停止", Completed: "已完成", Failed: "失败", Cancelled: "已停止",
 };
+function scanProgressText(scan: ScanState): string {
+  const phase = scanStatusLabels[scan.status] ?? scan.status;
+  if (scan.status === "Pending") return "排队中 · 等待前面的扫描完成";
+  if (scan.status === "Discovering") return `${phase} · 已发现 ${scan.filesSeen.toLocaleString()} 个资产文件 · 总数待确认`;
+  const files = `${scan.filesProcessed.toLocaleString()}/${scan.filesSeen.toLocaleString()} 文件`;
+  if (scan.status === "Indexing") {
+    const percent = scan.filesSeen ? Math.floor(scan.filesProcessed / scan.filesSeen * 100) : 0;
+    return `${phase} · ${files}（${percent}%）· 总进度 ${Math.floor(scan.progress * 100)}%`;
+  }
+  return `${phase} · ${files} · 总进度 ${Math.floor(scan.progress * 100)}%`;
+}
+function scanUpdateText(scan: ScanState): string {
+  if (!["Discovering", "Indexing", "Verifying", "Relations", "Pausing", "Cancelling"].includes(scan.status)) return "";
+  const updated = Date.parse(scan.updatedAt);
+  if (!Number.isFinite(updated)) return "";
+  const seconds = Math.max(0, Math.floor((Date.now() - updated) / 1000));
+  const age = seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  return `最近进度更新：${age}前${seconds >= 15 ? " · 当前步骤仍未报告新的进度" : ""}`;
+}
 const jobStatusLabels: Record<string, string> = {
   Pending: "排队中", Parsing: "解析中", Rendering: "渲染中", Encoding: "编码中",
   Completed: "已完成", Failed: "失败", Cancelled: "已取消", Cancelling: "正在取消",
@@ -698,7 +717,10 @@ export default function App() {
     const active = jobs.some((job) => activeThumbnailStatuses.has(job.status));
     if (!active) return;
     let disposed = false;
+    let inFlight = false;
     const timer = window.setInterval(() => {
+      if (inFlight) return;
+      inFlight = true;
       void Promise.all([invoke<Job[]>("jobs_list"), invoke<JobSummary>("jobs_summary")])
         .then(([nextJobs, nextSummary]) => {
           if (disposed) return;
@@ -714,27 +736,33 @@ export default function App() {
             }
           }
         })
-        .catch((reason) => { if (!disposed) setError(toUiError(reason)); });
+        .catch((reason) => { if (!disposed) setError(toUiError(reason)); })
+        .finally(() => { inFlight = false; });
     }, 700);
     return () => { disposed = true; window.clearInterval(timer); };
   }, [jobs, refreshAsset, refresh]);
 
   useEffect(() => {
     let disposed = false;
+    let inFlight = false;
     const timer = window.setInterval(() => {
-      void invoke<ScanState[]>("scan_states").then((nextScans) => {
+      if (inFlight) return;
+      inFlight = true;
+      void invoke<ScanState[]>("scan_states").then(async (nextScans) => {
         if (disposed) return;
         const previous = scanStatesRef.current;
         scanStatesRef.current = nextScans;
         setScanStates(nextScans);
-        if (nextScans.some((scan) => activeScanStatuses.has(scan.status))) {
-          void invoke<AssetCounts>("asset_counts").then((nextCounts) => { if (!disposed) setCounts(nextCounts); }).catch(() => {});
+        if (nextScans.some((scan) => activeScanStatuses.has(scan.status)
+          && scan.filesProcessed !== previous.find((item) => item.rootId === scan.rootId)?.filesProcessed)) {
+          await invoke<AssetCounts>("asset_counts").then((nextCounts) => { if (!disposed) setCounts(nextCounts); }).catch(() => {});
         }
+        if (disposed) return;
         if (previous.some((scan) => activeScanStatuses.has(scan.status)
           && ["Completed", "Paused", "Cancelled", "Failed"].includes(nextScans.find((next) => next.rootId === scan.rootId)?.status ?? ""))) {
           void refresh();
         }
-      }).catch((reason) => { if (!disposed) setError(toUiError(reason)); });
+      }).catch((reason) => { if (!disposed) setError(toUiError(reason)); }).finally(() => { inFlight = false; });
     }, 1200);
     return () => { disposed = true; window.clearInterval(timer); };
   }, [refresh]);
@@ -840,6 +868,7 @@ export default function App() {
   }
 
   function returnToAssetView() {
+    setAgentLinkOpen(false);
     const saved = folderReturnState.current ?? readAssetViewState("mmdbridge-asset-view-return");
     pendingScrollRestore.current = { top: saved?.scrollTop ?? 0, afterRevision: assetQueryRevision.current + 1, retryBlocked: false };
     setViewMode("assets");
@@ -1678,7 +1707,7 @@ export default function App() {
         }}>
           <div className="page-heading">
             <div className="heading-copy"><h1>{activeTitle}<span className="heading-count">{(showIndexedTotal ? indexedTotal : visibleAssets.length).toLocaleString()}{!showIndexedTotal && nextAssetCursor ? "+" : ""}</span></h1></div>
-            <div className="view-controls"><Button variant="filled" className="open-model-button" leftSection={<Plus size={16} aria-hidden="true" />} onClick={() => void openModelPreview()}>打开模型</Button><label className="card-size-control">视图大小 <Slider  min={130} max={300} step={10} value={cardSize} thumbLabel="资产卡片大小" onChange={(value) => setCardSize(value)} /></label></div>
+            <div className="view-controls"><SegmentedControl className="library-view-switch" aria-label="浏览视图" size="xs" value={viewMode} onChange={(value) => { if (value === "folders") enterFolderView(); else returnToAssetView(); }} data={[{ value: "assets", label: "资源" }, { value: "folders", label: "目录" }]} /><Button variant="filled" className="open-model-button" leftSection={<Plus size={16} aria-hidden="true" />} onClick={() => void openModelPreview()}>打开模型</Button><label className="card-size-control">视图大小 <Slider  min={130} max={300} step={10} value={cardSize} thumbLabel="资产卡片大小" onChange={(value) => setCardSize(value)} /></label></div>
           </div>
 
           <Tabs value={activeType} onChange={(value) => { if (value) selectCategory(value as AssetType | "all", viewMode === "folders"); }}>
@@ -1712,7 +1741,6 @@ export default function App() {
               <div className="folder-view-actions"><Button className="folder-return-assets" aria-expanded={!folderBrowserCompact} onClick={() => setFolderBrowserCollapse(folderBrowserCompact ? 0 : 1)}>{folderBrowserCompact ? "展开目录" : "收起目录"}</Button>
                 {folderRoot && <span className="folder-visible-count">{indexedTotal.toLocaleString()} 项</span>}
                 <Checkbox className="recursive-scope-toggle" checked={recursiveScope} onChange={(event) => setRecursiveScope(event.target.checked)} label={<>包含子目录</>} />
-                <Button className="folder-return-assets" onClick={returnToAssetView}>返回资产</Button>
               </div>
             </div>
             {!folderRoot ? <div className="folder-root-grid">{roots.filter((root) => activeType === "all" || root.assetType === activeType).map((root) => <UnstyledButton key={root.id} className="folder-root-card" onClick={() => { setActiveRoot(root.id); setActiveDirectory(null); setActiveType(root.assetType); setActiveMotionFormat("all"); setActiveSavedFilterId(null); setFavoritesOnly(false); setSelected(null); }} title={root.path}><span className={`type-icon ${root.assetType}`}><AssetKindIcon type={root.assetType} /></span><strong>{root.displayName}</strong><small>{(counts.byRoot[root.id] ?? 0).toLocaleString()} 项 · {root.path}</small></UnstyledButton>)}{!roots.length && <UnstyledButton className="folder-root-card add-folder-root" onClick={addAnyRoot}><Plus size={18} aria-hidden="true" /> 添加资产根目录</UnstyledButton>}</div>
@@ -1795,7 +1823,7 @@ export default function App() {
       <footer className={`jobbar ${jobsExpanded ? "expanded" : ""}`}>
         <div className="jobbar-leading"><span className={`jobbar-indicator ${busy || activeThumbnailCount || activeScans.length ? "working" : ""}`} />{busy ? "正在处理资产" : "后台任务"}<span className="jobbar-count">{activeThumbnailCount + activeScans.length + (busy ? 1 : 0)}</span></div>
         <div className="jobbar-detail">
-          {busy ? notice : activeScans.length ? `${activeScans.length} 个扫描任务 · ${scanStatusLabels[activeScans[0].status]} ${Math.round(activeScans[0].progress * 100)}%` : activeThumbnailCount ? `${activeThumbnailCount} 个缩略图任务 · 已完成 ${jobSummary.Completed ?? 0} · 失败 ${jobSummary.Failed ?? 0}` : "没有进行中的任务"}
+          {busy ? notice : activeScans.length ? `${activeScans.length} 个扫描任务 · ${scanProgressText(activeScans.find((scan) => scan.status !== "Pending") ?? activeScans[0])}` : activeThumbnailCount ? `${activeThumbnailCount} 个缩略图任务 · 已完成 ${jobSummary.Completed ?? 0} · 失败 ${jobSummary.Failed ?? 0}` : "没有进行中的任务"}
         </div>
         {scanStates.length > 0 && <Button className="jobbar-scan-link" onClick={() => setScanQueueOpen(true)}>管理扫描</Button>}
         {totalThumbnailCount > 0 && <Button className="jobbar-chevron" aria-label={jobsExpanded ? "收起缩略图任务" : "展开缩略图任务"} onClick={() => setJobsExpanded((expanded) => !expanded)}>{jobsExpanded ? <ChevronDown size={15} aria-hidden="true" /> : <ChevronUp size={15} aria-hidden="true" />}</Button>}
@@ -1844,7 +1872,7 @@ export default function App() {
           const pending = scanStates.filter((item) => item.status === "Pending").sort((a, b) => a.queueOrder - b.queueOrder);
           const pendingIndex = pending.findIndex((item) => item.rootId === scan.rootId);
           return <div className="scan-queue-row" key={scan.rootId}>
-            <div className="scan-queue-main"><strong>{root?.displayName ?? scan.rootId}{scan.scope === "local" ? " · 局部更新" : scan.scope === "full" ? " · 完整发现" : ""}{scan.fullCheck ? " · 深度检查" : ""}</strong><span>{scanStatusLabels[scan.status] ?? scan.status} · {scan.filesProcessed.toLocaleString()}/{scan.filesSeen.toLocaleString()} 文件 · {Math.round(scan.progress * 100)}%{scan.error ? ` · ${scan.error}` : ""}</span><Progress value={scan.progress * 100} aria-label={`${root?.displayName ?? "目录"}扫描进度`} size="xs" mt={6} /></div>
+            <div className="scan-queue-main"><strong>{root?.displayName ?? scan.rootId}{scan.scope === "local" ? " · 局部更新" : scan.scope === "full" ? " · 全目录扫描" : ""}{scan.fullCheck ? " · 深度检查" : ""}</strong><span>{scanProgressText(scan)}{scan.error ? ` · ${scan.error}` : ""}</span>{scanUpdateText(scan) && <span className="scan-update-age">{scanUpdateText(scan)}</span>}<Progress value={scan.status === "Discovering" ? 100 : scan.progress * 100} animated={scan.status === "Discovering"} aria-label={`${root?.displayName ?? "目录"}扫描总进度`} aria-valuenow={scan.status === "Discovering" ? undefined : Math.floor(scan.progress * 100)} aria-valuetext={scanProgressText(scan)} size="xs" mt={6} /></div>
             <div className="scan-queue-actions">
               {scan.status === "Pending" && <><Button disabled={pendingIndex <= 0} aria-label={`${root?.displayName ?? "扫描"}上移`} onClick={() => void moveScan(scan.rootId, -1)}>↑</Button><Button disabled={pendingIndex >= pending.length - 1} aria-label={`${root?.displayName ?? "扫描"}下移`} onClick={() => void moveScan(scan.rootId, 1)}>↓</Button></>}
               {["Pending", "Discovering", "Indexing", "Verifying", "Relations"].includes(scan.status) && <Button onClick={() => void pauseScan(scan.rootId)}>暂停</Button>}

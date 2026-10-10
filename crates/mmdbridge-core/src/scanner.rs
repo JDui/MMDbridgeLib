@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use chrono::Utc;
@@ -143,12 +143,14 @@ pub(crate) fn scan(
     let mut touched_asset_ids = local_sources.keys().cloned().collect::<HashSet<_>>();
     let mut dependency_stat_cache = HashMap::<String, Option<(i64, i64)>>::new();
     let mut relations_dirty = false;
+    let mut last_progress = Instant::now();
     for (index, path) in files.iter().cloned().enumerate() {
-        if index % 32 == 0 || index + 1 == files_seen {
+        if index % 32 == 0 || index + 1 == files_seen || last_progress.elapsed() >= Duration::from_millis(500) {
             library.update_scan_progress(
                 &root.id, "Indexing", 0.1 + 0.72 * index as f64 / files_seen.max(1) as f64,
                 files_seen, index,
             )?;
+            last_progress = Instant::now();
         }
         let path_text = path.to_string_lossy().into_owned();
         seen_paths.insert(path_text.clone());
@@ -489,12 +491,14 @@ pub(crate) fn scan(
     };
     let verify_total = asset_ids.len();
     let renderer_revision = cards::expected_renderer_revision(library, root.asset_type)?;
+    last_progress = Instant::now();
     for (index, asset_id) in asset_ids.into_iter().enumerate() {
-        if index % 32 == 0 {
+        if index % 32 == 0 || last_progress.elapsed() >= Duration::from_millis(500) {
             library.update_scan_progress(
                 &root.id, "Verifying", 0.83 + 0.12 * index as f64 / verify_total.max(1) as f64,
                 files_seen, files_seen,
             )?;
+            last_progress = Instant::now();
         }
         if cards::verify_if_changed(library, &asset_id, &renderer_revision)?.is_none() {
             cards::verify_with_renderer_revision(library, &asset_id, &renderer_revision)?;
@@ -982,20 +986,28 @@ fn dependencies_unchanged(
     asset_id: &str,
     stat_cache: &mut HashMap<String, Option<(i64, i64)>>,
 ) -> CoreResult<bool> {
-    let connection = library.connection()?;
+    // Release the shared database lock before touching dependency files. Slow
+    // disks must not block scan-state polling or unrelated thumbnail writes.
+    let (files, primary_source, parsed_json) = {
+        let connection = library.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT path,file_size,modified_ns FROM asset_files WHERE asset_id=?1 AND role<>'primary'",
+        )?;
+        let files = statement.query_map([asset_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        let primary_source: String = connection.query_row(
+            "SELECT primary_source FROM assets WHERE id=?1",
+            [asset_id], |row| row.get(0),
+        )?;
+        let parsed_json: Option<String> = connection.query_row(
+            "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='parsed'",
+            [asset_id], |row| row.get(0),
+        ).optional()?;
+        (files, primary_source, parsed_json)
+    };
     let mut indexed_paths = HashSet::new();
-    let mut statement = connection.prepare(
-        "SELECT path,file_size,modified_ns FROM asset_files WHERE asset_id=?1 AND role<>'primary'",
-    )?;
-    let rows = statement.query_map([asset_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (path, old_size, old_modified) = row?;
+    for (path, old_size, old_modified) in files {
         indexed_paths.insert(path.clone());
         let Some((current_size, current_modified)) = cached_file_stamp(stat_cache, Path::new(&path)) else {
             return Ok(false);
@@ -1004,21 +1016,7 @@ fn dependencies_unchanged(
             return Ok(false);
         }
     }
-    drop(statement);
-    let primary_source: String = connection.query_row(
-        "SELECT primary_source FROM assets WHERE id=?1",
-        [asset_id],
-        |row| row.get(0),
-    )?;
     indexed_paths.insert(primary_source);
-
-    let parsed_json: Option<String> = connection
-        .query_row(
-            "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='parsed'",
-            [asset_id],
-            |row| row.get(0),
-        )
-        .optional()?;
     let Some(parsed_json) = parsed_json else {
         return Ok(false);
     };
@@ -1222,13 +1220,15 @@ fn discover_paths(
     let mut files = Vec::new();
     let mut unsupported = 0;
     let mut visited = 0_usize;
+    let mut last_progress = Instant::now();
     for entry in walker {
         let entry = entry.map_err(|error| {
             std::io::Error::other(format!("failed to walk {}: {error}", base_path.display()))
         })?;
         visited += 1;
-        if visited % 1024 == 0 {
+        if visited % 1024 == 0 || last_progress.elapsed() >= Duration::from_millis(500) {
             library.update_scan_progress(&root.id, "Discovering", 0.02, files.len(), 0)?;
+            last_progress = Instant::now();
         }
         if !entry.file_type().is_file() { continue; }
         let path = entry.path();

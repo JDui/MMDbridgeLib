@@ -785,6 +785,9 @@ fn jobs_retry(state: State<'_, CoreState>, job_id: String) -> Result<serde_json:
 fn main() {
     let result = tauri::Builder::default()
         .setup(|app| {
+            if let (Some(window), Some(icon)) = (app.get_webview_window("main"), app.default_window_icon()) {
+                window.set_icon(icon.clone())?;
+            }
             let started = std::time::Instant::now();
             let status = std::sync::Arc::new(std::sync::Mutex::new(StartupStatus {
                 phase: "正在打开本地资产库…".to_owned(), ready: false, error: None,
