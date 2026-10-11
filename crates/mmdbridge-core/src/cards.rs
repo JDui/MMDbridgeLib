@@ -87,6 +87,13 @@ struct AssetContext {
     current_renderer_revision: Option<String>,
 }
 
+struct ThumbnailContext {
+    asset_id: String,
+    asset_type: AssetType,
+    fingerprint: String,
+    card_path: Option<PathBuf>,
+}
+
 struct ReadCard {
     manifest: CardManifest,
     manifest_json: String,
@@ -364,7 +371,7 @@ pub(crate) fn verify_with_renderer_revision(
                         card.has_thumbnail(),
                         Some("资源卡由旧版软件生成，需要刷新".to_owned()),
                     )
-                } else if card.has_thumbnail() && !thumbnail_version_current(library, &context, &card)? {
+                } else if card.has_thumbnail() && !thumbnail_version_current(library, context.asset_type, &card)? {
                     (
                         "CardStale",
                         Some(card.manifest_json.clone()),
@@ -555,16 +562,16 @@ fn manifest_renderer_revision(manifest_json: Option<&str>, expected: &str) -> St
 
 fn thumbnail_version_current(
     library: &Library,
-    context: &AssetContext,
+    asset_type: AssetType,
     card: &ReadCard,
 ) -> CoreResult<bool> {
     let Some(report) = card.manifest.thumbnail.as_ref()
         .and_then(|thumbnail| thumbnail.render_report.as_ref()) else { return Ok(false); };
-    let expected = if context.asset_type == AssetType::Motion {
+    let expected = if asset_type == AssetType::Motion {
         library.motion_preview_model()?.and_then(|path| {
             crate::thumbnail::motion_preview_settings_version(Path::new(&path)).ok()
         })
-    } else if context.asset_type == AssetType::Scene {
+    } else if asset_type == AssetType::Scene {
         Some(crate::thumbnail::SCENE_PREVIEW_SETTINGS_VERSION.to_owned())
     } else {
         Some(crate::thumbnail::PREVIEW_SETTINGS_VERSION.to_owned())
@@ -897,9 +904,9 @@ fn metadata_modified_ns(metadata: &std::fs::Metadata) -> i64 {
 }
 
 pub(crate) fn read_thumbnail(library: &Library, asset_id: &str) -> CoreResult<Option<Vec<u8>>> {
-    let context = load_context(library, asset_id)?;
+    let context = load_thumbnail_context(library, asset_id)?;
     let Some(path) = context
-        .current_card_path
+        .card_path
         .as_deref()
         .filter(|path| path.is_file())
     else {
@@ -907,10 +914,11 @@ pub(crate) fn read_thumbnail(library: &Library, asset_id: &str) -> CoreResult<Op
     };
     let card = read_card(path)?;
     if card.manifest.asset_id != context.asset_id
+        || card.manifest.asset_type != context.asset_type
         || card.manifest.source.fingerprint != context.fingerprint
         || card.manifest.generator.name != "MMDbridgeLib"
         || card.manifest.generator.version != env!("CARGO_PKG_VERSION")
-        || !thumbnail_version_current(library, &context, &card)?
+        || !thumbnail_version_current(library, context.asset_type, &card)?
     {
         return Ok(None);
     }
@@ -979,6 +987,26 @@ pub(crate) fn request_thumbnail_refresh(library: &Library, asset_id: &str) -> Co
         params![asset_id, REFRESH_REQUESTED_REVISION])?;
     transaction.commit()?;
     Ok(())
+}
+
+fn load_thumbnail_context(library: &Library, asset_id: &str) -> CoreResult<ThumbnailContext> {
+    // Displaying a preview needs neither parsed source metadata nor annotations.
+    // Check visibility in this same query instead of loading the full card context.
+    let row: Option<(String, String, String, Option<String>, bool, String)> = library.connection()?
+        .query_row(
+            "SELECT a.id,a.asset_type,a.fingerprint,c.card_path,a.retired_format,a.visibility
+             FROM assets a LEFT JOIN cards c ON c.asset_id=a.id WHERE a.id=?1",
+            [asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).optional()?;
+    let Some((id, asset_type, fingerprint, card_path, retired, visibility)) = row else {
+        return Err(CoreError::AssetNotFound(asset_id.to_owned()));
+    };
+    if retired { return Err(CoreError::UnsupportedAssetFormat("X".to_owned())); }
+    if visibility != "normal" { return Err(CoreError::AssetNotFound(asset_id.to_owned())); }
+    let asset_type = AssetType::parse(&asset_type)
+        .ok_or_else(|| CoreError::Card(format!("未知资产类型：{asset_type}")))?;
+    Ok(ThumbnailContext { asset_id: id, asset_type, fingerprint, card_path: card_path.map(PathBuf::from) })
 }
 
 fn load_context(library: &Library, asset_id: &str) -> CoreResult<AssetContext> {
@@ -1657,6 +1685,59 @@ mod tests {
         assert!(matches!(create_for_asset(&library, &rendered, None, None),
             Err(CoreError::Card(message)) if message.contains("缩略图生成期间")));
         assert_eq!(library.inspect_asset("a").unwrap().fingerprint, rendered.fingerprint);
+    }
+
+    #[test]
+    fn thumbnail_reads_ignore_metadata_but_reject_changed_inputs() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-thumbnail-read-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let card_path = directory.join("A.MMDRCV");
+        let library = publication_library();
+        let fingerprint = format!("blake3:{}", "0".repeat(64));
+        let preview = webp::Encoder::from_rgba(&vec![190u8; 1024 * 1024 * 4], 1024, 1024).encode(50.0);
+        let now = Utc::now().to_rfc3339();
+        let mut manifest = serde_json::json!({
+            "format": CARD_FORMAT, "schema_version": CARD_SCHEMA_VERSION,
+            "asset_id": "a", "asset_type": "model", "name": "A",
+            "source": { "primary_file": "model.pmx", "relative_path": "a/model.pmx", "fingerprint": fingerprint },
+            "metadata": {}, "tags": [], "created_at": now, "updated_at": now,
+            "generator": { "name": "MMDbridgeLib", "version": env!("CARGO_PKG_VERSION") },
+            "thumbnail": { "file": "preview.webp", "width": 1024, "height": 1024, "format": "webp", "quality": 50,
+                "render_report": { "rendererVersion": crate::thumbnail::RENDERER_VERSION,
+                    "previewSettingsVersion": crate::thumbnail::PREVIEW_SETTINGS_VERSION,
+                    "adapter": "Synthetic thumbnail fixture; no GPU render", "frontAxis": "-Z",
+                    "width": 1024, "height": 1024, "format": "webp", "quality": 50,
+                    "vertexCount": 3, "triangleCount": 1, "materialCount": 1, "textureCount": 0, "diagnostics": [] }
+            }
+        });
+        let write_fixture = |manifest: &Value| {
+            write_temp_card(File::create(&card_path).unwrap(), &card_path,
+                &serde_json::to_vec(manifest).unwrap(), Some(&preview)).unwrap();
+        };
+        write_fixture(&manifest);
+        {
+            let connection = library.connection().unwrap();
+            connection.execute("UPDATE assets SET fingerprint=?1 WHERE id='a'", [&fingerprint]).unwrap();
+            connection.execute("UPDATE cards SET card_path=?1 WHERE asset_id='a'", [card_path.to_string_lossy().as_ref()]).unwrap();
+            connection.execute("UPDATE metadata SET value_json='invalid JSON' WHERE asset_id='a'", []).unwrap();
+        }
+        assert_eq!(read_thumbnail(&library, "a").unwrap().unwrap().as_slice(), &*preview);
+        library.connection().unwrap().execute("UPDATE assets SET fingerprint='changed' WHERE id='a'", []).unwrap();
+        assert!(read_thumbnail(&library, "a").unwrap().is_none());
+        library.connection().unwrap().execute("UPDATE assets SET fingerprint=?1 WHERE id='a'", [&fingerprint]).unwrap();
+        manifest["thumbnail"]["render_report"]["rendererVersion"] = Value::String("old".to_owned());
+        write_fixture(&manifest);
+        assert!(read_thumbnail(&library, "a").unwrap().is_none());
+        manifest["thumbnail"]["render_report"]["rendererVersion"] = Value::String(crate::thumbnail::RENDERER_VERSION.to_owned());
+        write_fixture(&manifest);
+        library.connection().unwrap().execute("UPDATE assets SET visibility='auxiliary' WHERE id='a'", []).unwrap();
+        assert!(matches!(read_thumbnail(&library, "a"), Err(CoreError::AssetNotFound(_))));
+        library.connection().unwrap().execute("UPDATE assets SET visibility='normal',retired_format=1 WHERE id='a'", []).unwrap();
+        assert!(matches!(read_thumbnail(&library, "a"), Err(CoreError::UnsupportedAssetFormat(_))));
+        drop(library);
+        let resolved = fs::canonicalize(&directory).unwrap();
+        assert!(resolved.starts_with(fs::canonicalize(std::env::temp_dir()).unwrap()));
+        fs::remove_dir_all(resolved).unwrap();
     }
 
     #[test]

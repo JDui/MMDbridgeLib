@@ -84,6 +84,8 @@ pub struct Asset {
     pub statuses: Vec<String>,
     pub card_status: String,
     pub has_thumbnail: bool,
+    #[serde(default)]
+    pub thumbnail_revision: String,
     pub is_favorite: bool,
     pub updated_at: String,
 }
@@ -131,6 +133,8 @@ pub struct AssetListItem {
     pub statuses: Vec<String>,
     pub card_status: String,
     pub has_thumbnail: bool,
+    #[serde(default)]
+    pub thumbnail_revision: String,
     pub is_favorite: bool,
     pub updated_at: String,
 }

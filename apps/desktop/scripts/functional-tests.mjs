@@ -10,13 +10,61 @@ const app = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const temporary = await mkdtemp(join(tmpdir(), "mmdbridge-functional-"));
 after(async () => { await rm(temporary, { recursive: true }); });
 const bundle = await build({
-  stdin: { contents: 'export * from "./src/preferences"; export * from "./src/libraryState"; export * from "./src/frameRequests"; export * from "./src/previewCamera"; export * from "./src/viewerPresets"; export * as Three from "./src/vendor/three.module.js";', resolveDir: app, loader: "ts" },
+  stdin: { contents: 'export * from "./src/preferences"; export * from "./src/libraryState"; export * from "./src/frameRequests"; export * from "./src/previewCamera"; export * from "./src/viewerPresets"; export * from "./src/thumbnailRequests"; export * as Three from "./src/vendor/three.module.js";', resolveDir: app, loader: "ts" },
   bundle: true, platform: "node", format: "esm", write: false,
 });
 const modulePath = join(temporary, "functions.mjs");
 await writeFile(modulePath, bundle.outputFiles[0].text);
 const { readPreference, writePreference, readAssetViewState, visibleSelection, activeThumbnailStatuses, createFrameRequestQueue, sphereCameraDistance,
-  createMatcapAppearance, applyScenePreset, Three } = await import(pathToFileURL(modulePath).href);
+  createMatcapAppearance, applyScenePreset, createThumbnailLoader, Three } = await import(pathToFileURL(modulePath).href);
+
+test("thumbnail reads share requests, cancel queued work and retain active subscribers", async () => {
+  const reads = [], first = deferred(), revised = deferred();
+  const loader = createThumbnailLoader((id) => {
+    reads.push(id);
+    return reads.length === 1 ? first.promise : revised.promise;
+  }, { concurrency: 1 });
+  const cancelled = new AbortController(), retained = new AbortController(), offscreen = new AbortController();
+  const discarded = loader.load("a", "v1", cancelled.signal);
+  const discardedCheck = assert.rejects(discarded, /取消/);
+  const shared = loader.load("a", "v1", retained.signal);
+  const queued = loader.load("b", "v1", offscreen.signal);
+  const queuedCheck = assert.rejects(queued, /取消/);
+  cancelled.abort(); offscreen.abort();
+  await Promise.resolve();
+  assert.deepEqual(reads, ["a"]);
+  const oldPreview = new Uint8Array([1, 2]).buffer;
+  first.resolve(oldPreview);
+  assert.equal(await shared, oldPreview);
+  await Promise.all([discardedCheck, queuedCheck]);
+  assert.equal(await loader.load("a", "v1", retained.signal), oldPreview);
+  const replacement = loader.load("a", "v2", retained.signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(reads, ["a", "a"]);
+  const newPreview = new Uint8Array([3, 4]).buffer;
+  revised.resolve(newPreview);
+  assert.equal(await replacement, newPreview);
+});
+
+test("thumbnail cache stays bounded and failed reads remain retryable", async () => {
+  const counts = new Map();
+  const loader = createThumbnailLoader(async (id) => {
+    const count = (counts.get(id) ?? 0) + 1;
+    counts.set(id, count);
+    if (id === "failed" && count === 1) throw new Error("disk unavailable");
+    return new ArrayBuffer(4);
+  }, { maxEntries: 2, maxBytes: 6 });
+  const signal = new AbortController().signal;
+  await loader.load("a", "v1", signal);
+  await loader.load("b", "v1", signal);
+  await loader.load("b", "v1", signal);
+  assert.equal(counts.get("b"), 1);
+  await loader.load("a", "v1", signal);
+  assert.equal(counts.get("a"), 2);
+  await assert.rejects(loader.load("failed", "v1", signal), /disk unavailable/);
+  await loader.load("failed", "v1", signal);
+  assert.equal(counts.get("failed"), 2);
+});
 
 test("Matcap switches preserve cutout, opacity, geometry and skinning, including late textures", () => {
   const geometry = new Three.BufferGeometry();

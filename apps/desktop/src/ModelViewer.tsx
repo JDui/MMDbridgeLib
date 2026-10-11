@@ -255,6 +255,9 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
   const [referenceReload, setReferenceReload] = useState(0);
   const [referenceStatus, setReferenceStatus] = useState("");
   const [referenceError, setReferenceError] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportStatus, setExportStatus] = useState("");
+  const [exportFailed, setExportFailed] = useState(false);
   const isScene = asset.assetType === "scene";
 
   useEffect(() => {
@@ -901,13 +904,30 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
     setVisibleTypes(new Set(WEIGHT_TYPES.map((type) => type.code)));
   }
 
-  function exportPng() {
-    const renderer = handles.current?.renderer;
-    if (!renderer) return;
-    const link = document.createElement("a");
-    link.href = renderer.domElement.toDataURL("image/png");
-    link.download = `${safeFileName(asset.name)}-3d-preview.png`;
-    link.click();
+  async function exportPng() {
+    if (exporting) return;
+    setExporting(true);
+    setExportStatus("");
+    setExportFailed(false);
+    try {
+      const current = handles.current;
+      if (!current) throw new Error("3D 画布尚未准备好。");
+      current.renderer.render(current.scene, current.camera);
+      const canvas = current.renderer.domElement as HTMLCanvasElement;
+      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(
+        (value) => value ? resolve(value) : reject(new Error("无法生成当前视角 PNG。")), "image/png",
+      ));
+      const path = await invoke<string | null>("model_preview_export_png", {
+        fileName: `${safeFileName(asset.name)}-3d-preview.png`,
+        png: Array.from(new Uint8Array(await blob.arrayBuffer())),
+      });
+      setExportStatus(path ? `PNG 已保存：${path}` : "已取消导出截图。");
+    } catch (reason) {
+      setExportFailed(true);
+      setExportStatus(`导出截图失败：${toUiError(reason)}`);
+    } finally {
+      setExporting(false);
+    }
   }
 
   function resetCamera() {
@@ -929,7 +949,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
         <div className="model-viewer-header-actions"><label className="viewer-preset-select">{isScene ? "渲染预设" : "Matcap"}<NativeSelect aria-label={isScene ? "场景渲染预设" : "角色 Matcap 预设"} value={isScene ? scenePreset : matcap} disabled={loading || !!error || (!isScene && mode !== "texture" && mode !== "materials")} onChange={(event) => {
           if (isScene) { const value = event.target.value as ScenePreset; setScenePreset(value); writePreference(SCENE_PREFERENCE, value); }
           else { const value = event.target.value as MatcapPreset; setMatcap(value); writePreference(MATCAP_PREFERENCE, value); }
-        }}>{(isScene ? SCENE_PRESETS : MATCAP_PRESETS).map((preset) => <option key={preset.value} value={preset.value}>{preset.label}</option>)}</NativeSelect></label><Button disabled={!model} title="导出当前视角 PNG" onClick={exportPng}>导出截图</Button><ActionIcon variant="subtle" size="sm" className="model-viewer-close" aria-label="关闭 3D 预览" onClick={onClose}>×</ActionIcon></div>
+        }}>{(isScene ? SCENE_PRESETS : MATCAP_PRESETS).map((preset) => <option key={preset.value} value={preset.value}>{preset.label}</option>)}</NativeSelect></label><Button loading={exporting} disabled={!model || exporting} title="导出当前视角 PNG" onClick={exportPng}>导出截图</Button><ActionIcon variant="subtle" size="sm" className="model-viewer-close" aria-label="关闭 3D 预览" onClick={onClose}>×</ActionIcon></div>
       </header><div className="model-viewer-content">
         <aside className="model-viewer-sidebar">
           <div className="model-viewer-sidebar-scroll">
@@ -998,7 +1018,7 @@ export default function ModelViewer({ asset, onClose }: { asset: ViewerAsset; on
           {error && <div className="model-viewer-message model-viewer-error">模型无法预览：{error}</div>}
           {!loading && !error && <><div className="model-viewer-hud">{model?.vertexCount.toLocaleString()} 顶点{asset.assetType === "scene" ? " · 场景网格" : " · 双击顶点查看权重数据"}</div><div className="model-viewer-controls">{asset.assetType === "scene" ? <><span>WASD 移动</span><span>Q 降 / E 升</span><span>Shift 加速 / Ctrl 慢速</span><span>左键 / 右键拖动朝向</span><span>滚轮调整 FOV</span><Button onClick={() => handles.current?.viewOrigin()}>查看原点</Button></> : <><span>左键旋转</span><span>滚轮缩放</span><span>右键平移</span></>}<Button onClick={resetCamera}>重置视角</Button></div></>}
         </main>
-      </div><footer className="model-viewer-footer">{isScene ? <div className="scene-reference-controls"><Checkbox size="xs" label="原点参照角色" checked={showReference} disabled={!!error} onChange={(event) => setShowReference(event.currentTarget.checked)} /><Checkbox size="xs" label="地面网格" checked={showSceneGrid} disabled={!!error} onChange={(event) => { const visible = event.currentTarget.checked; setShowSceneGrid(visible); writePreference("mmdbridge-scene-grid-v1", String(visible)); }} /><span role="status" className={referenceError ? "scene-reference-error" : ""} title={referenceStatus}>{showReference ? referenceStatus : "参照角色已隐藏"}</span><Button size="xs" variant="subtle" disabled={!showReference || !!error || referenceStatus === "正在加载参照角色…"} onClick={() => setReferenceReload((count) => count + 1)}>重载角色</Button></div> : "已解析模型权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}</footer></Modal.Body></Modal.Content></Modal.Root>;
+      </div><footer className="model-viewer-footer">{isScene ? <div className="scene-reference-controls"><Checkbox size="xs" label="原点参照角色" checked={showReference} disabled={!!error} onChange={(event) => setShowReference(event.currentTarget.checked)} /><Checkbox size="xs" label="地面网格" checked={showSceneGrid} disabled={!!error} onChange={(event) => { const visible = event.currentTarget.checked; setShowSceneGrid(visible); writePreference("mmdbridge-scene-grid-v1", String(visible)); }} /><span role="status" className={referenceError ? "scene-reference-error" : ""} title={referenceStatus}>{showReference ? referenceStatus : "参照角色已隐藏"}</span><Button size="xs" variant="subtle" disabled={!showReference || !!error || referenceStatus === "正在加载参照角色…"} onClick={() => setReferenceReload((count) => count + 1)}>重载角色</Button></div> : "已解析模型权重与材质贴图；当前不执行骨骼姿势或物理模拟。"}{exportStatus && <div role="status" className={`model-viewer-export-status${exportFailed ? " model-viewer-export-error" : ""}`} title={exportStatus}>{exportStatus}</div>}</footer></Modal.Body></Modal.Content></Modal.Root>;
 }
 
 function disposeModelObjects(objects: ModelObjects, handles: SceneHandles | null) {

@@ -267,6 +267,38 @@ async fn model_preview(state: State<'_, CoreState>, asset_id: String) -> Result<
 }
 
 #[tauri::command]
+async fn model_preview_export_png(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    file_name: String,
+    png: Vec<u8>,
+) -> Result<Option<String>, ApiError> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, CoreError> {
+        use tauri_plugin_dialog::DialogExt;
+        if png.len() < 24 || png.len() > 32 * 1024 * 1024
+            || !png.starts_with(b"\x89PNG\r\n\x1a\n") || &png[12..16] != b"IHDR"
+        {
+            return Err(CoreError::ModelPreview("截图 PNG 数据无效或超过 32 MiB".to_owned()));
+        }
+        let width = u32::from_be_bytes(png[16..20].try_into().expect("checked PNG header"));
+        let height = u32::from_be_bytes(png[20..24].try_into().expect("checked PNG header"));
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            return Err(CoreError::ModelPreview("截图 PNG 尺寸无效或超过 8192 像素".to_owned()));
+        }
+        let Some(selected) = app.dialog().file().set_parent(&window)
+            .set_title("导出当前视角 PNG").add_filter("PNG 图片", &["png"])
+            .set_file_name(file_name).blocking_save_file()
+        else { return Ok(None); };
+        let path = selected.into_path().map_err(|error|
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))?;
+        std::fs::write(&path, png)?;
+        Ok(Some(path.to_string_lossy().into_owned()))
+    }).await
+        .map_err(|error| ApiError::from(CoreError::Io(std::io::Error::other(error.to_string()))))?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 async fn motion_preview_frame(state: State<'_, CoreState>, asset_id: String, frame: u32) -> Result<serde_json::Value, ApiError> {
     read_core(state.0.clone(), move |library| library.motion_preview_frame(&asset_id, frame)).await
 }
@@ -872,6 +904,7 @@ fn main() {
             scan_continue,
             scan_move,
             model_preview,
+            model_preview_export_png,
             motion_preview_frame,
             model_preview_file,
             scene_preview,

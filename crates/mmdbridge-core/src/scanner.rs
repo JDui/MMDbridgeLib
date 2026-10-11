@@ -21,6 +21,132 @@ use crate::{
 };
 
 pub(crate) const MAX_LIST_ITEMS: usize = 50_000;
+type ExistingCandidate = (String, i64, i64, String, String, String);
+
+struct PreparedScanFile {
+    path: PathBuf,
+    file_size: i64,
+    modified_ns: i64,
+    existing: Option<ExistingCandidate>,
+    old_metadata: Option<Value>,
+    reusable: bool,
+    content: PreparedContent,
+}
+
+enum PreparedContent {
+    Unchanged,
+    ReadFailed(String),
+    FingerprintMatched { fingerprint: String, bytes: Vec<u8> },
+    Parsed {
+        fingerprint: String,
+        parsed: Result<ParsedCandidate, String>,
+    },
+}
+
+fn scan_parse_permit(library: &Library, root_id: &str) -> CoreResult<crate::thumbnail_concurrency::StagePermit> {
+    let check = || -> CoreResult<()> {
+        let status: Option<String> = library.connection()?.query_row(
+            "SELECT status FROM scan_state WHERE root_id=?1", [root_id], |row| row.get(0),
+        ).optional()?;
+        match status.as_deref() {
+            Some("Paused" | "Pausing") => Err(CoreError::ScanPaused),
+            Some("Cancelled" | "Cancelling") | None => Err(CoreError::ScanCancelled),
+            _ => Ok(()),
+        }
+    };
+    check()?;
+    let mut wait_error = None;
+    crate::thumbnail_concurrency::acquire(crate::thumbnail_concurrency::ThumbnailStage::Parse, || {
+        match check() {
+            Ok(()) => true,
+            Err(error) => { wait_error = Some(error); false }
+        }
+    }).map_err(|error| wait_error.unwrap_or(error))
+}
+
+fn prepare_scan_batch(
+    library: &Library,
+    root: &Root,
+    paths: &[PathBuf],
+    full_check: bool,
+    stat_cache: &mut HashMap<String, Option<(i64, i64)>>,
+) -> CoreResult<Vec<Option<PreparedScanFile>>> {
+    let mut prepared = Vec::with_capacity(paths.len());
+    for path in paths {
+        let filesystem_metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => { prepared.push(None); continue; }
+        };
+        let file_size = i64::try_from(filesystem_metadata.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("file is larger than SQLite supports: {}", path.display()))
+        })?;
+        let modified_ns = metadata_modified_ns(&filesystem_metadata);
+        let existing: Option<ExistingCandidate> = {
+            let connection = library.connection()?;
+            connection.query_row(
+                "SELECT a.id,f.file_size,f.modified_ns,a.statuses_json,a.fingerprint,
+                        COALESCE((SELECT value_json FROM metadata WHERE asset_id=a.id AND key='parsed'),'{}')
+                 FROM assets a JOIN asset_files f ON f.asset_id=a.id
+                 WHERE a.root_id=?1 AND f.path_key=?2 AND f.role='primary' AND a.retired_format=0 LIMIT 1",
+                params![root.id, scan_path_key(path)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            ).optional()?
+        };
+        let old_metadata = existing.as_ref().and_then(|value| serde_json::from_str::<Value>(&value.5).ok());
+        let reusable = if let Some((asset_id, old_size, old_modified, old_statuses, _, _)) = &existing {
+            let camera_current = !path.extension().and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("vmd"))
+                || old_metadata.as_ref().and_then(|metadata| metadata.get("camera_classification_version")
+                    .and_then(Value::as_u64)) == Some(2);
+            let parser_current = old_metadata.as_ref().and_then(|metadata| metadata.get("parser_revision")
+                .and_then(Value::as_u64)) == Some(crate::parser::revision_for_path(path) as u64);
+            *old_size == file_size && *old_modified == modified_ns && camera_current && parser_current
+                && !parse_statuses(old_statuses).iter().any(|status| status == "ParseFailed")
+                && (full_check || dependencies_unchanged(library, asset_id, stat_cache)?)
+        } else {
+            false
+        };
+        prepared.push(Some(PreparedScanFile {
+            path: path.clone(), file_size, modified_ns, existing, old_metadata, reusable,
+            content: PreparedContent::Unchanged,
+        }));
+    }
+    // Only the bounded batch owns file contents, and ordinary unchanged sources
+    // never reach a reader or parser. Database and dependency work stays serial.
+    std::thread::scope(|scope| -> CoreResult<()> {
+        let mut workers = Vec::new();
+        for file in prepared.iter_mut().flatten().filter(|file| full_check || !file.reusable) {
+            workers.push(std::thread::Builder::new()
+                .name("mmdbridge-scan-parse".to_owned())
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, move || -> CoreResult<()> {
+                    let _permit = scan_parse_permit(library, &root.id)?;
+                    file.content = match read_bytes(&file.path) {
+                        Err(message) => PreparedContent::ReadFailed(message),
+                        Ok(bytes) => {
+                            let fingerprint = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+                            if file.reusable && file.existing.as_ref().is_some_and(|old| old.4 == fingerprint) {
+                                PreparedContent::FingerprintMatched { fingerprint, bytes }
+                            } else {
+                                PreparedContent::Parsed {
+                                    fingerprint,
+                                    parsed: parse_asset(root.asset_type, &file.path, &bytes),
+                                }
+                            }
+                        }
+                    };
+                    Ok(())
+                })?);
+        }
+        for worker in workers {
+            worker.join().map_err(|_| std::io::Error::other("扫描解析工作线程发生异常"))??;
+        }
+        Ok(())
+    })?;
+    Ok(prepared)
+}
+
 const ASSET_SEARCH_PREDICATE: &str =
     "(?1 IS NULL OR NOT EXISTS(
         SELECT 1 FROM json_each(?1) search_term
@@ -144,6 +270,8 @@ pub(crate) fn scan(
     let mut dependency_stat_cache = HashMap::<String, Option<(i64, i64)>>::new();
     let mut relations_dirty = false;
     let mut last_progress = Instant::now();
+    let parse_limit = library.thumbnail_concurrency()?.resolved_parse_limit().clamp(1, 8);
+    let mut prepared_batch = Vec::new().into_iter();
     for (index, path) in files.iter().cloned().enumerate() {
         if index % 32 == 0 || index + 1 == files_seen || last_progress.elapsed() >= Duration::from_millis(500) {
             library.update_scan_progress(
@@ -152,66 +280,32 @@ pub(crate) fn scan(
             )?;
             last_progress = Instant::now();
         }
+        if index % parse_limit == 0 {
+            prepared_batch = prepare_scan_batch(
+                library, root, &files[index..(index + parse_limit).min(files_seen)],
+                work.full_check, &mut dependency_stat_cache,
+            )?.into_iter();
+        }
         let path_text = path.to_string_lossy().into_owned();
         seen_paths.insert(path_text.clone());
-        let filesystem_metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
+        let Some(PreparedScanFile { file_size, modified_ns, existing, old_metadata, content, .. }) =
+            prepared_batch.next().expect("one preparation result per source") else { continue; };
+        let content = match content {
+            PreparedContent::FingerprintMatched { fingerprint, bytes } => {
+                let asset_id = &existing.as_ref().expect("a matching fingerprint has an indexed candidate").0;
+                // Deep checks retain the original order: read and compare the
+                // source fingerprint, then check dependencies on the scan thread.
+                if dependencies_unchanged(library, asset_id, &mut dependency_stat_cache)? {
+                    PreparedContent::Unchanged
+                } else {
+                    let _permit = scan_parse_permit(library, &root.id)?;
+                    PreparedContent::Parsed { fingerprint, parsed: parse_asset(root.asset_type, &path, &bytes) }
+                }
+            }
+            content => content,
         };
-        let file_size = i64::try_from(filesystem_metadata.len()).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("file is larger than SQLite supports: {}", path.display()),
-            )
-        })?;
-        let modified_ns = filesystem_metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map_or(0_i64, |duration| {
-                i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
-            });
-        let existing: Option<(String, i64, i64, String, String, String)> = {
-            let connection = library.connection()?;
-            connection.query_row(
-                "SELECT a.id,f.file_size,f.modified_ns,a.statuses_json,a.fingerprint,
-                        COALESCE((SELECT value_json FROM metadata WHERE asset_id=a.id AND key='parsed'),'{}')
-                 FROM assets a JOIN asset_files f ON f.asset_id=a.id
-                 WHERE a.root_id=?1 AND f.path_key=?2 AND f.role='primary' AND a.retired_format=0 LIMIT 1",
-                params![root.id, scan_path_key(&path)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-            ).optional()?
-        };
-        let checked_bytes = work.full_check.then(|| read_bytes(&path));
-        let checked_fingerprint = checked_bytes.as_ref().and_then(|result| result.as_ref().ok())
-            .map(|bytes| format!("blake3:{}", blake3::hash(bytes).to_hex()));
-        if let Some((asset_id, old_size, old_modified, old_statuses, old_fingerprint, old_metadata)) = &existing {
-            let old_metadata = serde_json::from_str::<Value>(old_metadata).ok();
-            let needs_camera_reclassification = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("vmd"))
-                && old_metadata
-                    .as_ref()
-                    .and_then(|metadata| {
-                        metadata
-                            .get("camera_classification_version")
-                            .and_then(Value::as_u64)
-                    })
-                    != Some(2);
-            let needs_parser_refresh = old_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("parser_revision").and_then(Value::as_u64))
-                != Some(crate::parser::revision_for_path(&path) as u64);
-            if *old_size == file_size
-                && *old_modified == modified_ns
-                && (!work.full_check || checked_fingerprint.as_deref() == Some(old_fingerprint.as_str()))
-                && !needs_camera_reclassification
-                && !needs_parser_refresh
-                && !parse_statuses(old_statuses)
-                    .iter()
-                    .any(|status| status == "ParseFailed")
-                && dependencies_unchanged(library, asset_id, &mut dependency_stat_cache)?
-            {
+        if matches!(&content, PreparedContent::Unchanged) {
+            if let Some((asset_id, _, _, old_statuses, old_fingerprint, _)) = &existing {
                 let statuses = parse_statuses(old_statuses)
                     .into_iter()
                     .filter(|status| status != "MissingSource")
@@ -232,9 +326,9 @@ pub(crate) fn scan(
             }
         }
 
-        let bytes = match checked_bytes.unwrap_or_else(|| read_bytes(&path)) {
-            Ok(bytes) => bytes,
-            Err(message) => {
+        let (fingerprint, parsed) = match content {
+            PreparedContent::Parsed { fingerprint, parsed } => (fingerprint, parsed),
+            PreparedContent::ReadFailed(message) => {
                 report.parse_failures += 1;
                 let parsed = ParsedCandidate {
                     name: display_name(&path),
@@ -257,14 +351,15 @@ pub(crate) fn scan(
                 relations_dirty |= root.asset_type == AssetType::Motion;
                 continue;
             }
+            PreparedContent::Unchanged | PreparedContent::FingerprintMatched { .. } =>
+                unreachable!("an unchanged source has an indexed candidate"),
         };
-        let fingerprint = format!("blake3:{}", blake3::hash(&bytes).to_hex());
         let moved_id = if full_scan && existing.is_none() {
             find_moved_asset(library, root, &fingerprint, &current_paths)?
         } else {
             None
         };
-        let mut parsed = match parse_asset(root.asset_type, &path, &bytes) {
+        let mut parsed = match parsed {
             Ok(parsed) => parsed,
             Err(message) => {
                 report.parse_failures += 1;
@@ -603,7 +698,10 @@ pub(crate) fn list_assets_with_predicate(
                  WHERE r.relation_type='MotionCameraPair' AND r.source_asset=a.id
                    AND camera.retired_format=0 AND instr(camera.statuses_json,'MissingSource')=0
                    AND json_extract(CASE WHEN json_valid(camera_metadata.value_json) THEN camera_metadata.value_json ELSE '{{}}' END,'$.has_camera')=1
-                 ORDER BY r.confirmed DESC,r.confidence DESC LIMIT 1)
+                 ORDER BY r.confirmed DESC,r.confidence DESC LIMIT 1),
+                a.fingerprint || ':' || COALESCE(c.card_path,'') || ':' || COALESCE(CAST(c.modified_ns AS TEXT),'')
+                  || ':' || COALESCE(CAST(c.file_size AS TEXT),'') || ':' || COALESCE(c.renderer_revision,'')
+                  || ':' || COALESCE(c.status,'CardMissing')
          FROM assets a LEFT JOIN metadata m ON m.asset_id=a.id AND m.key='parsed' LEFT JOIN cards c ON c.asset_id=a.id
          WHERE a.retired_format=0 AND a.visibility='normal' AND {ASSET_SEARCH_PREDICATE}
            AND ({predicate})
@@ -655,7 +753,10 @@ pub(crate) fn list_asset_page_with_predicate(
                    AND camera.retired_format=0 AND instr(camera.statuses_json,'MissingSource')=0
                    AND json_extract(CASE WHEN json_valid(camera_metadata.value_json) THEN camera_metadata.value_json ELSE '{{}}' END,'$.has_camera')=1
                  ORDER BY r.confirmed DESC,r.confidence DESC LIMIT 1),
-                CASE WHEN json_valid(m.value_json) THEN json_extract(m.value_json,'$.skeleton_class') END
+                CASE WHEN json_valid(m.value_json) THEN json_extract(m.value_json,'$.skeleton_class') END,
+                a.fingerprint || ':' || COALESCE(c.card_path,'') || ':' || COALESCE(CAST(c.modified_ns AS TEXT),'')
+                  || ':' || COALESCE(CAST(c.file_size AS TEXT),'') || ':' || COALESCE(c.renderer_revision,'')
+                  || ':' || COALESCE(c.status,'CardMissing')
          FROM assets a LEFT JOIN metadata m ON m.asset_id=a.id AND m.key='parsed' LEFT JOIN cards c ON c.asset_id=a.id
          WHERE a.retired_format=0 AND a.visibility='normal' AND {ASSET_SEARCH_PREDICATE}
            AND ({predicate})
@@ -802,6 +903,7 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         updated_at: row.get(8)?,
         card_status,
         has_thumbnail,
+        thumbnail_revision: row.get(14)?,
         is_favorite: row.get(12)?,
     })
 }
@@ -834,6 +936,7 @@ fn asset_list_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetLi
         updated_at: row.get(9)?,
         card_status: row.get(10)?,
         has_thumbnail: row.get::<_, i64>(11)? != 0,
+        thumbnail_revision: row.get(15)?,
         is_favorite: row.get(12)?,
     })
 }
@@ -1302,6 +1405,50 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod status_tests {
     use super::*;
+
+    #[test]
+    fn parallel_scan_preserves_incremental_skip_and_isolates_parse_failures() {
+        let directory = std::env::temp_dir().join(format!("mmdbridge-parallel-scan-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let pose = b"Vocaloid Pose Data file\n\nfixture.osm;\n1;\n\nBone0{center\n0.0,0.0,0.0;\n0.0,0.0,0.0,1.0;\n}\n";
+        let unchanged = directory.join("a-unchanged.vpd");
+        let broken = directory.join("b-broken.vpd");
+        let changed = directory.join("c-changed.vpd");
+        for source in [&unchanged, &broken, &changed] { std::fs::write(source, pose).unwrap(); }
+        let library = Library::in_memory().unwrap();
+        let root = library.add_root(AssetType::Motion, directory.to_str().unwrap(), None).unwrap();
+        let initial = library.scan_root(&root.id).unwrap();
+        assert_eq!((initial.assets_added, initial.parse_failures), (3, 0));
+        let repeat = library.scan_root(&root.id).unwrap();
+        assert_eq!((repeat.assets_unchanged, repeat.assets_updated, repeat.parse_failures), (3, 0, 0));
+
+        // An ordinary rescan deliberately uses size/mtime, so an unchanged stamp
+        // must not feed even invalid contents to the parser. Deep checks still do.
+        let modified = std::fs::metadata(&unchanged).unwrap().modified().unwrap();
+        std::fs::write(&unchanged, vec![b'x'; pose.len()]).unwrap();
+        std::fs::File::options().write(true).open(&unchanged).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        std::fs::write(&broken, b"changed invalid VPD").unwrap();
+        std::fs::write(&changed, String::from_utf8_lossy(pose).replace("0.0,0.0,0.0;", "12.0,0.0,0.0;")).unwrap();
+        let updated = library.scan_root(&root.id).unwrap();
+        assert_eq!((updated.assets_unchanged, updated.assets_updated, updated.parse_failures), (1, 2, 1));
+        let assets = library.list_assets(Some(AssetType::Motion), None, 10).unwrap();
+        let broken_key = scan_path_key(&std::fs::canonicalize(&broken).unwrap());
+        let broken_asset = assets.iter().find(|asset|
+            scan_path_key(Path::new(&asset.primary_source)) == broken_key).unwrap();
+        assert_eq!(broken_asset.statuses, ["ParseFailed"]);
+        assert!(assets.iter().filter(|asset| asset.id != broken_asset.id)
+            .all(|asset| asset.statuses == ["Ready"]));
+        crate::scan_queue::enqueue_inline(&library, &root.id).unwrap();
+        let mut work = library.claim_pending_scan(&root.id).unwrap().unwrap();
+        work.full_check = true;
+        let checked = scan(&library, &root, &work);
+        let checked_report = checked.as_ref().unwrap();
+        assert_eq!((checked_report.assets_unchanged, checked_report.assets_updated, checked_report.parse_failures), (1, 2, 2));
+        library.finish_scan(&root.id, &work, &checked).unwrap();
+        drop(library);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     fn candidate_with_texture(name: &str, texture: &Path) -> ParsedCandidate {
         let dependency = crate::types::ParsedDependency {

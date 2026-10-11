@@ -100,15 +100,15 @@ fn reserve_thumbnail(library: &Library, asset_id: &str, priority: i32) -> CoreRe
 }
 
 fn reserve_thumbnail_on(connection: &Connection, asset_id: &str, priority: i32) -> CoreResult<(String, bool)> {
-    if let Some(id) = active_job(connection, asset_id)? { return Ok((id, false)); }
-    if crate::operations::is_asset_operation_active_on(connection, asset_id)? {
-        return Err(CoreError::ThumbnailQueue("该资产正在执行文件操作，暂时不能生成缩略图".to_owned()));
-    }
     let visible: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND retired_format=0 AND visibility='normal')",
         [asset_id], |row| row.get(0),
     )?;
     if !visible { return Err(CoreError::AssetNotFound(asset_id.to_owned())); }
+    if let Some(id) = active_job(connection, asset_id)? { return Ok((id, false)); }
+    if crate::operations::is_asset_operation_active_on(connection, asset_id)? {
+        return Err(CoreError::ThumbnailQueue("该资产正在执行文件操作，暂时不能生成缩略图".to_owned()));
+    }
     let id = Uuid::new_v4().to_string();
     connection.execute(
         "INSERT INTO jobs(id,asset_id,kind,priority,status,progress,error_json,created_at,updated_at)
@@ -142,7 +142,17 @@ pub(crate) fn enqueue_thumbnails(
     asset_ids: &[String],
     priority: i32,
 ) -> CoreResult<Vec<Value>> {
-    for asset_id in asset_ids { library.inspect_asset(asset_id)?; }
+    enqueue_thumbnail_ids(library, asset_ids, priority)?.iter()
+        .map(|id| get_job(library, id)).collect()
+}
+
+pub(crate) fn enqueue_thumbnail_ids(
+    library: &Library,
+    asset_ids: &[String],
+    priority: i32,
+) -> CoreResult<Vec<String>> {
+    // Reservation already checks visibility and active operations atomically.
+    // Do not deserialize the full asset and card manifest just to queue its ID.
     let reserved = reserve_thumbnails(library, asset_ids, priority)?;
     let tasks = reserved.iter().filter(|(_, created)| *created)
         .map(|(id, _)| new_task(library.clone(), id.clone(), i64::from(priority))).collect::<Vec<_>>();
@@ -154,7 +164,7 @@ pub(crate) fn enqueue_thumbnails(
             return Err(error);
         }
     }
-    reserved.iter().map(|(id, _)| get_job(library, id)).collect()
+    Ok(reserved.into_iter().map(|(id, _)| id).collect())
 }
 
 pub(crate) fn cancel_job(library: &Library, job_id: &str) -> CoreResult<bool> {
@@ -374,11 +384,21 @@ fn update_progress(
 ) -> CoreResult<bool> {
     let now = Utc::now().to_rfc3339();
     let connection = library.connection()?;
+    let progress = progress.clamp(0.0, 1.0);
+    let current: Option<(String, f64)> = connection.query_row(
+        "SELECT status,progress FROM jobs WHERE id=?1 AND kind='thumbnail'
+         AND status NOT IN ('Completed','Failed','Cancelled','Cancelling')",
+        [job_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((current_status, current_progress)) = current else { return Ok(false); };
+    // Stage permits poll cancellation every 100 ms. Waiting is not new
+    // progress: avoid a durable SQLite write from every waiting worker.
+    if current_status == status && current_progress == progress { return Ok(true); }
     let changed = connection.execute(
         "UPDATE jobs SET status=?1,progress=?2,updated_at=?3
          ,claim_owner=CASE WHEN ?1='Completed' THEN NULL ELSE claim_owner END
          WHERE id=?4 AND kind='thumbnail' AND status NOT IN ('Completed','Failed','Cancelled','Cancelling')",
-        params![status, progress.clamp(0.0, 1.0), now, job_id],
+        params![status, progress, now, job_id],
     )?;
     Ok(changed > 0)
 }
@@ -500,7 +520,21 @@ mod tests {
         seed(&library);
         let (id, _) = reserve_thumbnail(&library, "a", 0).unwrap();
         assert!(claim_job(&library, &id).unwrap());
+        let (writes, timestamp) = {
+            let connection = library.connection().unwrap();
+            (connection.total_changes(), connection.query_row(
+                "SELECT updated_at FROM jobs WHERE id=?1", [&id], |row| row.get::<_, String>(0),
+            ).unwrap())
+        };
+        for _ in 0..100 { assert!(update_progress(&library, &id, "Parsing", 0.02).unwrap()); }
+        {
+            let connection = library.connection().unwrap();
+            assert_eq!(connection.total_changes(), writes);
+            assert_eq!(connection.query_row("SELECT updated_at FROM jobs WHERE id=?1", [&id],
+                |row| row.get::<_, String>(0)).unwrap(), timestamp);
+        }
         assert!(cancel_job(&library, &id).unwrap());
+        assert!(!update_progress(&library, &id, "Parsing", 0.02).unwrap());
         assert_eq!(get_job(&library, &id).unwrap()["status"], "Cancelling");
         run_task(new_task(library.clone(), id.clone(), 0));
         assert_eq!(get_job(&library, &id).unwrap()["status"], "Cancelling");
@@ -545,6 +579,8 @@ mod tests {
         let reserved = reserve_thumbnails(&library, &["a".to_owned(), "a".to_owned(), "b".to_owned()], 0).unwrap();
         assert_eq!(reserved[0].0, reserved[1].0);
         assert_eq!(reserved.iter().filter(|(_, created)| *created).count(), 2);
+        library.connection().unwrap().execute("UPDATE assets SET visibility='auxiliary' WHERE id='a'", []).unwrap();
+        assert!(matches!(reserve_thumbnail(&library, "a", 0), Err(CoreError::AssetNotFound(_))));
     }
 
     #[test]

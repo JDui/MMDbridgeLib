@@ -44,6 +44,10 @@ impl ThumbnailConcurrencySettings {
         Ok(())
     }
 
+    pub(crate) fn resolved_parse_limit(&self) -> usize {
+        self.resolved()[0]
+    }
+
     fn resolved(&self) -> [usize; 3] {
         let automatic_cpu_limit = std::thread::available_parallelism()
             .map(|count| count.get().saturating_sub(1).clamp(1, 8))

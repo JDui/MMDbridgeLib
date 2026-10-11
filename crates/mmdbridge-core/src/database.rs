@@ -1161,9 +1161,9 @@ impl Library {
         }
         let result = scanner::scan(self, &root, work).and_then(|report| {
             if queue_color_previews && root.asset_type == AssetType::Model && self.auto_tag_settings()?.colors {
-                self.update_scan_progress(root_id, "Verifying", 0.98, report.files_seen, report.files_seen)?;
-                self.queue_pending_cards_with_progress(root_id, &mut || {
-                    self.update_scan_progress(root_id, "Verifying", 0.98, report.files_seen, report.files_seen)
+                self.queue_pending_cards_with_progress(root_id, true, &mut |completed, total| {
+                    let progress = 0.96 + 0.035 * completed as f64 / total.max(1) as f64;
+                    self.update_scan_progress(root_id, "Verifying", progress, report.files_seen, report.files_seen)
                 })?;
             }
             Ok(report)
@@ -1894,11 +1894,40 @@ impl Library {
     }
 
     pub fn queue_pending_cards(&self, root_id: &str) -> CoreResult<Vec<String>> {
-        self.queue_pending_cards_with_progress(root_id, &mut || Ok(()))
+        self.queue_pending_cards_with_progress(root_id, false, &mut |_, _| Ok(()))
+    }
+
+    fn pending_card_candidates(
+        &self, root: &Root, scan_verified: bool, renderer_revision: &str,
+    ) -> CoreResult<Vec<String>> {
+        let candidates = {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT a.id,a.primary_source,a.statuses_json
+                 FROM assets a LEFT JOIN cards c ON c.asset_id=a.id
+                 WHERE a.root_id=?1 AND a.asset_type=?2 AND a.retired_format=0 AND a.visibility='normal'
+                   AND (?3=0 OR c.asset_id IS NULL OR c.status<>'CardValid' OR c.has_thumbnail=0
+                        OR c.renderer_revision IS NULL OR c.renderer_revision<>?4)
+                   AND (?3=0 OR NOT EXISTS(SELECT 1 FROM jobs j WHERE j.asset_id=a.id AND j.kind='thumbnail'
+                        AND j.status IN ('Pending','Parsing','Rendering','Encoding','Cancelling')))
+                 ORDER BY a.id")?;
+            statement.query_map(params![root.id, root.asset_type.as_str(), scan_verified, renderer_revision], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?.collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(candidates.into_iter().filter_map(|(id, source, statuses)| {
+            let statuses: Vec<String> = serde_json::from_str(&statuses).unwrap_or_default();
+            if statuses.iter().any(|status| matches!(status.as_str(), "MissingSource" | "ParseFailed" | "Unsupported")) {
+                return None;
+            }
+            Path::new(&source).extension().and_then(|extension| extension.to_str())
+                .is_some_and(|extension| root.asset_type.supports_thumbnail_extension(extension)).then_some(id)
+        }).collect())
     }
 
     fn queue_pending_cards_with_progress(
-        &self, root_id: &str, progress: &mut dyn FnMut() -> CoreResult<()>,
+        &self, root_id: &str, scan_verified: bool,
+        progress: &mut dyn FnMut(usize, usize) -> CoreResult<()>,
     ) -> CoreResult<Vec<String>> {
         let root = self.list_roots()?.into_iter()
             .find(|root| root.id == root_id)
@@ -1909,36 +1938,37 @@ impl Library {
             ));
         }
         let renderer_revision = crate::cards::expected_renderer_revision(self, root.asset_type)?;
-        let mut cursor = None;
+        // The scanner already verified this scan's changed cards. Reuse the
+        // database cache here; explicit queue requests still check card files.
+        let candidates = self.pending_card_candidates(&root, scan_verified, &renderer_revision)?;
+        let total = candidates.len();
+        progress(0, total)?;
         let mut job_ids = Vec::new();
-        loop {
-            let page = self.list_asset_page(Some(root.asset_type), None, Some(root_id), false, cursor.as_ref(), 500, None, None, true)?;
-            for (index, asset) in page.items.into_iter().enumerate() {
-                if index % 16 == 0 { progress()?; }
-                if asset.statuses.iter().any(|status| matches!(status.as_str(),
-                    "MissingSource" | "ParseFailed" | "Unsupported")) { continue; }
-                let extension = Path::new(&asset.primary_source).extension().and_then(|value| value.to_str());
-                if !extension.is_some_and(|value| asset.asset_type.supports_thumbnail_extension(value)) { continue; }
+        for (batch_index, batch) in candidates.chunks(128).enumerate() {
+            let mut pending = Vec::new();
+            for (index, asset_id) in batch.iter().enumerate() {
+                if scan_verified {
+                    pending.push(asset_id.clone());
+                    continue;
+                }
+                if index % 16 == 0 { progress(batch_index * 128 + index, total)?; }
                 let validation = match crate::cards::verify_if_changed(
                     self,
-                    &asset.id,
+                    asset_id,
                     &renderer_revision,
                 )? {
                     Some(validation) => validation,
                     None => crate::cards::verify_with_renderer_revision(
                         self,
-                        &asset.id,
+                        asset_id,
                         &renderer_revision,
                     )?,
                 };
                 if validation.status == "CardValid" && validation.has_thumbnail { continue; }
-                let job = self.enqueue_thumbnail(&asset.id, 0)?;
-                if let Some(id) = job.get("id").and_then(serde_json::Value::as_str) {
-                    job_ids.push(id.to_owned());
-                }
+                pending.push(asset_id.clone());
             }
-            cursor = page.next_cursor;
-            if cursor.is_none() { break; }
+            job_ids.extend(crate::jobs::enqueue_thumbnail_ids(self, &pending, 0)?);
+            progress(((batch_index + 1) * 128).min(total), total)?;
         }
         Ok(job_ids)
     }
@@ -2582,6 +2612,14 @@ mod storage_tests {
         let expression = FilterExpr::And { children: vec![rule(crate::FilterField::Tag, "blue"), rule(crate::FilterField::SkeletonClass, "nonstandard")] };
         let first = library.list_asset_page_with_filters(Some(AssetType::Model), None, Some("r"), false, None, 1, None, None, true, None, Some(expression.clone())).unwrap();
         assert_eq!(first.items[0].id, "a");
+        let thumbnail_revision = first.items[0].thumbnail_revision.clone();
+        assert_eq!(library.inspect_asset("a").unwrap().thumbnail_revision, thumbnail_revision);
+        library.connection().unwrap().execute(
+            "UPDATE cards SET file_size=123,modified_ns=456 WHERE asset_id='a'", [],
+        ).unwrap();
+        let changed = library.list_asset_page(Some(AssetType::Model), None, Some("r"), false, None, 1, None, None, true).unwrap();
+        assert_ne!(changed.items[0].thumbnail_revision, thumbnail_revision);
+        assert_eq!(library.inspect_asset("a").unwrap().thumbnail_revision, changed.items[0].thumbnail_revision);
         assert_eq!(first.items[0].metadata["skeleton_class"], "nonstandard");
         let second = library.list_asset_page_with_filters(Some(AssetType::Model), None, Some("r"), false, first.next_cursor.as_ref(), 1, None, None, true, None, Some(expression.clone())).unwrap();
         assert_eq!(second.items[0].id, "c");
@@ -2602,6 +2640,50 @@ mod storage_tests {
         assert_eq!(library.mark_outdated_thumbnails().unwrap(), 0);
         assert_eq!(library.inspect_asset("a").unwrap().card_status, "CardStale");
         assert_eq!(library.inspect_asset("b").unwrap().card_status, "CardValid");
+    }
+
+    #[test]
+    fn verified_scan_queues_only_incomplete_cards_without_loading_manifests() {
+        let library = Library::in_memory().unwrap();
+        let revision = crate::cards::expected_renderer_revision(&library, AssetType::Model).unwrap();
+        {
+            let connection = library.connection().unwrap();
+            connection.execute_batch(
+                "INSERT INTO roots(id,asset_type,path,path_key,display_name,created_at)
+                 VALUES ('r','model','C:/models','c:/models','Models','now');"
+            ).unwrap();
+            for (id, status, thumbnail, source_status, visibility, retired, extension, renderer) in [
+                ("fresh", "CardValid", true, "[]", "normal", false, "pmx", revision.as_str()),
+                ("stale", "CardStale", true, "[]", "normal", false, "pmx", revision.as_str()),
+                ("missing", "CardMissing", false, "[]", "normal", false, "pmx", revision.as_str()),
+                ("empty", "CardValid", false, "[]", "normal", false, "pmx", revision.as_str()),
+                ("old", "CardValid", true, "[]", "normal", false, "pmx", "old"),
+                ("active", "CardMissing", false, "[]", "normal", false, "pmx", revision.as_str()),
+                ("failed", "CardMissing", false, "[\"ParseFailed\"]", "normal", false, "pmx", revision.as_str()),
+                ("hidden", "CardMissing", false, "[]", "auxiliary", false, "pmx", revision.as_str()),
+                ("retired", "CardMissing", false, "[]", "normal", true, "pmx", revision.as_str()),
+                ("unsupported", "CardMissing", false, "[]", "normal", false, "txt", revision.as_str()),
+            ] {
+                connection.execute(
+                    "INSERT INTO assets(id,root_id,asset_type,name,primary_source,asset_directory,statuses_json,
+                        visibility,retired_format,created_at,updated_at,last_seen_at)
+                     VALUES (?1,'r','model',?1,?2,'C:/models',?3,?4,?5,'now','now','now')",
+                    params![id, format!("C:/models/{id}.{extension}"), source_status, visibility, retired],
+                ).unwrap();
+                // The queue must not deserialize metadata or card manifests.
+                connection.execute(
+                    "INSERT INTO cards(asset_id,card_path,status,has_thumbnail,renderer_revision,manifest_json,last_checked_at)
+                     VALUES (?1,'unused',?2,?3,?4,'invalid manifest','now')", params![id, status, thumbnail, renderer],
+                ).unwrap();
+            }
+            connection.execute("INSERT INTO jobs(id,asset_id,kind,status,created_at,updated_at)
+                VALUES ('job','active','thumbnail','Pending','now','now')", []).unwrap();
+        }
+        let root = library.list_roots().unwrap().remove(0);
+        assert_eq!(library.pending_card_candidates(&root, true, &revision).unwrap(),
+            ["empty", "missing", "old", "stale"]);
+        assert_eq!(library.pending_card_candidates(&root, false, &revision).unwrap(),
+            ["active", "empty", "fresh", "missing", "old", "stale"]);
     }
 
     #[test]

@@ -12,43 +12,15 @@ import { LibraryContextMenu } from "./LibraryContextMenu";
 import { useLibraryDialog } from "./LibraryDialog";
 import { readPreference, writePreference } from "./preferences";
 import { activeThumbnailStatuses, readAssetViewState, visibleSelection, type AssetViewState } from "./libraryState";
+import { createThumbnailLoader } from "./thumbnailRequests";
 import "./virtualized-grid.css";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
 const MotionViewer = lazy(() => import("./MotionViewer"));
 
-const thumbnailReadQueue: Array<() => void> = [];
-let activeThumbnailReads = 0;
+const thumbnailLoader = createThumbnailLoader((assetId) => invoke<ArrayBuffer>("card_thumbnail", { assetId }));
 
-function loadCardThumbnail(assetId: string, signal: AbortSignal): Promise<ArrayBuffer> {
-  return new Promise((resolve, reject) => {
-    let started = false;
-    const cancel = () => {
-      if (started) return;
-      const index = thumbnailReadQueue.indexOf(start);
-      if (index >= 0) thumbnailReadQueue.splice(index, 1);
-      reject(new Error("缩略图请求已取消"));
-    };
-    const start = () => {
-      if (signal.aborted) { cancel(); return; }
-      started = true;
-      activeThumbnailReads++;
-      const finish = () => {
-        activeThumbnailReads--;
-        signal.removeEventListener("abort", cancel);
-        thumbnailReadQueue.shift()?.();
-      };
-      invoke<ArrayBuffer>("card_thumbnail", { assetId })
-        .then((buffer) => { resolve(buffer); finish(); }, (reason) => { reject(reason); finish(); });
-    };
-    signal.addEventListener("abort", cancel, { once: true });
-    if (signal.aborted) { cancel(); return; }
-    if (activeThumbnailReads < 4) start();
-    else thumbnailReadQueue.push(start);
-  });
-}
-
-function CardThumbnail({ assetId, alt, revision = 0 }: { assetId: string; alt: string; revision?: number }) {
+function CardThumbnail({ assetId, alt, revision = 0, cacheRevision = "" }: { assetId: string; alt: string; revision?: number; cacheRevision?: string }) {
   const [source, setSource] = useState("");
   const [failed, setFailed] = useState(false);
 
@@ -58,7 +30,7 @@ function CardThumbnail({ assetId, alt, revision = 0 }: { assetId: string; alt: s
     let active = true;
     let objectUrl = "";
     const controller = new AbortController();
-    void loadCardThumbnail(assetId, controller.signal)
+    void thumbnailLoader.load(assetId, `${cacheRevision}:${revision}`, controller.signal)
       .then((buffer) => {
         if (!active) return;
         if (!buffer?.byteLength) { setFailed(true); return; }
@@ -71,10 +43,10 @@ function CardThumbnail({ assetId, alt, revision = 0 }: { assetId: string; alt: s
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [assetId, revision]);
+  }, [assetId, revision, cacheRevision]);
 
   return <div className="card-thumbnail-slot">
-    {source ? <img className="card-thumbnail-image" src={source} alt={alt} onError={() => { setSource(""); setFailed(true); }} /> : <span className="thumbnail-load-error" data-tone={failed ? "error" : "info"}>{failed ? "缩略图读取失败" : "正在加载缩略图…"}</span>}
+    {source ? <img className="card-thumbnail-image" src={source} alt={alt} decoding="async" onError={() => { setSource(""); setFailed(true); }} /> : <span className="thumbnail-load-error" data-tone={failed ? "error" : "info"}>{failed ? "缩略图读取失败" : "正在加载缩略图…"}</span>}
   </div>;
 }
 
@@ -100,6 +72,7 @@ type Asset = {
   statuses: string[];
   cardStatus: string;
   hasThumbnail: boolean;
+  thumbnailRevision?: string;
   isFavorite: boolean;
   updatedAt: string;
 };
@@ -266,7 +239,8 @@ const scanStatusLabels: Record<string, string> = {
   Cancelling: "正在停止", Completed: "已完成", Failed: "失败", Cancelled: "已停止",
 };
 function scanProgressText(scan: ScanState): string {
-  const phase = scanStatusLabels[scan.status] ?? scan.status;
+  const phase = scan.status === "Verifying" && scan.progress >= 0.96
+    ? "安排缩略图任务" : scanStatusLabels[scan.status] ?? scan.status;
   if (scan.status === "Pending") return "排队中 · 等待前面的扫描完成";
   if (scan.status === "Discovering") return `${phase} · 已发现 ${scan.filesSeen.toLocaleString()} 个资产文件 · 总数待确认`;
   const files = `${scan.filesProcessed.toLocaleString()}/${scan.filesSeen.toLocaleString()} 文件`;
@@ -1798,7 +1772,7 @@ export default function App() {
                 else if (event.key === "Enter" && !bulkSelectMode) { event.preventDefault(); openAsset3D(asset); }
               }}>
               <div className={`asset-art ${asset.assetType} ${asset.hasThumbnail ? "has-thumbnail" : ""}`}>
-                {asset.hasThumbnail && <CardThumbnail revision={thumbnailRevisions[asset.id]} assetId={asset.id} alt={`${asset.name} 缩略图`} />}
+                {asset.hasThumbnail && <CardThumbnail revision={thumbnailRevisions[asset.id]} cacheRevision={asset.thumbnailRevision ?? asset.updatedAt} assetId={asset.id} alt={`${asset.name} 缩略图`} />}
                 {!asset.hasThumbnail && <div className="asset-placeholder"><AssetKindIcon type={asset.assetType} size={36} /><span>尚未生成预览</span></div>}<span className="art-format">{String(asset.metadata.file_type ?? asset.assetType).toUpperCase()}</span>
                 <div className="asset-markers">{asset.isFavorite && <span className="favorite-marker" role="img" aria-label="已收藏" title="已收藏"><Star size={14} fill="currentColor" aria-hidden="true" /></span>}{typeof asset.metadata.paired_camera_path === "string" && <span className="paired-camera-marker" title={`配套镜头：${asset.metadata.paired_camera_path}`}><Camera size={12} aria-hidden="true" /> 镜头</span>}{asset.assetType === "model" && asset.metadata.skeleton_class === "nonstandard" && <span className="skeleton-badge">非标准</span>}{status && <span className="asset-status-marker" data-tone={status.tone} title={status.text}>{status.text}</span>}</div>
               </div>
@@ -1842,7 +1816,7 @@ export default function App() {
       <AppShell.Aside className={`inspector ${selected ? "has-selection" : ""}`} aria-hidden={!inspectorOpen || agentLinkOpen}>
         <div className="inspector-top"><div><div className="eyebrow">当前选择</div><h2>资产详情</h2></div><ActionIcon variant="subtle" size="sm" className="icon-button" aria-label="关闭资产详情" onClick={() => setInspectorOpen(false)}><X size={17} aria-hidden="true" /></ActionIcon></div>
         {selected ? <>
-          <UnstyledButton className={`inspector-preview ${selected.assetType} ${selected.hasThumbnail ? "has-thumbnail" : ""}`} title="查看缩略图" onClick={() => setPreviewAsset(selected)}>{selected.hasThumbnail && <CardThumbnail revision={thumbnailRevisions[selected.id]} assetId={selected.id} alt={`${selected.name} 缩略图`} />}{!selected.hasThumbnail && <div className="asset-placeholder"><AssetKindIcon type={selected.assetType} size={38} /><span>尚未生成预览</span></div>}<span className="preview-badge">{selected.metadata.is_pose ? "姿势" : categoryLabels[selected.assetType]}</span></UnstyledButton>
+          <UnstyledButton className={`inspector-preview ${selected.assetType} ${selected.hasThumbnail ? "has-thumbnail" : ""}`} title="查看缩略图" onClick={() => setPreviewAsset(selected)}>{selected.hasThumbnail && <CardThumbnail revision={thumbnailRevisions[selected.id]} cacheRevision={selected.thumbnailRevision ?? selected.updatedAt} assetId={selected.id} alt={`${selected.name} 缩略图`} />}{!selected.hasThumbnail && <div className="asset-placeholder"><AssetKindIcon type={selected.assetType} size={38} /><span>尚未生成预览</span></div>}<span className="preview-badge">{selected.metadata.is_pose ? "姿势" : categoryLabels[selected.assetType]}</span></UnstyledButton>
           <div className="inspector-title"><div><div className="inspector-type">{categoryLabels[selected.assetType]}</div><h3>{selected.name}</h3></div><Button color={selected.isFavorite ? "yellow" : "gray"} aria-label={selected.isFavorite ? "取消收藏" : "添加收藏"} aria-pressed={selected.isFavorite} title={selected.isFavorite ? "取消收藏" : "添加收藏"} onClick={() => void toggleFavorite(selected)}><Star size={18} fill={selected.isFavorite ? "currentColor" : "none"} aria-hidden="true" /></Button></div>
           <div className="inspector-section"><div className="section-title">基本信息</div><div className="detail-list">
             {Object.entries(selected.metadata).filter(([key, value]) => metadataLabels[key] && (typeof value === "number" || typeof value === "boolean" || typeof value === "string")).slice(0, 10).map(([key, value]) => <div className="detail-row" key={key}><span>{metadataLabels[key]}</span><strong>{formatValue(value)}</strong></div>)}
@@ -1883,7 +1857,7 @@ export default function App() {
             </div>
           </div>;
         }) : <div className="jobs-panel-empty">队列为空。点击目录旁的扫描按钮加入任务。</div>}</div></Modal>}
-      {previewAsset && <Modal opened onClose={() => { setPreviewAsset(null); }} title={<div><strong id="thumbnail-preview-title">{previewAsset.name}</strong></div>} size={760} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal thumbnail-preview-modal" }}><div className="thumbnail-preview-frame">{previewAsset.hasThumbnail ? <CardThumbnail revision={thumbnailRevisions[previewAsset.id]} assetId={previewAsset.id} alt={`${previewAsset.name} 缩略图`} /> : <div className="thumbnail-preview-empty">该资产尚未生成缩略图</div>}</div>{!previewAsset.hasThumbnail && <div className="settings-modal-actions"><Button onClick={() => { void createCard(previewAsset.id); setPreviewAsset(null); }}>生成资源卡和缩略图</Button></div>}</Modal>}
+      {previewAsset && <Modal opened onClose={() => { setPreviewAsset(null); }} title={<div><strong id="thumbnail-preview-title">{previewAsset.name}</strong></div>} size={760} zIndex={200} closeOnClickOutside={true} closeOnEscape={true} closeButtonProps={{ "aria-label": "关闭窗口" }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal thumbnail-preview-modal" }}><div className="thumbnail-preview-frame">{previewAsset.hasThumbnail ? <CardThumbnail revision={thumbnailRevisions[previewAsset.id]} cacheRevision={previewAsset.thumbnailRevision ?? previewAsset.updatedAt} assetId={previewAsset.id} alt={`${previewAsset.name} 缩略图`} /> : <div className="thumbnail-preview-empty">该资产尚未生成缩略图</div>}</div>{!previewAsset.hasThumbnail && <div className="settings-modal-actions"><Button onClick={() => { void createCard(previewAsset.id); setPreviewAsset(null); }}>生成资源卡和缩略图</Button></div>}</Modal>}
       {viewerAsset && <Suspense fallback={<div role="status" style={{ position: "fixed", inset: 0, zIndex: 50, display: "grid", placeItems: "center", background: "#050a0de8", color: "#bbcbc9", fontSize: 12 }}>正在载入 3D Viewer…</div>}><ModelViewer asset={viewerAsset} onClose={() => setViewerAsset(null)} /></Suspense>}
       {motionViewerAsset && <Suspense fallback={<div role="status" style={{ position: "fixed", inset: 0, zIndex: 50, display: "grid", placeItems: "center", background: "#050a0de8", color: "#bbcbc9", fontSize: 12 }}>正在载入 VMD 3D Viewer…</div>}><MotionViewer asset={motionViewerAsset} onClose={() => setMotionViewerAsset(null)} /></Suspense>}
       {assetOperationPlan && <Modal opened onClose={() => { if (!busy) setAssetOperationPlan(null); }} title={<div><strong id="operation-plan-title">确认资产操作</strong></div>} size={720} zIndex={200} closeOnClickOutside={!busy} closeOnEscape={!busy} closeButtonProps={{ "aria-label": "关闭窗口", disabled: busy }} classNames={{ content: "library-modal", title: "library-modal-title", body: "operation-modal" }}>{assetOperationError && <Alert color="red" role="alert" mb="sm">{assetOperationError}</Alert>}<p className="operation-summary">{assetOperationPlan.operation === "move" ? "移动" : assetOperationPlan.operation === "rename" ? "重命名" : assetOperationPlan.operation === "delete_model" ? (assetOperationPlan.deleteMode === "folder" ? "回收整个模型文件夹" : "只回收所选 PMX 文件") : "发送到 Windows 回收站"}将处理 {assetOperationPlan.sourcePaths.length} 个路径、{assetOperationPlan.affectedAssets.length} 项索引资产。</p>{assetOperationPlan.operation === "delete_model" && <>

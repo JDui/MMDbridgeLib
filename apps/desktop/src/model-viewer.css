@@ -5,6 +5,7 @@
   width: min(1120px, calc(100vw - 40px));
   height: min(760px, calc(100dvh - 40px));
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
   border: 1px solid var(--line-3);
@@ -18,6 +19,7 @@
 
 .model-viewer-header {
   display: flex;
+  min-width: 0;
   align-items: center;
   justify-content: space-between;
   gap: 18px;
@@ -28,6 +30,7 @@
 
 .model-viewer-header > div:first-child {
   display: flex;
+  flex: 1;
   flex-direction: column;
   gap: 4px;
   min-width: 0;
@@ -50,7 +53,7 @@
 }
 
 .model-viewer-header small {
-  max-width: min(75vw, 880px);
+  max-width: 100%;
   overflow: hidden;
   color: var(--text-4);
   text-overflow: ellipsis;
@@ -142,6 +145,12 @@
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 4px;
   margin: 4px 0 7px;
+}
+
+.mv-weight-shortcuts .mantine-Button-root {
+  min-width: 0;
+  padding-inline: 5px;
+  font-size: 11px;
 }
 
 .mv-weight-legend {
@@ -403,6 +412,9 @@
   right: 12px;
   bottom: 11px;
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: calc(100% - 24px);
   align-items: center;
   gap: 4px;
   padding: 5px 6px;
@@ -426,6 +438,14 @@
   font-size: 10px;
   line-height: 1.55;
 }
+
+.model-viewer-export-status {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-viewer-export-error { color: var(--library-error); }
 
 @media (max-width: 800px) {
   .model-viewer-header { flex-wrap: wrap; gap: 10px; }
