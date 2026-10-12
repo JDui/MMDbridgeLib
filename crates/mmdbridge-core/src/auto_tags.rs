@@ -152,7 +152,7 @@ pub(crate) fn reconcile(
 }
 
 pub(crate) fn backfill(library: &Library, asset_id: &str, asset_type: AssetType, metadata: &Value, fingerprint: &str) -> CoreResult<bool> {
-    if !library.auto_tag_settings()?.technical || metadata["is_camera_only"] == true { return Ok(false); }
+    if metadata["is_camera_only"] == true { return Ok(false); }
     let candidates = technical_tags(asset_type, metadata);
     let cached: Option<String> = library.connection()?.query_row(
         "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='auto_tags_technical'", [asset_id], |row| row.get(0),

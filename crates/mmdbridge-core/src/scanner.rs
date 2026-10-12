@@ -71,28 +71,58 @@ fn prepare_scan_batch(
     full_check: bool,
     stat_cache: &mut HashMap<String, Option<(i64, i64)>>,
 ) -> CoreResult<Vec<Option<PreparedScanFile>>> {
-    let mut prepared = Vec::with_capacity(paths.len());
+    let mut file_stamps = Vec::with_capacity(paths.len());
+    let mut path_keys = Vec::with_capacity(paths.len());
     for path in paths {
         let filesystem_metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
-            Err(_) => { prepared.push(None); continue; }
+            Err(_) => { file_stamps.push(None); continue; }
         };
         let file_size = i64::try_from(filesystem_metadata.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData,
                 format!("file is larger than SQLite supports: {}", path.display()))
         })?;
         let modified_ns = metadata_modified_ns(&filesystem_metadata);
-        let existing: Option<ExistingCandidate> = {
-            let connection = library.connection()?;
-            connection.query_row(
-                "SELECT a.id,f.file_size,f.modified_ns,a.statuses_json,a.fingerprint,
-                        COALESCE((SELECT value_json FROM metadata WHERE asset_id=a.id AND key='parsed'),'{}')
-                 FROM assets a JOIN asset_files f ON f.asset_id=a.id
-                 WHERE a.root_id=?1 AND f.path_key=?2 AND f.role='primary' AND a.retired_format=0 LIMIT 1",
-                params![root.id, scan_path_key(path)],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-            ).optional()?
+        let path_key = scan_path_key(path);
+        path_keys.push(path_key.clone());
+        file_stamps.push(Some((path_key, file_size, modified_ns)));
+    }
+
+    // Fetch the indexed state for the whole bounded batch in one SQLite query.
+    // The old per-path lookup made large scans pay one database round-trip for
+    // every source before any parsing could begin.
+    let mut existing_by_path = HashMap::<String, ExistingCandidate>::new();
+    if !path_keys.is_empty() {
+        let placeholders = (2..=path_keys.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT f.path_key,a.id,f.file_size,f.modified_ns,a.statuses_json,a.fingerprint,
+                    COALESCE((SELECT value_json FROM metadata WHERE asset_id=a.id AND key='parsed'),'{{}}')
+             FROM assets a JOIN asset_files f ON f.asset_id=a.id
+             WHERE a.root_id=?1 AND f.path_key IN ({placeholders})
+               AND f.role='primary' AND a.retired_format=0"
+        );
+        let mut values = Vec::with_capacity(path_keys.len() + 1);
+        values.push(SqlValue::Text(root.id.clone()));
+        values.extend(path_keys.iter().cloned().map(SqlValue::Text));
+        let connection = library.connection()?;
+        let mut statement = connection.prepare(&sql)?;
+        existing_by_path = statement.query_map(params_from_iter(values.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, (
+                row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
+            )))
+        })?.collect::<Result<HashMap<_, _>, _>>()?;
+    }
+
+    let mut prepared = Vec::with_capacity(paths.len());
+    for (path, file_stamp) in paths.iter().zip(file_stamps) {
+        let Some((path_key, file_size, modified_ns)) = file_stamp else {
+            prepared.push(None);
+            continue;
         };
+        let existing = existing_by_path.remove(&path_key);
         let old_metadata = existing.as_ref().and_then(|value| serde_json::from_str::<Value>(&value.5).ok());
         let reusable = if let Some((asset_id, old_size, old_modified, old_statuses, _, _)) = &existing {
             let camera_current = !path.extension().and_then(|extension| extension.to_str())
@@ -254,6 +284,7 @@ pub(crate) fn scan(
     let files_seen = files.len();
     library.update_scan_progress(&root.id, "Indexing", 0.1, files_seen, 0)?;
     let now = Utc::now().to_rfc3339();
+    let auto_tag_settings = library.auto_tag_settings()?;
     let mut report = ScanReport {
         root_id: root.id.clone(),
         files_seen: files.len(),
@@ -319,8 +350,10 @@ pub(crate) fn scan(
                     relations_dirty |= root.asset_type == AssetType::Motion;
                 }
                 report.assets_unchanged += 1;
-                if let Some(metadata) = old_metadata.as_ref() {
-                    crate::auto_tags::backfill(library, asset_id, root.asset_type, metadata, old_fingerprint)?;
+                if auto_tag_settings.technical {
+                    if let Some(metadata) = old_metadata.as_ref() {
+                        crate::auto_tags::backfill(library, asset_id, root.asset_type, metadata, old_fingerprint)?;
+                    }
                 }
                 continue;
             }
@@ -336,7 +369,7 @@ pub(crate) fn scan(
                     status: "ParseFailed".to_owned(),
                     dependencies: Vec::new(),
                 };
-                store_candidate(
+                store_candidate_with_settings(
                     library,
                     root,
                     &path,
@@ -347,6 +380,7 @@ pub(crate) fn scan(
                     existing.as_ref().map(|v| v.0.as_str()),
                     None,
                     &now,
+                    &auto_tag_settings,
                 )?;
                 relations_dirty |= root.asset_type == AssetType::Motion;
                 continue;
@@ -442,7 +476,7 @@ pub(crate) fn scan(
         let restore_card_path = card_path_hint
             .as_deref()
             .filter(|_| recovered_id.as_deref() == selected_id);
-        if !store_candidate(
+        if !store_candidate_with_settings(
             library,
             root,
             &path,
@@ -453,6 +487,7 @@ pub(crate) fn scan(
             selected_id,
             restore_card_path,
             &now,
+            &auto_tag_settings,
         )? {
             report.parse_failures += 1;
             continue;
@@ -941,6 +976,7 @@ fn asset_list_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetLi
     })
 }
 
+#[cfg(test)]
 fn store_candidate(
     library: &Library,
     root: &Root,
@@ -952,6 +988,26 @@ fn store_candidate(
     existing_id: Option<&str>,
     card_path_hint: Option<&Path>,
     now: &str,
+) -> CoreResult<bool> {
+    let auto_tag_settings = library.auto_tag_settings()?;
+    store_candidate_with_settings(
+        library, root, path, file_size, modified_ns, fingerprint, parsed,
+        existing_id, card_path_hint, now, &auto_tag_settings,
+    )
+}
+
+fn store_candidate_with_settings(
+    library: &Library,
+    root: &Root,
+    path: &Path,
+    file_size: i64,
+    modified_ns: i64,
+    fingerprint: String,
+    parsed: ParsedCandidate,
+    existing_id: Option<&str>,
+    card_path_hint: Option<&Path>,
+    now: &str,
+    auto_tag_settings: &crate::AutoTagSettings,
 ) -> CoreResult<bool> {
     let path_text = path.to_string_lossy().into_owned();
     let path_key = scan_path_key(path);
@@ -1066,15 +1122,12 @@ fn store_candidate(
     }
     transaction.execute("INSERT INTO metadata(asset_id,key,value_json) VALUES (?1,'parsed',?2) ON CONFLICT(asset_id,key) DO UPDATE SET value_json=excluded.value_json", params![stored_id, parsed_metadata])?;
     transaction.execute("INSERT INTO cards(asset_id,card_path,status,last_checked_at) VALUES (?1,?2,'CardMissing',?3) ON CONFLICT(asset_id) DO UPDATE SET card_path=excluded.card_path,status=CASE WHEN cards.status='CardValid' THEN 'CardStale' ELSE cards.status END,last_checked_at=excluded.last_checked_at", params![stored_id, card_path, now])?;
-    let settings: crate::AutoTagSettings = transaction.query_row(
-        "SELECT value_json FROM settings WHERE key='auto_tags'", [], |row| row.get::<_, String>(0),
-    ).optional()?.map(|json| serde_json::from_str(&json)).transpose()?.unwrap_or_default();
     if visibility == "normal" {
-        if settings.technical {
+        if auto_tag_settings.technical {
             crate::auto_tags::reconcile(&transaction, &stored_id, "technical", &fingerprint,
                 &crate::auto_tags::technical_tags(root.asset_type, &parsed.metadata), 1.0)?;
         }
-        if settings.colors {
+        if auto_tag_settings.colors {
             // Any successful reparse can reflect changed texture dependencies as well
             // as changed geometry. Old automatic colours must wait for a fresh preview.
             crate::auto_tags::reconcile(&transaction, &stored_id, "palette", &fingerprint, &[], 0.78)?;
@@ -1089,24 +1142,32 @@ fn dependencies_unchanged(
     asset_id: &str,
     stat_cache: &mut HashMap<String, Option<(i64, i64)>>,
 ) -> CoreResult<bool> {
-    // Release the shared database lock before touching dependency files. Slow
-    // disks must not block scan-state polling or unrelated thumbnail writes.
+    // Read an asset's source, parsed dependencies and file stamps in one query,
+    // then release SQLite before touching dependency files. Slow disks must not
+    // block scan-state polling or unrelated thumbnail writes.
     let (files, primary_source, parsed_json) = {
         let connection = library.connection()?;
         let mut statement = connection.prepare(
-            "SELECT path,file_size,modified_ns FROM asset_files WHERE asset_id=?1 AND role<>'primary'",
+            "SELECT a.primary_source,m.value_json,f.path,f.file_size,f.modified_ns
+             FROM assets a
+             LEFT JOIN metadata m ON m.asset_id=a.id AND m.key='parsed'
+             LEFT JOIN asset_files f ON f.asset_id=a.id AND f.role<>'primary'
+             WHERE a.id=?1",
         )?;
-        let files = statement.query_map([asset_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-        })?.collect::<Result<Vec<_>, _>>()?;
-        let primary_source: String = connection.query_row(
-            "SELECT primary_source FROM assets WHERE id=?1",
-            [asset_id], |row| row.get(0),
-        )?;
-        let parsed_json: Option<String> = connection.query_row(
-            "SELECT value_json FROM metadata WHERE asset_id=?1 AND key='parsed'",
-            [asset_id], |row| row.get(0),
-        ).optional()?;
+        let mut rows = statement.query([asset_id])?;
+        let mut files = Vec::new();
+        let mut primary_source = None;
+        let mut parsed_json = None;
+        while let Some(row) = rows.next()? {
+            if primary_source.is_none() {
+                primary_source = Some(row.get::<_, String>(0)?);
+                parsed_json = row.get::<_, Option<String>>(1)?;
+            }
+            if let Some(path) = row.get::<_, Option<String>>(2)? {
+                files.push((path, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?));
+            }
+        }
+        let Some(primary_source) = primary_source else { return Ok(false); };
         (files, primary_source, parsed_json)
     };
     let mut indexed_paths = HashSet::new();
@@ -1136,10 +1197,7 @@ fn dependencies_unchanged(
             return Ok(false);
         }
         if status == Some("missing")
-            && path.is_some_and(|path| {
-                std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
-            })
-        {
+            && path.is_some_and(|path| cached_file_stamp(stat_cache, Path::new(path)).is_some()) {
             return Ok(false);
         }
     }

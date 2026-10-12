@@ -1138,7 +1138,7 @@ impl Library {
         &self,
         root_id: &str,
         work: &crate::types::ScanWork,
-        queue_color_previews: bool,
+        queue_missing_thumbnails: bool,
     ) -> CoreResult<ScanReport> {
         let _scan_guard = self.scan_lock.lock().map_err(|_| CoreError::LockPoisoned)?;
         let root = {
@@ -1160,11 +1160,15 @@ impl Library {
             return Err(CoreError::RootDisabled(root_id.to_owned()));
         }
         let result = scanner::scan(self, &root, work).and_then(|report| {
-            if queue_color_previews && root.asset_type == AssetType::Model && self.auto_tag_settings()?.colors {
-                self.queue_pending_cards_with_progress(root_id, true, &mut |completed, total| {
-                    let progress = 0.96 + 0.035 * completed as f64 / total.max(1) as f64;
-                    self.update_scan_progress(root_id, "Verifying", progress, report.files_seen, report.files_seen)
-                })?;
+            if queue_missing_thumbnails {
+                let motion_preview_ready = root.asset_type != AssetType::Motion
+                    || self.motion_preview_model()?.is_some();
+                if motion_preview_ready {
+                    self.queue_pending_cards_with_progress(root_id, true, &mut |completed, total| {
+                        let progress = 0.96 + 0.035 * completed as f64 / total.max(1) as f64;
+                        self.update_scan_progress(root_id, "Verifying", progress, report.files_seen, report.files_seen)
+                    })?;
+                }
             }
             Ok(report)
         });
@@ -1920,7 +1924,14 @@ impl Library {
             if statuses.iter().any(|status| matches!(status.as_str(), "MissingSource" | "ParseFailed" | "Unsupported")) {
                 return None;
             }
-            Path::new(&source).extension().and_then(|extension| extension.to_str())
+            let source_path = Path::new(&source);
+            if scan_verified && !root.scan_recursive
+                && source_path.parent().is_none_or(|parent| {
+                    crate::scanner::scan_path_key(parent) != crate::scanner::scan_path_key(Path::new(&root.path))
+                }) {
+                return None;
+            }
+            source_path.extension().and_then(|extension| extension.to_str())
                 .is_some_and(|extension| root.asset_type.supports_thumbnail_extension(extension)).then_some(id)
         }).collect())
     }
