@@ -206,8 +206,8 @@ fn root_add(
 }
 
 #[tauri::command]
-fn root_remove(state: State<'_, CoreState>, root_id: String) -> Result<bool, ApiError> {
-    state.0.remove_root(&root_id).map_err(Into::into)
+async fn root_remove(state: State<'_, CoreState>, root_id: String) -> Result<bool, ApiError> {
+    read_core(state.0.clone(), move |library| library.remove_root(&root_id)).await
 }
 
 #[tauri::command]

@@ -1,11 +1,16 @@
-import { ActionIcon, Alert, Badge, Button, Checkbox, NativeSelect } from "@mantine/core";
+import { ActionIcon, Alert, Badge, Button, Checkbox } from "@mantine/core";
 import { invoke } from "@tauri-apps/api/core";
 import { Check, Copy, FileCheck, Link2, RefreshCw, ScanLine, Square, Tags, Unplug } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toUiError } from "./uiError";
 
 type AssetType = "model" | "motion" | "scene";
-export type AgentLinkScope = { rootId: string | null; assetType: AssetType | null };
+export type AgentLinkScope = {
+  rootIds: string[] | null;
+  assetTypes: AssetType[];
+  onlyUnrecognized: boolean;
+  recognizeDuringScan: boolean;
+};
 type Root = { id: string; displayName: string; enabled: boolean; assetType: AssetType };
 export type AgentLinkEvent = { id: string; time: string; operation: string; phase: string; message: string; percent: number | null; details: Record<string, unknown> };
 export type AgentLinkSnapshot = {
@@ -110,8 +115,13 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
           let next = await invoke<AgentLinkSnapshot>("agentlink_open");
           if (disposed || version !== pollVersion.current) return;
           if (!scopeApplied.current && next.status !== "active") {
-            const selectedRoot = roots.find((root) => root.id === initial.current.rootId && root.enabled);
-            const initialValue = { rootId: selectedRoot?.id ?? null, assetType: selectedRoot?.assetType ?? initial.current.assetType };
+            const assetTypes = initial.current.assetTypes.length ? initial.current.assetTypes : ["model", "motion", "scene"];
+            const enabledRootIds = new Set(roots.filter((root) => root.enabled && assetTypes.includes(root.assetType)).map((root) => root.id));
+            const initialValue = {
+              ...initial.current,
+              assetTypes,
+              rootIds: initial.current.rootIds === null ? null : initial.current.rootIds.filter((id) => enabledRootIds.has(id)),
+            };
             next = await invoke<AgentLinkSnapshot>("agentlink_scope_set", { scope: initialValue });
             if (disposed || version !== pollVersion.current) return;
           }
@@ -171,9 +181,31 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
   const progress = snapshot?.percent ?? null;
   const visualStatus = connectionError || snapshot?.error ? "disconnected" : snapshot?.status ?? "waiting";
   const recentOperation = [...events].reverse().find((event) => event.operation in activityIcons || event.operation === "agent-identify" || event.operation === "agent-session")?.operation ?? "agent-identify";
-  const scopeRoots = roots.filter((root) => root.enabled && (!scope.assetType || root.assetType === scope.assetType));
-  const unavailableRoot = scope.rootId && !scopeRoots.some((root) => root.id === scope.rootId)
-    ? [{value:scope.rootId,label:(roots.find((root) => root.id === scope.rootId)?.displayName ?? "原资产目录") + " · 不可用",disabled:true}] : [];
+  const typeOptions: { value: AssetType; label: string }[] = [
+    { value: "model", label: "模型" }, { value: "motion", label: "动作" }, { value: "scene", label: "场景" },
+  ];
+  const scopeRoots = roots.filter((root) => root.enabled && scope.assetTypes.includes(root.assetType));
+  const selectedRootIds = scope.rootIds === null ? scopeRoots.map((root) => root.id) : scope.rootIds;
+  const selectedRootSet = new Set(selectedRootIds);
+  const selectedAvailableRootCount = scopeRoots.filter((root) => selectedRootSet.has(root.id)).length;
+  const unavailableRootIds = scope.rootIds?.filter((id) => !scopeRoots.some((root) => root.id === id)) ?? [];
+  function changeAssetType(type: AssetType, checked: boolean) {
+    const assetTypes = checked ? [...new Set([...scope.assetTypes, type])] : scope.assetTypes.filter((item) => item !== type);
+    if (!assetTypes.length) return;
+    const rootIds = scope.rootIds === null ? null : scope.rootIds.filter((id) => {
+      const root = roots.find((item) => item.id === id);
+      return root?.enabled && assetTypes.includes(root.assetType);
+    });
+    void changeScope({ ...scope, assetTypes, rootIds });
+  }
+  function changeRoot(rootId: string, checked: boolean) {
+    const selected = new Set(scope.rootIds ?? scopeRoots.map((root) => root.id));
+    if (checked) selected.add(rootId); else selected.delete(rootId);
+    const rootIds = [...selected];
+    const allAvailableSelected = scopeRoots.length > 0 && rootIds.length === scopeRoots.length
+      && scopeRoots.every((root) => selected.has(root.id));
+    void changeScope({ ...scope, rootIds: allAvailableSelected ? null : rootIds });
+  }
   return <section className={`agentlink-page ${settling ? "is-settling" : ""}`} data-status={visualStatus} data-animate={active && documentVisible && !connectionError && !snapshot?.error} hidden={!active} aria-label="AgentLink">
     <div className="agentlink-heading"><div><h1>AgentLink</h1><p>在外部 Agent 中使用 Prompt，进度与操作记录会显示在 Log。</p></div>
       <div className="agentlink-session-controls">
@@ -185,14 +217,34 @@ export function AgentLinkPage({ active, initialScope, roots, onLibraryChanged }:
     {(error || connectionError || snapshot?.error) && <Alert role="alert" color="red" title="AgentLink">{error || connectionError || snapshot?.error}</Alert>}
     {snapshot && (!snapshot.cliAvailable || !snapshot.skillAvailable) && <Alert role="alert" color="yellow">便携目录缺少 CLI 或标签 Skill，请使用完整便携包。</Alert>}
     <div className="agentlink-scope">
-      <NativeSelect label="资产类型" aria-label="AgentLink 资产类型" value={scope.assetType ?? "all"} disabled={busy || connected || !snapshot} data={[{value:"all",label:"全部资产"},{value:"model",label:"模型"},{value:"motion",label:"动作"},{value:"scene",label:"场景"}]} onChange={(event) => void changeScope({assetType:event.target.value === "all" ? null : event.target.value as AssetType,rootId:null})} />
-      <NativeSelect label="资产目录" aria-label="AgentLink 资产目录" value={scope.rootId ?? "all"} disabled={busy || connected || !snapshot} data={[{value:"all",label:"全部已启用目录"},...scopeRoots.map((root) => ({value:root.id,label:root.displayName})),...unavailableRoot]} onChange={(event) => void changeScope({...scope,rootId:event.target.value === "all" ? null : event.target.value})} />
+      <div className="agentlink-scope-group">
+        <span className="agentlink-scope-label">项目类型</span>
+        <div className="agentlink-scope-checkboxes" role="group" aria-label="AgentLink 项目类型">
+          {typeOptions.map((option) => <Checkbox key={option.value} size="xs" label={option.label} checked={scope.assetTypes.includes(option.value)} disabled={busy || connected || !snapshot || (scope.assetTypes.length === 1 && scope.assetTypes.includes(option.value))} onChange={(event) => changeAssetType(option.value, event.currentTarget.checked)} />)}
+        </div>
+      </div>
+      <div className="agentlink-scope-group">
+        <div className="agentlink-scope-heading"><span className="agentlink-scope-label">项目目录</span><span className="agentlink-scope-count">已选 {selectedAvailableRootCount} / {scopeRoots.length}</span></div>
+        <div className="agentlink-scope-checkboxes" role="group" aria-label="AgentLink 项目目录">
+          <Checkbox size="xs" label="全部已启用项目" checked={scope.rootIds === null} disabled={busy || connected || !snapshot} onChange={(event) => void changeScope({ ...scope, rootIds: event.currentTarget.checked ? null : [] })} />
+          {scopeRoots.map((root) => <Checkbox key={root.id} size="xs" label={root.displayName} title={root.displayName} checked={selectedRootSet.has(root.id)} disabled={busy || connected || !snapshot} onChange={(event) => changeRoot(root.id, event.currentTarget.checked)} />)}
+          {unavailableRootIds.map((id) => <Checkbox key={id} size="xs" label={`${roots.find((root) => root.id === id)?.displayName ?? "原项目"} · 不可用`} checked disabled={busy || connected || !snapshot} onChange={() => changeRoot(id, false)} />)}
+          {!scopeRoots.length && <span className="agentlink-scope-empty">所选类型没有已启用项目目录</span>}
+        </div>
+      </div>
+      <div className="agentlink-scope-options">
+        <div className="agentlink-scope-policy">
+          <Checkbox size="xs" label="只处理尚无 Agent 标签的资产" checked={scope.onlyUnrecognized} disabled={busy || connected || !snapshot} onChange={(event) => void changeScope({ ...scope, onlyUnrecognized: event.currentTarget.checked })} />
+          <span>关闭后重做所选范围内的全部资产，并保留已有标签。</span>
+        </div>
+        <Checkbox size="xs" label="扫描期间持续识别新发现的资产" checked={scope.recognizeDuringScan} disabled={busy || connected || !snapshot} onChange={(event) => void changeScope({ ...scope, recognizeDuringScan: event.currentTarget.checked })} />
+      </div>
       {connected && <span className="agentlink-scope-note">接管期间范围已固定</span>}
     </div>
     <div className="agentlink-panels">
       <div className="agentlink-panel prompt-panel">
         <PanelEffects />
-        <div className="agentlink-panel-header"><h2>Prompt</h2><div><Button size="compact-xs" variant="subtle" leftSection={<RefreshCw size={14} />} disabled={busy || !snapshot} onClick={() => void action("agentlink_open", {}, true)}>重新生成</Button><Button size="compact-xs" variant="light" leftSection={copied === "prompt" ? <Check size={14} /> : <Copy size={14} />} disabled={!prompt || stalePrompt} onClick={() => void copy("prompt")}>{copied === "prompt" ? "已复制" : "复制"}</Button></div></div>
+        <div className="agentlink-panel-header"><h2>Prompt</h2><div><Button size="compact-xs" variant="subtle" leftSection={<RefreshCw size={14} />} disabled={busy || !snapshot} onClick={() => void action("agentlink_open", {}, true)}>{dirty || stalePrompt ? "生成新版本" : "重新生成"}</Button><Button size="compact-xs" variant="light" leftSection={copied === "prompt" ? <Check size={14} /> : <Copy size={14} />} disabled={!prompt || stalePrompt} onClick={() => void copy("prompt")}>{copied === "prompt" ? "已复制" : "复制"}</Button></div></div>
         {stalePrompt && <div className="agentlink-prompt-warning" role="status">范围或会话已变化，请重新生成 Prompt。</div>}
         <textarea className="agentlink-prompt" aria-label="AgentLink Prompt" spellCheck={false} value={prompt} placeholder="正在生成当前资产范围的 Prompt…" onChange={(event) => {setPrompt(event.target.value);setDirty(true);dirtyRef.current=true;}} />
         <div className="agentlink-panel-footer"><span>{dirty ? "已编辑" : "当前资产范围"}</span><span>{prompt.length.toLocaleString()} 字符</span></div>

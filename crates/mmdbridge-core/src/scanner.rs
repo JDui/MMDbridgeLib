@@ -688,6 +688,56 @@ pub(crate) fn list_asset_page(
         limit, motion_format, directory_path, recursive_scope, None)
 }
 
+pub(crate) fn list_agent_link_asset_page(
+    library: &Library,
+    asset_types: &[AssetType],
+    root_ids: Option<&[String]>,
+    only_unrecognized: bool,
+    cursor: Option<&AssetCursor>,
+    limit: usize,
+) -> CoreResult<AssetPage> {
+    if asset_types.is_empty() {
+        return Err(CoreError::AgentLink("至少选择一种资产类型".to_owned()));
+    }
+    let placeholders = (2..2 + asset_types.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut predicates = vec![format!("a.asset_type IN ({placeholders})")];
+    let mut values = asset_types
+        .iter()
+        .map(|asset_type| SqlValue::Text(asset_type.as_str().to_owned()))
+        .collect::<Vec<_>>();
+    if let Some(root_ids) = root_ids {
+        if root_ids.is_empty() {
+            predicates.push("0".to_owned());
+        } else {
+            let first_parameter = values.len() + 2;
+            let root_placeholders = (first_parameter..first_parameter + root_ids.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            predicates.push(format!("a.root_id IN ({root_placeholders})"));
+            values.extend(root_ids.iter().cloned().map(SqlValue::Text));
+        }
+    }
+    if only_unrecognized {
+        predicates.push(
+            "NOT EXISTS(SELECT 1 FROM asset_tags at WHERE at.asset_id=a.id AND at.source='agent')"
+                .to_owned(),
+        );
+    }
+    list_asset_page_with_predicate(
+        library,
+        None,
+        None,
+        limit,
+        &predicates.join(" AND "),
+        values,
+        cursor,
+    )
+}
+
 pub(crate) fn list_asset_page_filtered(
     library: &Library, asset_type: Option<AssetType>, query: Option<&str>, root_id: Option<&str>,
     favorite_only: bool, cursor: Option<&AssetCursor>, limit: usize, motion_format: Option<&str>,

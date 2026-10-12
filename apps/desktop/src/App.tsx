@@ -1238,13 +1238,16 @@ export default function App() {
 
   async function removeRoot(root: Root) {
     if (!await dialogs.confirm(`从资产库移除“${root.displayName}”？磁盘文件不会删除。`)) return;
+    setBusy(true);
+    setNotice(`正在从资产库移除 ${root.displayName} 的索引…`);
     try {
       await invoke("root_remove", { rootId: root.id });
       setActiveRoot(null);
       setSelected(null);
       await refresh();
       setNotice("已从资产库移除目录索引。");
-    } catch (reason) { setError(toUiError(reason)); }
+    } catch (reason) { setError(toUiError(reason)); setNotice(""); }
+    finally { setBusy(false); }
   }
 
   async function createCard(assetId: string) {
@@ -1659,7 +1662,7 @@ export default function App() {
       </AppShell.Navbar>
 
       <AppShell.Main className="main-area">
-        {agentLinkMounted && <AgentLinkPage active={agentLinkOpen} initialScope={{rootId:activeRoot,assetType:activeType === "all" ? null : activeType}} roots={roots} onLibraryChanged={refresh} />}
+        {agentLinkMounted && <AgentLinkPage active={agentLinkOpen} initialScope={{rootIds:activeRoot ? [activeRoot] : null,assetTypes:activeType === "all" ? ["model","motion","scene"] : [activeType],onlyUnrecognized:false,recognizeDuringScan:false}} roots={roots} onLibraryChanged={refresh} />}
         <div className="library-page" hidden={agentLinkOpen}>
         <header className="topbar">
           <form className="search-box" onSubmit={submitSearch}>

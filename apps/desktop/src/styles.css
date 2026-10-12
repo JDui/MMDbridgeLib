@@ -2624,11 +2624,19 @@ button:focus-visible {
 .agentlink-status-dot { position: relative; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; margin-right: 7px; }
 .agentlink-status.is-active .agentlink-status-dot { animation: agentlink-pulse 1.8s ease-in-out infinite; }
 .agentlink-status.is-active .agentlink-status-dot::after { content: ""; position: absolute; inset: -4px; border: 1px solid currentColor; border-radius: 50%; opacity: 0; animation: agentlink-signal 2.4s ease-out infinite; }
-.agentlink-scope { display: flex; align-items: end; gap: 12px; }
-.agentlink-scope > div { min-width: 160px; }
-.agentlink-scope > div:nth-child(2) { min-width: 230px; }
-.agentlink-scope .mantine-InputWrapper-label { color: var(--text-3); font-size: 11px; margin-bottom: 6px; font-weight: 500; }
-.agentlink-scope-note { font-size: 11px; color: var(--text-3); padding-bottom: 10px; }
+.agentlink-scope { display: grid; grid-template-columns: minmax(180px,.8fr) minmax(260px,1.2fr); align-items: start; gap: 10px 18px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: color-mix(in srgb, var(--panel) 72%, transparent); }
+.agentlink-scope-group { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.agentlink-scope-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.agentlink-scope-label { color: var(--text-3); font-size: 11px; font-weight: 550; }
+.agentlink-scope-count { color: var(--text-3); font-size: 10px; font-variant-numeric: tabular-nums; }
+.agentlink-scope-checkboxes { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 14px; max-height: 92px; overflow: auto; padding: 2px; }
+.agentlink-scope-checkboxes .mantine-Checkbox-root, .agentlink-scope-options .mantine-Checkbox-root { flex: 0 0 auto; }
+.agentlink-scope-checkboxes .mantine-Checkbox-label, .agentlink-scope-options .mantine-Checkbox-label { color: var(--text-2); font-size: 11px; line-height: 1.45; }
+.agentlink-scope-options { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; padding-top: 9px; border-top: 1px solid var(--line); }
+.agentlink-scope-policy { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 9px; }
+.agentlink-scope-policy > span { color: var(--text-3); font-size: 10px; }
+.agentlink-scope-empty { color: var(--text-3); font-size: 11px; }
+.agentlink-scope-note { grid-column: 1 / -1; font-size: 11px; color: var(--text-3); }
 .agentlink-panels { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 18px; flex: 1; min-height: 400px; }
 .agentlink-panel { position: relative; isolation: isolate; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel); border: 1px solid var(--line-2); border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.06); overflow: hidden; backdrop-filter: blur(16px); transition: border-color 240ms var(--library-motion-ease); }
 .agentlink-panel > :not(.agentlink-panel-effects) { position: relative; z-index: 1; }
@@ -2692,5 +2700,6 @@ button:focus-visible {
 @keyframes agentlink-settle { 0% { opacity: 0; } 22% { opacity: .85; } 100% { opacity: 0; } }
 .agentlink-page[data-animate="false"] *, .agentlink-page[data-animate="false"] *::before, .agentlink-page[data-animate="false"] *::after { animation-play-state: paused !important; transition: none !important; }
 @media (max-width: 1150px) { .agentlink-page { padding: 20px; } .agentlink-heading { align-items: start; } .agentlink-session-controls { flex-direction: column; align-items: end; } .agentlink-panel-header { padding: 14px; } .agentlink-panels { gap: 12px; } }
+@media (max-width: 1150px) { .agentlink-scope { grid-template-columns: minmax(0,1fr); } }
 @media (prefers-reduced-motion: reduce) { .agentlink-page *, .agentlink-page *::before, .agentlink-page *::after { animation: none !important; transition: none !important; } }
 html[data-library-motion="off"] .agentlink-page *, html[data-library-motion="off"] .agentlink-page *::before, html[data-library-motion="off"] .agentlink-page *::after { animation: none !important; transition: none !important; }

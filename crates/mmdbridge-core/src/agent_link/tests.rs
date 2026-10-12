@@ -151,7 +151,7 @@ fn old_prompt_cannot_join_or_write_to_a_replacement_session() {
 fn live_scope_blocks_outside_assets_and_cancel_requires_a_new_session() {
     let f=Fixture::new();let library=f.library.as_ref().unwrap();let server=f.server.as_ref().unwrap();
     let root=library.inspect_asset(&f.asset).unwrap().root_id;
-    server.set_scope(AgentLinkScope {root_id:Some(root),asset_type:Some(AssetType::Model)}).unwrap();f.connect();
+    server.set_scope(AgentLinkScope {root_ids:Some(vec![root]),asset_types:vec![AssetType::Model],..AgentLinkScope::default()}).unwrap();f.connect();
     assert!(server.set_scope(AgentLinkScope::default()).is_err());
     assert!(f.rpc("agent-inspect",json!({"assetId":f.other})).is_err());
     assert!(f.rpc("agent-tags",json!({"assetIds":[f.asset,f.other],"name":"造型:Q版","confidence":0.85})).is_err());

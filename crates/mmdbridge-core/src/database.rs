@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
     time::Duration,
 };
 
@@ -48,7 +48,7 @@ impl Library {
     pub(crate) fn backing_database_path(&self) -> Option<PathBuf> {
         self.database_path.as_deref().map(|path| path.to_path_buf())
     }
-    const SCHEMA_VERSION: i64 = 16;
+    const SCHEMA_VERSION: i64 = 17;
 
     fn check_schema_version(connection: &Connection) -> CoreResult<i64> {
         let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -684,8 +684,19 @@ impl Library {
                 .collect::<Result<Vec<_>, _>>()?.iter().any(|name| name == "claim_owner");
             if !has_owner { transaction.execute("ALTER TABLE jobs ADD COLUMN claim_owner INTEGER", [])?; }
             transaction.execute("CREATE INDEX IF NOT EXISTS idx_jobs_asset_status ON jobs(asset_id,kind,status)", [])?;
-            transaction.pragma_update(None, "user_version", Self::SCHEMA_VERSION)?;
+            transaction.pragma_update(None, "user_version", 16)?;
             transaction.commit()?;
+        }
+        if schema_version < 17 {
+            progress(LibraryOpenProgress::stage(4, "升级数据库：目录删除索引", "为资产关系与版本外键添加索引，避免移除目录时重复扫描"));
+            connection.execute_batch(
+                "BEGIN;
+                 CREATE INDEX IF NOT EXISTS idx_relations_source_asset ON relations(source_asset);
+                 CREATE INDEX IF NOT EXISTS idx_relations_target_asset ON relations(target_asset);
+                 CREATE INDEX IF NOT EXISTS idx_versions_asset ON versions(asset_id);
+                 PRAGMA user_version = 17;
+                 COMMIT;",
+            )?;
         }
         Ok(())
     }
@@ -1093,7 +1104,15 @@ impl Library {
     }
 
     pub fn remove_root(&self, root_id: &str) -> CoreResult<bool> {
-        let _scan_guard = self.scan_lock.lock().map_err(|_| CoreError::LockPoisoned)?;
+        let _scan_guard = match self.scan_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                return Err(CoreError::InvalidRoot(
+                    "扫描仍在运行，请等待扫描结束后再移除目录索引".to_owned(),
+                ));
+            }
+            Err(TryLockError::Poisoned(_)) => return Err(CoreError::LockPoisoned),
+        };
         let removed = {
             let mut connection = self
                 .connection
@@ -1110,12 +1129,19 @@ impl Library {
             )?;
             if active { return Err(CoreError::InvalidRoot("此目录仍有后台任务占用，请取消任务并等待退出后再移除索引".to_owned())); }
             let removed = transaction.execute("DELETE FROM roots WHERE id=?1", [root_id])? > 0;
+            if removed {
+                // Asset relations cascade with the root. Drop version families that
+                // became singletons without rescanning every remaining asset.
+                transaction.execute(
+                    "DELETE FROM versions WHERE family_id IN (
+                       SELECT family_id FROM versions GROUP BY family_id HAVING COUNT(*) < 2
+                     )",
+                    [],
+                )?;
+            }
             transaction.commit()?;
             removed
         };
-        if removed {
-            self.rebuild_relations()?;
-        }
         Ok(removed)
     }
 
@@ -1763,6 +1789,35 @@ impl Library {
         )
     }
 
+    pub(crate) fn agent_link_asset_page(
+        &self,
+        asset_types: &[AssetType],
+        root_ids: Option<&[String]>,
+        only_unrecognized: bool,
+        cursor: Option<&AssetCursor>,
+        limit: usize,
+    ) -> CoreResult<AssetPage> {
+        scanner::list_agent_link_asset_page(
+            self,
+            asset_types,
+            root_ids,
+            only_unrecognized,
+            cursor,
+            limit,
+        )
+    }
+
+    pub(crate) fn asset_has_agent_tags(&self, asset_id: &str) -> CoreResult<bool> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset_tags WHERE asset_id=?1 AND source='agent')",
+                [asset_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn inspect_asset(&self, asset_id: &str) -> CoreResult<Asset> {
         scanner::inspect_asset(self, asset_id)
     }
@@ -2152,7 +2207,7 @@ impl Library {
 
     pub(crate) fn add_missing_agent_tags(
         &self, asset_ids: &[String], name: &str, confidence: f64,
-        root_id: Option<&str>, asset_type: Option<AssetType>,
+        root_ids: Option<&[String]>, asset_types: &[AssetType],
     ) -> CoreResult<Vec<TagMutation>> {
         let name = validate_tag(name)?;
         validate_tag_request("agent", Some(confidence))?;
@@ -2166,8 +2221,8 @@ impl Library {
                 "SELECT a.root_id,a.asset_type,r.enabled FROM assets a JOIN roots r ON r.id=a.root_id WHERE a.id=?1",
                 [asset_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
             )?;
-            if !enabled || root_id.is_some_and(|id| id != current_root)
-                || asset_type.is_some_and(|kind| kind.as_str() != current_type) {
+            if !enabled || root_ids.is_some_and(|ids| !ids.iter().any(|id| id == &current_root))
+                || !asset_types.iter().any(|kind| kind.as_str() == current_type) {
                 return Err(CoreError::AgentLink("资产不在当前接管范围内".to_owned()));
             }
             let existing: Option<(String, String)> = transaction.query_row(
@@ -2573,7 +2628,7 @@ mod storage_tests {
         ).unwrap();
         library.initialize_schema().unwrap();
         let connection = library.connection().unwrap();
-        assert_eq!(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 16);
+        assert_eq!(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 17);
         assert_eq!(connection.query_row("SELECT value_json FROM settings WHERE key='fixture'", [], |row| row.get::<_, String>(0)).unwrap(), "42");
         assert_eq!(connection.query_row("SELECT status,claim_owner FROM jobs WHERE id='old'", [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))).unwrap(), ("Failed".to_owned(), None));
     }
